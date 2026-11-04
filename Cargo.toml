@@ -1,0 +1,15 @@
+[workspace]
+members = ["contract", "handoff", "issuer", "client"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+publish = false
+
+[workspace.dependencies]
+ring = "=0.17.14"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled"] }

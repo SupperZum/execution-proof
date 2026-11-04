@@ -1,0 +1,20 @@
+[package]
+name = "execution-proof-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+https = ["dep:reqwest"]
+
+[dependencies]
+execution-proof-contract = { path = "../contract" }
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64 = "=0.22.1"
+serde_json_canonicalizer = "=0.3.2"
+kbs-types = "=0.15.0"
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"], optional = true }
