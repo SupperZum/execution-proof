@@ -1,4 +1,4 @@
-# Execution Proof Prototype
+# Execution Proof
 
 Rust libraries for signed workload launch authorization, policy admission, and
 one-use guest context in an encrypted-image execution proof workflow. They connect

@@ -9,6 +9,7 @@ rust-version = "1.90"
 publish = false
 readme = "README.md"
 license-file = "LICENSE"
+repository = "https://github.com/SupperZum/execution-proof"
 
 [workspace.dependencies]
 ring = "=0.17.14"
