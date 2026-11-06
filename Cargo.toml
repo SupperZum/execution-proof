@@ -7,6 +7,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.90"
 publish = false
+readme = "README.md"
+license-file = "LICENSE"
 
 [workspace.dependencies]
 ring = "=0.17.14"

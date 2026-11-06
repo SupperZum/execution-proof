@@ -1,3 +1,6 @@
 /target/
 *.key
 *.pem
+*.db
+*.db-shm
+*.db-wal

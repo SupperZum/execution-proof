@@ -1,9 +1,12 @@
 [package]
 name = "execution-proof-contract"
+description = "Signed launch, policy, credential and admission contracts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+readme.workspace = true
+license-file.workspace = true
 
 [dependencies]
 ring.workspace = true

@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Stable (${{ matrix.profile }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: default
+            feature_args: ""
+          - profile: all-features
+            feature_args: --all-features
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Check formatting
+        if: matrix.profile == 'default'
+        run: cargo fmt --all --check
+      - name: Test
+        run: cargo test --workspace --locked ${{ matrix.feature_args }}
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked ${{ matrix.feature_args }} -- -D warnings
+      - name: Build API documentation
+        if: matrix.profile == 'all-features'
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+  msrv:
+    name: Rust 1.90.0
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.90.0
+      - name: Check all targets and features
+        run: cargo check --workspace --all-targets --all-features --locked

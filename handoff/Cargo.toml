@@ -1,9 +1,12 @@
 [package]
 name = "execution-proof-handoff"
+description = "One-use guest admission and boot-local launch bookkeeping"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+readme.workspace = true
+license-file.workspace = true
 
 [features]
 default = []
