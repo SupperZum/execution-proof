@@ -904,6 +904,39 @@ fn last_error() -> StartupError {
     )
 }
 
+#[cfg(all(test, feature = "rootfs-custody"))]
+pub(crate) fn test_pair() -> (StartupBoundChannel, StartupBoundChannel) {
+    let (preparation, kata) = PrivateFdChannel::pair().expect("fixture socketpair");
+    let mut nonce = [0; 32];
+    SystemRandom::new().fill(&mut nonce).expect("fixture nonce");
+    let configuration = move |role| Bootstrap {
+        role,
+        nonce,
+        boot: [2; 48],
+        preparation: [3; 48],
+        kata: [4; 48],
+    };
+    let accept = move |channel: PrivateFdChannel, role| {
+        let bootstrap = configuration(role);
+        let expected = ExpectedStartup {
+            role,
+            boot_config_sha384: bootstrap.boot,
+            own_executable_sha384: *bootstrap.own(),
+            peer_executable_sha384: *bootstrap.peer(),
+        };
+        StartupBoundChannel::accept_descriptors(
+            channel.into_startup_fd().expect("fixture owns channel"),
+            make_ticket(&bootstrap).expect("fixture ticket").into(),
+            expected,
+            Duration::from_secs(2),
+        )
+        .expect("fixture startup binding")
+    };
+    let first = std::thread::spawn(move || accept(preparation, Role::Preparation));
+    let second = accept(kata, Role::Kata);
+    (first.join().expect("fixture startup joined"), second)
+}
+
 #[cfg(test)]
 #[path = "startup_tests.rs"]
 mod tests;

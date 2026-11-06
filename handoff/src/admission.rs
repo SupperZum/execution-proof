@@ -25,6 +25,15 @@ use ring::{
 };
 use std::{convert::Infallible, fmt, sync::Mutex};
 
+#[cfg(all(target_os = "linux", feature = "rootfs-custody"))]
+#[path = "admission_receiver.rs"]
+mod receiver;
+#[cfg(all(target_os = "linux", feature = "rootfs-custody"))]
+pub use receiver::{
+    PendingReceiverEnrollment, ReceiverAdmissionVerifier, ReceiverChallenge,
+    ReceiverEnrollmentError, VerifiedReceiverAdmission,
+};
+
 pub struct GuestAdmissionConfig {
     pub grant: GrantExpectations,
     pub expected_grant: LaunchGrant,
@@ -175,6 +184,8 @@ impl Bundle {
 struct State {
     verified: Option<Bundle>,
     accepted: Option<AcceptedAttemptContext>,
+    #[cfg(feature = "rootfs-custody")]
+    enrollment: Option<[u8; 48]>,
 }
 
 /// One instance per trusted boot/attempt. The owner must retain it for that

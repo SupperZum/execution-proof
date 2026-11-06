@@ -14,6 +14,7 @@ default = []
 software-lab = []
 rootfs-transfer = ["dep:libc"]
 rootfs-startup = ["rootfs-transfer"]
+rootfs-custody = ["rootfs-startup", "dep:serde", "dep:serde_json"]
 
 [[test]]
 name = "admission_lifecycle"
@@ -35,6 +36,8 @@ required-features = ["rootfs-startup"]
 execution-proof-contract = { path = "../contract" }
 libc = { workspace = true, optional = true }
 ring.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 ring.workspace = true

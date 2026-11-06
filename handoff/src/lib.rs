@@ -18,6 +18,8 @@ pub mod fd_transport;
 pub mod rootfs_offer;
 #[cfg(all(target_os = "linux", feature = "rootfs-startup"))]
 pub mod startup;
+#[cfg(all(target_os = "linux", feature = "rootfs-custody"))]
+pub mod rootfs_custody;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Mutex;

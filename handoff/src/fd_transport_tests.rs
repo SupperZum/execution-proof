@@ -213,6 +213,34 @@ fn wrong_descriptor_counts_close_every_received_descriptor_and_endpoint() {
     }
 }
 
+#[cfg(feature = "rootfs-custody")]
+#[test]
+fn optional_descriptor_accepts_zero_or_one_and_closes_two_before_rejection() {
+    let source = source(c"onb17-transport-optional-count");
+    for count in 0..=2 {
+        let (sender, mut receiver) = PrivateFdChannel::pair().unwrap();
+        raw_send(
+            &sender,
+            b"mixed-custody-state",
+            &vec![source.as_raw_fd(); count],
+        );
+        let received = receiver.try_receive(FdExpectation::Optional);
+        if count <= 1 {
+            let (payload, descriptor) = received.unwrap().unwrap().into_parts();
+            assert_eq!(payload, b"mixed-custody-state");
+            assert_eq!(descriptor.is_some(), count == 1);
+            drop(descriptor);
+        } else {
+            assert!(matches!(received, Err(TransportError::DescriptorCount)));
+            assert!(matches!(
+                receiver.try_receive(FdExpectation::Optional),
+                Err(TransportError::Failed)
+            ));
+        }
+        assert_eq!(aliases("onb17-transport-optional-count"), 1);
+    }
+}
+
 #[test]
 fn oversized_packet_closes_delivered_descriptor_and_terminally_rejects() {
     let source = source(c"onb17-transport-data-truncation");

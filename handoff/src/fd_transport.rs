@@ -44,6 +44,8 @@ pub enum SendOutcome {
 pub enum FdExpectation {
     None,
     One,
+    #[cfg(feature = "rootfs-custody")]
+    Optional,
 }
 
 pub struct ReceivedPacket {
@@ -297,6 +299,8 @@ fn collect_descriptor(
     let accepted_count = match expected {
         FdExpectation::None => descriptor_count == 0,
         FdExpectation::One => descriptor_count == 1,
+        #[cfg(feature = "rootfs-custody")]
+        FdExpectation::Optional => descriptor_count <= 1,
     };
     if !accepted_count {
         return Err(TransportError::DescriptorCount);
