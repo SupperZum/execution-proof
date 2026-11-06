@@ -292,6 +292,7 @@ name = "execution-proof-handoff"
 version = "0.1.0"
 dependencies = [
  "execution-proof-contract",
+ "libc",
  "ring",
  "serde",
  "serde_json",

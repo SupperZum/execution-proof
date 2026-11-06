@@ -12,13 +12,21 @@ repository.workspace = true
 [features]
 default = []
 software-lab = []
+rootfs-transfer = ["dep:libc"]
 
 [[test]]
 name = "admission_lifecycle"
 required-features = ["software-lab"]
 
+[[test]]
+name = "rootfs_transfer_process"
+path = "tests/rootfs_transfer_process.rs"
+harness = false
+required-features = ["rootfs-transfer"]
+
 [dependencies]
 execution-proof-contract = { path = "../contract" }
+libc = { workspace = true, optional = true }
 ring.workspace = true
 
 [dev-dependencies]
