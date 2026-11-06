@@ -302,6 +302,7 @@ name = "execution-proof-issuer"
 version = "0.1.0"
 dependencies = [
  "execution-proof-contract",
+ "execution-proof-handoff",
  "ring",
  "rusqlite",
  "serde",

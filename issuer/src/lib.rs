@@ -334,20 +334,28 @@ impl SoftwareIssuer {
         })
     }
 
+    /// Early L/A software-lab API; never a fallback for a policy-admission store.
     pub fn redeem(
         &self,
         statements: &VerifiedStatements,
         recorder_request_json: &[u8],
     ) -> Result<Redemption, Error> {
+        if self.policy_admission.is_some() {
+            return Err(Error::PolicyMismatch);
+        }
         self.authenticate_recorder(statements, recorder_request_json, REDEEM_PURPOSE)?;
         Ok(self.store.redeem(statements, self.clock.as_ref())?)
     }
 
+    /// Early L/A software-lab API; never a fallback for a policy-admission store.
     pub fn status(
         &self,
         statements: &VerifiedStatements,
         recorder_request_json: &[u8],
     ) -> Result<RedemptionStatus, Error> {
+        if self.policy_admission.is_some() {
+            return Err(Error::PolicyMismatch);
+        }
         self.authenticate_recorder(statements, recorder_request_json, STATUS_PURPOSE)?;
         Ok(self
             .store

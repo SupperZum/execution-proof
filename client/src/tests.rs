@@ -639,3 +639,59 @@ fn credential_envelope_bounds_and_unknown_duplicate_fields_are_strict() {
         Some(ClientError::TooLarge)
     );
 }
+
+#[test]
+fn authority_time_client_authenticates_without_a_guest_clock_but_cannot_mint_permission() {
+    let (wire, expected, recorder, keywrap) = inputs();
+    assert_eq!(
+        verify_launch_grant(&wire, &expected, 200).err(),
+        Some(execution_proof_contract::Error::Expired)
+    );
+    let client =
+        ClientProtocol::new_authority_time(wire, &expected, recorder, keywrap, [8; 48]).unwrap();
+    assert_eq!(client.grant().validity().expires, 200);
+    assert!(client.begin_request().is_ok());
+    let (mut forged, expected, recorder, keywrap) = inputs();
+    let raw: Value = serde_json::from_slice(&forged).unwrap();
+    let mut raw = raw;
+    raw["statement"]["binding"]["boot_id"] = "other-boot".into();
+    forged = serde_json::to_vec(&raw).unwrap();
+    assert_eq!(
+        ClientProtocol::new_authority_time(forged, &expected, recorder, keywrap, [8; 48]).err(),
+        Some(ClientError::Contract(
+            execution_proof_contract::Error::InvalidSignature
+        ))
+    );
+}
+
+#[test]
+fn authority_time_credential_response_authenticates_a_delayed_committed_publication() {
+    let (client, expected, aggregate, response) = credential_fixture(b"exact-jwe");
+    let verified = client
+        .verify_credential_response_historical(&response, &aggregate, &expected)
+        .unwrap();
+    assert_eq!(verified.jwe_bytes(), b"exact-jwe");
+    assert_eq!(verified.delivery().validity().expires, 200);
+    assert_eq!(
+        client
+            .verify_credential_response(&response, &aggregate, &expected, 200)
+            .err(),
+        Some(ClientError::Contract(
+            execution_proof_contract::Error::Expired
+        ))
+    );
+    let mut changed: Value = serde_json::from_slice(&response).unwrap();
+    changed["jwe_b64"] = STANDARD.encode(b"substituted").into();
+    assert_eq!(
+        client
+            .verify_credential_response_historical(
+                &serde_json::to_vec(&changed).unwrap(),
+                &aggregate,
+                &expected
+            )
+            .err(),
+        Some(ClientError::Contract(
+            execution_proof_contract::Error::BindingMismatch
+        ))
+    );
+}

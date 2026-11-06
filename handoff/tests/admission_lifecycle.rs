@@ -145,7 +145,7 @@ fn signed_statements_bind_once_and_abort_does_not_reopen_attempt() {
     let reference_one = reference(&statements, 1);
     let task = task(&statements);
     assert_eq!(
-        table.register(&statements, reference_one).unwrap(),
+        table.register_lab(&statements, reference_one).unwrap(),
         Registration::Inserted
     );
     assert_eq!(
@@ -169,12 +169,12 @@ fn signed_statements_bind_once_and_abort_does_not_reopen_attempt() {
         Error::Aborted
     );
     assert_eq!(
-        table.register(&statements, reference_one).unwrap(),
+        table.register_lab(&statements, reference_one).unwrap(),
         Registration::Existing(Status::AbortedAfterConsume)
     );
     assert_eq!(
         table
-            .register(&statements, reference(&statements, 2))
+            .register_lab(&statements, reference(&statements, 2))
             .unwrap_err(),
         Error::AttemptAlreadyRegistered
     );
@@ -186,7 +186,7 @@ fn concurrent_consumers_of_signed_context_receive_one_permit() {
     let table = Arc::new(BootTable::new(statements.binding().boot_id.clone(), 1).unwrap());
     let reference = reference(&statements, 3);
     let task = task(&statements);
-    table.register(&statements, reference).unwrap();
+    table.register_lab(&statements, reference).unwrap();
     table.bind(&reference, task.clone()).unwrap();
     let barrier = Arc::new(Barrier::new(8));
     let workers: Vec<_> = (0..8)
@@ -220,7 +220,7 @@ fn signed_grant_reservation_survives_abort_and_capacity_does_not_evict() {
     let first = authenticated_statements_for_grant("attempt-first", "one-grant");
     let first_reference = reference(&first, 4);
     let table = BootTable::new(first.binding().boot_id.clone(), 1).unwrap();
-    table.register(&first, first_reference).unwrap();
+    table.register_lab(&first, first_reference).unwrap();
     assert_eq!(
         table.abort(&first_reference).unwrap(),
         Status::AbortedBeforeConsume
@@ -230,7 +230,7 @@ fn signed_grant_reservation_survives_abort_and_capacity_does_not_evict() {
     let reused_grant = authenticated_statements_for_grant("attempt-second", "one-grant");
     assert_eq!(
         table
-            .register(&reused_grant, reference(&reused_grant, 5))
+            .register_lab(&reused_grant, reference(&reused_grant, 5))
             .unwrap_err(),
         Error::GrantAlreadyRegistered
     );
@@ -238,7 +238,7 @@ fn signed_grant_reservation_survives_abort_and_capacity_does_not_evict() {
     let distinct = authenticated_statements("attempt-third");
     assert_eq!(
         table
-            .register(&distinct, reference(&distinct, 6))
+            .register_lab(&distinct, reference(&distinct, 6))
             .unwrap_err(),
         Error::CapacityExhausted
     );

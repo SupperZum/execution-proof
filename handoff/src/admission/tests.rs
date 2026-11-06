@@ -9,32 +9,8 @@ use execution_proof_contract::{
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::Serialize;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Barrier,
-};
+use std::sync::{Arc, Barrier};
 
-struct Clock {
-    value: Mutex<Result<u64, GuestClockError>>,
-    calls: AtomicUsize,
-}
-impl Clock {
-    fn new(value: u64) -> Arc<Self> {
-        Arc::new(Self {
-            value: Mutex::new(Ok(value)),
-            calls: AtomicUsize::new(0),
-        })
-    }
-    fn set(&self, value: Result<u64, GuestClockError>) {
-        *self.value.lock().unwrap() = value;
-    }
-}
-impl GuestClock for Clock {
-    fn now_unix_seconds(&self) -> Result<u64, GuestClockError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        *self.value.lock().unwrap()
-    }
-}
 fn key() -> Ed25519KeyPair {
     let encoded = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
     Ed25519KeyPair::from_pkcs8(encoded.as_ref()).unwrap()
@@ -155,12 +131,12 @@ impl Fixture {
             admission_policy_sha384: "22".repeat(48),
         }
     }
-    fn gate(&self, clock: Arc<Clock>) -> GuestAdmissionGate {
-        GuestAdmissionGate::new(self.config(), clock).unwrap()
+    fn gate(&self) -> GuestAdmissionGate {
+        GuestAdmissionGate::new(self.config()).unwrap()
     }
     fn receipt(&self, nonce: &str) -> AdmissionAuthorizationV1 {
         let config = self.config();
-        let grant = verify_launch_grant(&self.grant_wire, &config.grant, 100).unwrap();
+        let grant = verify_launch_grant_historical(&self.grant_wire, &config.grant).unwrap();
         let aggregate =
             verify_policy_aggregate(&self.aggregate_wire, &grant, &config.aggregate).unwrap();
         AdmissionAuthorizationV1 {
@@ -196,11 +172,14 @@ impl Fixture {
 }
 
 #[test]
-fn valid_signed_bundle_still_cannot_prepare_and_exact_history_skips_clock() {
+fn valid_bundle_transfers_context_once_and_never_opens_preparation() {
     let f = Fixture::new();
-    let clock = Clock::new(100);
-    let gate = f.gate(clock.clone());
+    let gate = f.gate();
     let receipt = f.receipt_wire(&gate);
+    assert_eq!(
+        gate.take_accepted_attempt().err(),
+        Some(GuestAdmissionError::NotReady)
+    );
     assert_eq!(gate.status().unwrap(), GateStatus::Pending);
     assert_eq!(
         gate.validate_for_preparation(&f.grant_wire, &f.aggregate_wire, &receipt)
@@ -210,12 +189,40 @@ fn valid_signed_bundle_still_cannot_prepare_and_exact_history_skips_clock() {
         ))
     );
     assert_eq!(gate.status().unwrap(), GateStatus::Verified);
-    let calls = clock.calls.load(Ordering::SeqCst);
-    clock.set(Err(GuestClockError::Unavailable));
+    let context = gate.take_accepted_attempt().unwrap();
+    assert_eq!(context.binding(), &f.grant.binding);
+    assert_eq!(context.grant_id(), f.grant.grant_id);
+    assert_eq!(context.grant_digest(), f.aggregate.grant_sha384);
+    assert_eq!(
+        context.aggregate_digest(),
+        f.aggregate.digest_sha384().unwrap()
+    );
+    assert_eq!(
+        context.authority_key_sha384(),
+        hash(f.authority.public_key().as_ref())
+    );
+    assert_eq!(
+        context.aggregate_key_sha384(),
+        hash(f.producer.public_key().as_ref())
+    );
+    assert_eq!(context.validity(), &f.grant.validity);
+    assert_eq!(
+        context.context_digest(),
+        f.receipt(gate.challenge_nonce()).context_sha384
+    );
+    assert_eq!(context.guest_nonce(), gate.challenge_nonce());
+    assert_eq!(context.workflow_id(), f.aggregate.request.workflow_id);
+    assert_eq!(context.resource_path(), &f.aggregate.request.resource_path);
+    drop(context); // Cancellation or failure after transfer cannot recover authority.
+    assert_eq!(gate.status().unwrap(), GateStatus::Consumed);
     assert_eq!(
         gate.verify_bundle(&f.grant_wire, &f.aggregate_wire, &receipt)
             .unwrap(),
         AdmissionCheck::Historical
+    );
+    assert_eq!(
+        gate.take_accepted_attempt().err(),
+        Some(GuestAdmissionError::AlreadyConsumed)
     );
     assert_eq!(
         gate.validate_for_preparation(&f.grant_wire, &f.aggregate_wire, &receipt)
@@ -224,7 +231,6 @@ fn valid_signed_bundle_still_cannot_prepare_and_exact_history_skips_clock() {
             GuestUnsupportedReason::ContentPreparationUnavailable
         ))
     );
-    assert_eq!(clock.calls.load(Ordering::SeqCst), calls);
     assert!(crate::supported_proof_profiles().is_empty());
     assert!(crate::prepare_launch(
         crate::PROTOCOL_VERSION,
@@ -247,7 +253,7 @@ fn each_actual_signature_and_own_configured_roots_are_required() {
             config.aggregate.kbs_proof_public_key =
                 attacker.public_key().as_ref().try_into().unwrap();
         }
-        let gate = GuestAdmissionGate::new(config, Clock::new(100)).unwrap();
+        let gate = GuestAdmissionGate::new(config).unwrap();
         let mut grant = f.grant_wire.clone();
         let mut aggregate = f.aggregate_wire.clone();
         let mut receipt = f.receipt_wire(&gate);
@@ -286,7 +292,7 @@ fn each_actual_signature_and_own_configured_roots_are_required() {
 fn signed_wrong_nonce_boot_attempt_content_policy_or_domain_is_rejected() {
     let f = Fixture::new();
     for which in 0..8 {
-        let gate = f.gate(Clock::new(100));
+        let gate = f.gate();
         let mut receipt = f.receipt(gate.challenge_nonce());
         match which {
             0 => receipt = f.receipt("different-guest-nonce"),
@@ -309,8 +315,8 @@ fn signed_wrong_nonce_boot_attempt_content_policy_or_domain_is_rejected() {
 #[test]
 fn fresh_gate_nonce_prevents_cross_gate_receipt_and_changed_raw_retry_conflicts() {
     let f = Fixture::new();
-    let first = f.gate(Clock::new(100));
-    let other = f.gate(Clock::new(100));
+    let first = f.gate();
+    let other = f.gate();
     assert_ne!(first.challenge_nonce(), other.challenge_nonce());
     let receipt = f.receipt_wire(&first);
     assert!(other
@@ -337,57 +343,38 @@ fn fresh_gate_nonce_prevents_cross_gate_receipt_and_changed_raw_retry_conflicts(
 }
 
 #[test]
-fn clock_failures_regression_and_expiry_denial_keep_pending_and_highwater() {
+fn authority_time_authentication_does_not_depend_on_guest_time() {
     let f = Fixture::new();
-    let clock = Clock::new(200);
-    let gate = f.gate(clock.clone());
+    let gate = f.gate();
     let receipt = f.receipt_wire(&gate);
+    let config = f.config();
+    // A conservative live wrapper still rejects expiry; the guest authenticates
+    // an authority-committed result against its own pending continuity instead.
     assert_eq!(
-        gate.verify_bundle(&f.grant_wire, &f.aggregate_wire, &receipt),
-        Err(GuestAdmissionError::Contract(
-            execution_proof_contract::Error::Expired
-        ))
+        execution_proof_contract::verify_launch_grant(&f.grant_wire, &config.grant, 200).err(),
+        Some(execution_proof_contract::Error::Expired)
     );
-    clock.set(Ok(199));
-    assert_eq!(
-        gate.verify_bundle(&f.grant_wire, &f.aggregate_wire, &receipt),
-        Err(GuestAdmissionError::ClockRegression)
-    );
-    assert_eq!(gate.status().unwrap(), GateStatus::Pending);
-    for value in [
-        Err(GuestClockError::Unavailable),
-        Err(GuestClockError::OutOfRange),
-        Ok(u64::MAX),
-    ] {
-        let clock = Clock::new(100);
-        let gate = f.gate(clock.clone());
-        clock.set(value);
-        assert!(gate
-            .verify_bundle(&f.grant_wire, &f.aggregate_wire, &f.receipt_wire(&gate))
-            .is_err());
-        assert_eq!(gate.status().unwrap(), GateStatus::Pending);
-    }
-    let clock = Clock::new(99);
-    let gate = f.gate(clock.clone());
-    let receipt = f.receipt_wire(&gate);
-    assert_eq!(
-        gate.verify_bundle(&f.grant_wire, &f.aggregate_wire, &receipt),
-        Err(GuestAdmissionError::Contract(
-            execution_proof_contract::Error::NotYetValid
-        ))
-    );
-    clock.set(Ok(100));
     assert_eq!(
         gate.verify_bundle(&f.grant_wire, &f.aggregate_wire, &receipt)
             .unwrap(),
         AdmissionCheck::FirstVerified
+    );
+    let _accepted = gate.take_accepted_attempt().unwrap();
+    let restored = f.gate();
+    assert_ne!(gate.challenge_nonce(), restored.challenge_nonce());
+    assert!(restored
+        .verify_bundle(&f.grant_wire, &f.aggregate_wire, &receipt)
+        .is_err());
+    assert_eq!(
+        restored.take_accepted_attempt().err(),
+        Some(GuestAdmissionError::NotReady)
     );
 }
 
 #[test]
 fn simultaneous_exact_submissions_have_one_first_verification_without_rearming() {
     let f = Fixture::new();
-    let gate = Arc::new(f.gate(Clock::new(100)));
+    let gate = Arc::new(f.gate());
     let receipt = Arc::new(f.receipt_wire(&gate));
     let grant = Arc::new(f.grant_wire);
     let aggregate = Arc::new(f.aggregate_wire);
@@ -426,10 +413,9 @@ fn simultaneous_exact_submissions_have_one_first_verification_without_rearming()
 }
 
 #[test]
-fn outer_bounds_precede_clock_and_trusted_exact_grant_is_not_request_selected() {
+fn outer_bounds_and_trusted_exact_grant_are_not_request_selected() {
     let f = Fixture::new();
-    let clock = Clock::new(100);
-    let gate = f.gate(clock.clone());
+    let gate = f.gate();
     let oversized = vec![b' '; MAX_WIRE_BYTES + 1];
     for values in [
         (&oversized[..], b"".as_slice(), b"".as_slice()),
@@ -441,12 +427,116 @@ fn outer_bounds_precede_clock_and_trusted_exact_grant_is_not_request_selected() 
             Err(GuestAdmissionError::TooLarge)
         );
     }
-    assert_eq!(clock.calls.load(Ordering::SeqCst), 0);
     let mut other = f.grant.clone();
     other.binding.boot_id = "other-boot".into();
     let other_wire = sign(other.clone(), &other.signing_bytes().unwrap(), &f.authority);
     assert_eq!(
         gate.verify_bundle(&other_wire, &f.aggregate_wire, &f.receipt_wire(&gate)),
         Err(GuestAdmissionError::BindingMismatch)
+    );
+}
+
+#[test]
+fn simultaneous_context_takes_have_one_winner_even_after_exact_retries() {
+    let f = Fixture::new();
+    let gate = Arc::new(f.gate());
+    let receipt = f.receipt_wire(&gate);
+    gate.verify_bundle(&f.grant_wire, &f.aggregate_wire, &receipt)
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(8));
+    let tasks: Vec<_> = (0..8)
+        .map(|_| {
+            let (gate, barrier) = (gate.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                gate.take_accepted_attempt().map(|_| ())
+            })
+        })
+        .collect();
+    let outcomes: Vec<_> = tasks.into_iter().map(|task| task.join().unwrap()).collect();
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == Err(GuestAdmissionError::AlreadyConsumed))
+            .count(),
+        7
+    );
+    assert_eq!(
+        gate.verify_bundle(&f.grant_wire, &f.aggregate_wire, &receipt)
+            .unwrap(),
+        AdmissionCheck::Historical
+    );
+    assert_eq!(
+        gate.take_accepted_attempt().err(),
+        Some(GuestAdmissionError::AlreadyConsumed)
+    );
+}
+
+#[test]
+fn aggregate_context_is_consumed_by_reference_registration_and_abort_never_rearms() {
+    let f = Fixture::new();
+    let gate = f.gate();
+    let receipt = f.receipt_wire(&gate);
+    gate.verify_bundle(&f.grant_wire, &f.aggregate_wire, &receipt)
+        .unwrap();
+    let accepted = gate.take_accepted_attempt().unwrap();
+    let reference = crate::PreparationReference {
+        id: crate::PreparationId::new([7; 32]),
+        context_sha384: crate::decode_sha384(accepted.context_digest()).unwrap(),
+    };
+    let table = crate::BootTable::new(f.grant.binding.boot_id.clone(), 1).unwrap();
+    assert_eq!(
+        table.register(accepted, reference).unwrap(),
+        crate::Registration::Inserted
+    );
+    let binding = &f.grant.binding;
+    let task = crate::TaskIdentity {
+        boot_id: binding.boot_id.clone(),
+        attempt_id: binding.attempt_id.clone(),
+        selected_manifest_sha256: binding.selected_manifest_sha256.clone(),
+        effective_launch_sha384: binding.effective_launch_sha384.clone(),
+        container_role: binding.container_role.clone(),
+        generation: 1,
+    };
+    table.bind(&reference, task.clone()).unwrap();
+    let _bookkeeping = table.consume(&reference, &task).unwrap();
+    table.abort(&reference).unwrap();
+    assert_eq!(
+        table.consume(&reference, &task).err(),
+        Some(crate::Error::Aborted)
+    );
+    assert_eq!(
+        gate.verify_bundle(&f.grant_wire, &f.aggregate_wire, &receipt)
+            .unwrap(),
+        AdmissionCheck::Historical
+    );
+    assert_eq!(
+        gate.take_accepted_attempt().err(),
+        Some(GuestAdmissionError::AlreadyConsumed)
+    );
+    assert!(crate::supported_proof_profiles().is_empty());
+}
+
+#[test]
+fn registration_failure_also_consumes_the_local_context() {
+    let f = Fixture::new();
+    let gate = f.gate();
+    let receipt = f.receipt_wire(&gate);
+    gate.verify_bundle(&f.grant_wire, &f.aggregate_wire, &receipt)
+        .unwrap();
+    let accepted = gate.take_accepted_attempt().unwrap();
+    let reference = crate::PreparationReference {
+        id: crate::PreparationId::new([8; 32]),
+        context_sha384: crate::decode_sha384(accepted.context_digest()).unwrap(),
+    };
+    let other_boot = crate::BootTable::new("other-boot".into(), 1).unwrap();
+    assert_eq!(
+        other_boot.register(accepted, reference),
+        Err(crate::Error::WrongBoot)
+    );
+    assert_eq!(
+        gate.take_accepted_attempt().err(),
+        Some(GuestAdmissionError::AlreadyConsumed)
     );
 }

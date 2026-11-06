@@ -137,6 +137,7 @@ impl VerifiedCredentialDelivery {
     }
 }
 
+/// Authenticates the statement and checks a trusted authority/lab clock.
 pub fn verify_credential_delivery(
     receipt_json: &[u8],
     grant: &VerifiedLaunchGrant,
@@ -144,6 +145,22 @@ pub fn verify_credential_delivery(
     expected: &DeliveryExpectations,
     jwe_bytes: &[u8],
     trusted_now: u64,
+) -> Result<VerifiedCredentialDelivery, Error> {
+    let verified =
+        verify_credential_delivery_historical(receipt_json, grant, aggregate, expected, jwe_bytes)?;
+    verified.validity().check_at(trusted_now)?;
+    Ok(verified)
+}
+
+/// Authenticates an already accepted publication and its exact signed context.
+/// This performs no current-time check and creates no new admission permission.
+/// A guest caller must retain its own pending nonce and one-use admission state.
+pub fn verify_credential_delivery_historical(
+    receipt_json: &[u8],
+    grant: &VerifiedLaunchGrant,
+    aggregate: &VerifiedPolicyAggregate,
+    expected: &DeliveryExpectations,
+    jwe_bytes: &[u8],
 ) -> Result<VerifiedCredentialDelivery, Error> {
     if jwe_bytes.is_empty() || jwe_bytes.len() > MAX_CREDENTIAL_JWE_BYTES {
         return Err(Error::TooLarge);
@@ -198,7 +215,6 @@ pub fn verify_credential_delivery(
         &bytes,
         &signed.signature,
     )?;
-    statement.validity.check_at(trusted_now)?;
     Ok(VerifiedCredentialDelivery {
         digest: sha384(&bytes),
         statement: signed.statement,

@@ -2,11 +2,14 @@
 //!
 //! A reference does not establish encrypted-content preparation, rootfs custody,
 //! bootstrap/key origin, or an observed exec. This crate neither opens paths nor
-//! releases a FIFO. Only authenticated statements can register a reference; the
+//! releases a FIFO. Only a one-use aggregate admission can register a reference; the
 //! caller still needs the real CDH and authenticated runtime handoff backends.
 //! State and tombstones are retained for the lifetime of the table. A restart is
 //! not replay protection: only a newly enrolled boot may create a new table.
 
+use admission::AcceptedAttemptContext;
+use execution_proof_contract::LaunchBinding;
+#[cfg(any(test, feature = "software-lab"))]
 use execution_proof_contract::VerifiedStatements;
 pub mod admission;
 use std::collections::BTreeMap;
@@ -75,10 +78,10 @@ impl PreparationId {
     }
 }
 
-/// An untrusted identifier plus the exact signed L/A context commitment.
+/// An untrusted identifier plus the exact aggregate admission context commitment.
 ///
 /// Anyone may construct a reference. Only `register` associates it with verified
-/// statements. The type deliberately contains no caller path or rootfs claim.
+/// admission. The type deliberately contains no caller path or rootfs claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreparationReference {
     pub id: PreparationId,
@@ -206,9 +209,48 @@ impl BootTable {
         })
     }
 
+    /// Consumes the unique accepted context even if registration rejects. Retry
+    /// uses status; it cannot recover preparation authority from an old receipt.
+    /// ```compile_fail
+    /// use execution_proof_contract::VerifiedStatements;
+    /// use execution_proof_handoff::{BootTable, PreparationReference};
+    /// fn early(table: &BootTable, old: VerifiedStatements, reference: PreparationReference) {
+    ///     table.register(old, reference);
+    /// }
+    /// ```
     pub fn register(
         &self,
+        admission: AcceptedAttemptContext,
+        reference: PreparationReference,
+    ) -> Result<Registration, Error> {
+        self.register_binding(
+            admission.binding(),
+            admission.grant_id(),
+            admission.context_digest(),
+            reference,
+        )
+    }
+
+    /// Early L/A software fixtures only; unavailable in the default runtime API.
+    #[cfg(any(test, feature = "software-lab"))]
+    pub fn register_lab(
+        &self,
         statements: &VerifiedStatements,
+        reference: PreparationReference,
+    ) -> Result<Registration, Error> {
+        self.register_binding(
+            statements.binding(),
+            statements.grant_id(),
+            statements.context_digest(),
+            reference,
+        )
+    }
+
+    fn register_binding(
+        &self,
+        binding: &LaunchBinding,
+        grant_id: &str,
+        context_digest: &str,
         reference: PreparationReference,
     ) -> Result<Registration, Error> {
         validate_reference(&reference)?;
@@ -216,14 +258,13 @@ impl BootTable {
         if let Some(entry) = entries.get(&reference.id) {
             exact_reference(entry, &reference)?;
         }
-        let binding = statements.binding();
         if binding.boot_id != self.boot_id {
             return Err(Error::WrongBoot);
         }
         if binding.container_role != APPLICATION_ROLE {
             return Err(Error::WrongRole);
         }
-        if reference.context_sha384 != decode_sha384(statements.context_digest())? {
+        if reference.context_sha384 != decode_sha384(context_digest)? {
             return Err(Error::ContextMismatch);
         }
         if let Some(entry) = entries.get(&reference.id) {
@@ -234,10 +275,7 @@ impl BootTable {
         if entries.values().any(|e| e.attempt_id == binding.attempt_id) {
             return Err(Error::AttemptAlreadyRegistered);
         }
-        if entries
-            .values()
-            .any(|e| e.grant_id == statements.grant_id())
-        {
+        if entries.values().any(|e| e.grant_id == grant_id) {
             return Err(Error::GrantAlreadyRegistered);
         }
         if entries.len() == self.capacity {
@@ -247,7 +285,7 @@ impl BootTable {
             reference.id,
             Entry {
                 reference,
-                grant_id: statements.grant_id().to_owned(),
+                grant_id: grant_id.to_owned(),
                 attempt_id: binding.attempt_id.clone(),
                 manifest: binding.selected_manifest_sha256.clone(),
                 effective_launch: binding.effective_launch_sha384.clone(),

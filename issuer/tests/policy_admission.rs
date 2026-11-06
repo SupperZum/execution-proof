@@ -9,12 +9,15 @@ use execution_proof_contract::{
         ResourcePolicyRequest, POLICY_AGGREGATE_PROFILE, POLICY_AGGREGATE_PURPOSE,
         POLICY_AGGREGATE_VERSION,
     },
-    verify_launch_grant_historical, GrantExpectations, VerifiedLaunchGrant,
+    verify_launch_grant_historical, GrantExpectations, LaunchGrant, Signed, VerifiedLaunchGrant,
+};
+use execution_proof_handoff::admission::{
+    AdmissionCheck, GateStatus, GuestAdmissionConfig, GuestAdmissionError, GuestAdmissionGate,
 };
 use execution_proof_issuer::{
     AdmissionPublicationKind, ClockError, Error, PolicyAdmissionConfig, RecorderRequest,
-    Redemption, SoftwareIssuer, StoreError, POLICY_REDEEM_PURPOSE, POLICY_STATUS_PURPOSE,
-    REDEEM_PURPOSE, REQUEST_VERSION,
+    SoftwareIssuer, StoreError, POLICY_REDEEM_PURPOSE, POLICY_STATUS_PURPOSE, REDEEM_PURPOSE,
+    REQUEST_VERSION, STATUS_PURPOSE,
 };
 use std::sync::{Arc, Barrier};
 use support::{hash, signed, Fixture, Key};
@@ -373,51 +376,46 @@ fn operator_pins_must_match_static_policy_scope_and_owned_issued_grant() {
 }
 
 #[test]
-fn old_and_policy_formats_share_one_durable_consume_slot_in_both_orders() {
-    for old_first in [true, false] {
-        let lab = Lab::new();
-        let issuer = lab.create();
-        let enrollment = lab.base.enrollment(&issuer, "one");
-        let old_wire = enrollment.issue(&issuer);
-        let old = lab.base.statements(&enrollment, &old_wire);
-        // Exact issuance retry builds the same L for the aggregate fixture.
-        let case = lab.case(&issuer, "one");
-        assert_eq!(case.grant_wire, old_wire);
-        lab.pin(&issuer, &case);
-        let old_request = lab.base.request(&old, REDEEM_PURPOSE, &lab.base.recorder);
-        let request = lab.request(&case, POLICY_REDEEM_PURPOSE, &lab.base.recorder);
-        if old_first {
-            assert_eq!(
-                issuer.redeem(&old, &old_request).unwrap(),
-                Redemption::FirstRedeemed
-            );
-            assert!(matches!(
-                issuer.redeem_policy_aggregate(
+fn policy_profile_rejects_early_redeem_and_status_without_consuming_aggregate_slot() {
+    let lab = Lab::new();
+    let issuer = lab.create();
+    let enrollment = lab.base.enrollment(&issuer, "one");
+    let old_wire = enrollment.issue(&issuer);
+    let old = lab.base.statements(&enrollment, &old_wire);
+    let case = lab.case(&issuer, "one");
+    assert_eq!(case.grant_wire, old_wire);
+    lab.pin(&issuer, &case);
+    let old_redeem = lab.base.request(&old, REDEEM_PURPOSE, &lab.base.recorder);
+    let old_status = lab.base.request(&old, STATUS_PURPOSE, &lab.base.recorder);
+    for consumed in [false, true] {
+        assert!(matches!(
+            issuer.redeem(&old, &old_redeem),
+            Err(Error::PolicyMismatch)
+        ));
+        assert!(matches!(
+            issuer.status(&old, &old_status),
+            Err(Error::PolicyMismatch)
+        ));
+        let status = issuer
+            .status_policy_aggregate(
+                case.grant.grant_id(),
+                &case.aggregate_wire,
+                &lab.request(&case, POLICY_STATUS_PURPOSE, &lab.base.recorder),
+            )
+            .unwrap();
+        assert_eq!(status.is_some(), consumed);
+        if !consumed {
+            let publication = issuer
+                .redeem_policy_aggregate(
                     case.grant.grant_id(),
                     &case.aggregate_wire,
-                    &request
-                ),
-                Err(Error::Store(StoreError::Conflict))
-            ));
-            assert!(issuer
-                .status_policy_aggregate(
-                    case.grant.grant_id(),
-                    &case.aggregate_wire,
-                    &lab.request(&case, POLICY_STATUS_PURPOSE, &lab.base.recorder)
+                    &lab.request(&case, POLICY_REDEEM_PURPOSE, &lab.base.recorder),
                 )
-                .is_err());
-        } else {
+                .unwrap();
             assert_eq!(
-                issuer
-                    .redeem_policy_aggregate(case.grant.grant_id(), &case.aggregate_wire, &request)
-                    .unwrap()
-                    .publication,
+                publication.publication,
                 AdmissionPublicationKind::FirstAuthorized
             );
-            assert!(matches!(
-                issuer.redeem(&old, &old_request),
-                Err(Error::Store(StoreError::Conflict))
-            ));
         }
     }
 }
@@ -462,7 +460,7 @@ fn independent_connections_publish_only_one_authorization_and_preserve_its_bytes
 }
 
 #[test]
-fn concurrent_old_and_policy_redemption_have_exactly_one_winner() {
+fn concurrent_early_redemption_cannot_compete_with_policy_admission() {
     let lab = Arc::new(Lab::new());
     let issuer = lab.create();
     let enrollment = lab.base.enrollment(&issuer, "mixed-race");
@@ -490,17 +488,12 @@ fn concurrent_old_and_policy_redemption_have_exactly_one_winner() {
     });
     let old_result = old_thread.join().unwrap();
     let new_result = new_thread.join().unwrap();
+    assert!(matches!(old_result, Err(Error::PolicyMismatch)));
     assert_eq!(
-        usize::from(old_result.is_ok()) + usize::from(new_result.is_ok()),
-        1
+        new_result.unwrap().publication,
+        AdmissionPublicationKind::FirstAuthorized
     );
-    if let Err(error) = old_result {
-        assert!(matches!(error, Error::Store(StoreError::Conflict)));
-    }
-    if let Err(error) = new_result {
-        assert!(matches!(error, Error::Store(StoreError::Conflict)));
-    }
-    lab.reopen(); // Both possible winner formats remain structurally valid.
+    lab.reopen(); // Rejected early calls cannot corrupt the aggregate record.
 }
 
 #[test]
@@ -622,4 +615,128 @@ fn clock_failures_expiry_high_water_and_explicit_profile_identity_fail_closed() 
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(schema, 2);
+}
+
+#[test]
+fn committed_receipt_first_delivery_after_expiry_activates_only_original_pending_gate() {
+    let lab = Lab::new();
+    let issuer = lab.create();
+    let mut case = lab.case(&issuer, "delayed-first-delivery");
+    let base = lab.base.config();
+    let gate_config = || GuestAdmissionConfig {
+        grant: GrantExpectations {
+            authority_public_key: lab.base.authority.public(),
+            audience: base.audience.clone(),
+            authority: base.authority.clone(),
+            tenant: base.tenant.clone(),
+            profile_sha384: base.profile_sha384.clone(),
+            launch_policy_sha384: base.launch_policy_sha384.clone(),
+            image_policy_sha384: base.image_policy_sha384.clone(),
+        },
+        expected_grant: serde_json::from_slice::<Signed<LaunchGrant>>(&case.grant_wire)
+            .unwrap()
+            .statement,
+        aggregate: AggregateExpectations {
+            kbs_proof_public_key: lab.kbs.public(),
+            expected: case.aggregate.clone(),
+        },
+        audience: lab.config().receipt_audience,
+        issuer: base.authority.clone(),
+        admission_policy_sha384: issuer.admission_policy_sha384().unwrap().into(),
+    };
+    let gate = GuestAdmissionGate::new(gate_config()).unwrap();
+    let lost_continuity = GuestAdmissionGate::new(gate_config()).unwrap();
+    case.nonce = gate.challenge_nonce().into();
+    let aggregate = verify_policy_aggregate(
+        &case.aggregate_wire,
+        &case.grant,
+        &AggregateExpectations {
+            kbs_proof_public_key: lab.kbs.public(),
+            expected: case.aggregate.clone(),
+        },
+    )
+    .unwrap();
+    case.context = policy_admission_context(
+        &case.grant,
+        &aggregate,
+        &case.nonce,
+        issuer.admission_policy_sha384().unwrap(),
+    )
+    .unwrap();
+    lab.pin(&issuer, &case);
+    let request = lab.request(&case, POLICY_REDEEM_PURPOSE, &lab.base.recorder);
+    let committed = issuer
+        .redeem_policy_aggregate(case.grant.grant_id(), &case.aggregate_wire, &request)
+        .unwrap();
+    assert_eq!(
+        committed.publication,
+        AdmissionPublicationKind::FirstAuthorized
+    );
+    assert_eq!(gate.status().unwrap(), GateStatus::Pending); // Reply was lost/delayed.
+    lab.base.clock.set(case.grant.validity().expires);
+    let retry = issuer
+        .redeem_policy_aggregate(case.grant.grant_id(), &case.aggregate_wire, &request)
+        .unwrap();
+    assert_eq!(retry.publication, AdmissionPublicationKind::Existing);
+    assert_eq!(
+        retry.signed_authorization_json,
+        committed.signed_authorization_json
+    );
+    let config = lab.base.config();
+    assert_eq!(
+        execution_proof_contract::verify_launch_grant(
+            &case.grant_wire,
+            &GrantExpectations {
+                authority_public_key: lab.base.authority.public(),
+                audience: config.audience,
+                authority: config.authority,
+                tenant: config.tenant,
+                profile_sha384: config.profile_sha384,
+                launch_policy_sha384: config.launch_policy_sha384,
+                image_policy_sha384: config.image_policy_sha384,
+            },
+            case.grant.validity().expires
+        )
+        .err(),
+        Some(execution_proof_contract::Error::Expired)
+    );
+    assert_eq!(
+        gate.verify_bundle(
+            &case.grant_wire,
+            &case.aggregate_wire,
+            &retry.signed_authorization_json
+        )
+        .unwrap(),
+        AdmissionCheck::FirstVerified
+    );
+    let context = gate.take_accepted_attempt().unwrap();
+    assert_eq!(context.context_digest(), case.context);
+    drop(context);
+    assert_eq!(
+        gate.verify_bundle(
+            &case.grant_wire,
+            &case.aggregate_wire,
+            &retry.signed_authorization_json
+        )
+        .unwrap(),
+        AdmissionCheck::Historical
+    );
+    assert_eq!(gate.status().unwrap(), GateStatus::Consumed);
+    assert_eq!(
+        gate.take_accepted_attempt().err(),
+        Some(GuestAdmissionError::AlreadyConsumed)
+    );
+    assert_ne!(lost_continuity.challenge_nonce(), gate.challenge_nonce());
+    assert!(lost_continuity
+        .verify_bundle(
+            &case.grant_wire,
+            &case.aggregate_wire,
+            &retry.signed_authorization_json
+        )
+        .is_err());
+    assert_eq!(
+        lost_continuity.take_accepted_attempt().err(),
+        Some(GuestAdmissionError::NotReady)
+    );
+    assert!(execution_proof_handoff::supported_proof_profiles().is_empty());
 }

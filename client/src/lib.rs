@@ -4,7 +4,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use execution_proof_contract::{
     credential::{
-        verify_credential_delivery, DeliveryExpectations, VerifiedCredentialDelivery,
+        verify_credential_delivery_historical, DeliveryExpectations, VerifiedCredentialDelivery,
         MAX_CREDENTIAL_JWE_BYTES,
     },
     policy_receipt::{
@@ -12,7 +12,7 @@ use execution_proof_contract::{
         VerifiedPolicyAggregate,
     },
     session::{operation_signing_bytes, recorder_session_signing_bytes, SessionOperation},
-    verify_launch_grant, GrantExpectations, VerifiedLaunchGrant,
+    verify_launch_grant, verify_launch_grant_historical, GrantExpectations, VerifiedLaunchGrant,
 };
 use kbs_types::TeePubKey;
 use ring::{
@@ -85,7 +85,8 @@ struct CredentialResponse {
 }
 
 /// The encrypted bytes are exposed only after authenticating their producer,
-/// exact ciphertext digest, current signed window and client-owned context.
+/// exact ciphertext digest, signed acceptance window and client-owned context.
+/// Authentication alone does not create a guest preparation permission.
 pub struct VerifiedCredentialResponse {
     delivery: VerifiedCredentialDelivery,
     jwe: Vec<u8>,
@@ -107,9 +108,10 @@ struct BeginContext {
 }
 
 /// Keys remain in memory. No raw Debug, serialization, or caller-derived trust roots.
-/// The grant is time-checked at construction; the server must independently check
-/// its trusted clock before each new admission. Aggregate verification is not a
-/// current authorization or an execution verdict.
+/// The authority-time constructor authenticates the signed grant without trusting
+/// the guest clock. The server checks its clock before each new admission; the
+/// guest admission gate owns pending continuity and one-use state. Aggregate
+/// authentication is not a new authorization or an execution verdict.
 pub struct ClientProtocol {
     grant: VerifiedLaunchGrant,
     signed_grant: Vec<u8>,
@@ -133,6 +135,29 @@ impl ClientProtocol {
         expected_init: [u8; 48],
     ) -> Result<Self, ClientError> {
         let grant = verify_launch_grant(&signed_grant, expected, trusted_now)?;
+        Self::from_verified_grant(signed_grant, grant, recorder, keywrap, expected_init)
+    }
+
+    /// Guest path: authenticate L while the authority owns live acceptance time.
+    /// This does not mint a guest admission or preparation capability.
+    pub fn new_authority_time(
+        signed_grant: Vec<u8>,
+        expected: &GrantExpectations,
+        recorder: Ed25519KeyPair,
+        keywrap: TeePubKey,
+        expected_init: [u8; 48],
+    ) -> Result<Self, ClientError> {
+        let grant = verify_launch_grant_historical(&signed_grant, expected)?;
+        Self::from_verified_grant(signed_grant, grant, recorder, keywrap, expected_init)
+    }
+
+    fn from_verified_grant(
+        signed_grant: Vec<u8>,
+        grant: VerifiedLaunchGrant,
+        recorder: Ed25519KeyPair,
+        keywrap: TeePubKey,
+        expected_init: [u8; 48],
+    ) -> Result<Self, ClientError> {
         if hash(recorder.public_key().as_ref()) != grant.binding().channel_key_sha384 {
             return Err(ClientError::BindingMismatch);
         }
@@ -193,14 +218,28 @@ impl ClientProtocol {
         }))
     }
 
-    /// Verifies fresh acceptance, including exact retries. Historical policy
-    /// authentication alone never exposes credential ciphertext after expiry.
+    /// Conservative authority/lab wrapper that also checks current trusted time.
     pub fn verify_credential_response(
         &self,
         response_json: &[u8],
         aggregate_json: &[u8],
         expected: &DeliveryExpectations,
         trusted_now: u64,
+    ) -> Result<VerifiedCredentialResponse, ClientError> {
+        let verified =
+            self.verify_credential_response_historical(response_json, aggregate_json, expected)?;
+        verified.delivery().validity().check_at(trusted_now)?;
+        Ok(verified)
+    }
+
+    /// Authenticates an authority-accepted credential publication, without a guest
+    /// clock. This exposes ciphertext only; a live one-use admission context is
+    /// still required by the attempt adapter before any credential can be used.
+    pub fn verify_credential_response_historical(
+        &self,
+        response_json: &[u8],
+        aggregate_json: &[u8],
+        expected: &DeliveryExpectations,
     ) -> Result<VerifiedCredentialResponse, ClientError> {
         if response_json.len() > MAX_CREDENTIAL_RESPONSE_BYTES {
             return Err(ClientError::TooLarge);
@@ -216,13 +255,12 @@ impl ClientProtocol {
             execution_proof_contract::MAX_WIRE_BYTES,
         )?;
         let jwe = canonical_base64(&response.jwe_b64, MAX_CREDENTIAL_JWE_BYTES)?;
-        let delivery = verify_credential_delivery(
+        let delivery = verify_credential_delivery_historical(
             &receipt,
             &self.grant,
             &aggregate,
             expected,
             &jwe,
-            trusted_now,
         )?;
         Ok(VerifiedCredentialResponse { delivery, jwe })
     }

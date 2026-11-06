@@ -5,6 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+software-lab = []
+
+[[test]]
+name = "admission_lifecycle"
+required-features = ["software-lab"]
+
 [dependencies]
 execution-proof-contract = { path = "../contract" }
 ring.workspace = true

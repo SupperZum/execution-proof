@@ -534,6 +534,9 @@ impl Store {
         statements: &VerifiedStatements,
         clock: &dyn IssuerClock,
     ) -> Result<Redemption, StoreError> {
+        if !matches!(self.profile, StoreProfile::Legacy) {
+            return Err(StoreError::InvalidInput);
+        }
         let mut connection = self.connection.lock().map_err(|_| StoreError::Corrupt)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (_, issued) = find_grant(&transaction, statements.grant_id())?.decode()?;
@@ -571,6 +574,9 @@ impl Store {
         grant_id: &str,
         context_digest: &str,
     ) -> Result<RedemptionStatus, StoreError> {
+        if !matches!(self.profile, StoreProfile::Legacy) {
+            return Err(StoreError::InvalidInput);
+        }
         hex(context_digest, 48)?;
         let issued = self.get_issued(grant_id)?;
         match issued.redemption_context {
@@ -689,23 +695,30 @@ impl Store {
         authorization: &AdmissionAuthorizationV1,
     ) -> Result<Option<Vec<u8>>, StoreError> {
         let authority = self.policy_authority()?;
-        let connection = self.connection.lock().map_err(|_| StoreError::Corrupt)?;
-        let (_, issued) = find_grant(&connection, &authorization.grant_id)?.decode()?;
+        let mut connection = self.connection.lock().map_err(|_| StoreError::Corrupt)?;
+        // Both rows describe one durable transition. Keep a read snapshot even
+        // when another issuer connection commits redemption between the reads.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let (_, issued) = find_grant(&transaction, &authorization.grant_id)?.decode()?;
         let issued = issued.ok_or(StoreError::NotFound)?;
-        let (pin, receipt) = read_policy_pin(&connection, &authorization.grant_id)?;
+        #[cfg(test)]
+        tests::after_policy_status_first_read();
+        let (pin, receipt) = read_policy_pin(&transaction, &authorization.grant_id)?;
         validate_pin_issued(&pin, &issued, &authority)?;
         validate_authorization(authorization, &pin, &issued)?;
-        match issued.redemption_context.as_deref() {
-            None if receipt.is_none() => Ok(None),
+        let receipt = match issued.redemption_context.as_deref() {
+            None if receipt.is_none() => None,
             Some(context) if context == authorization.context_sha384 => {
                 let bytes = receipt.ok_or(StoreError::Conflict)?;
                 if decode_receipt(&bytes, &pin, &issued, &authority)? != *authorization {
                     return Err(StoreError::Conflict);
                 }
-                Ok(Some(bytes))
+                Some(bytes)
             }
-            _ => Err(StoreError::Conflict),
-        }
+            _ => return Err(StoreError::Conflict),
+        };
+        transaction.commit()?;
+        Ok(receipt)
     }
 
     fn policy_authority(&self) -> Result<[u8; 32], StoreError> {
@@ -1387,6 +1400,77 @@ mod tests {
             .unwrap();
         (issued, grant, wire)
     }
+    fn policy_authorization_fixture(
+        store: &Store,
+        issued: &IssuedRecord,
+        grant: &LaunchGrant,
+    ) -> AdmissionAuthorizationV1 {
+        use execution_proof_contract::policy_receipt::{
+            PolicyCommitments, ResourcePolicyRequest, POLICY_AGGREGATE_PROFILE,
+            POLICY_AGGREGATE_PURPOSE, POLICY_AGGREGATE_VERSION,
+        };
+        let expected = LaunchPolicyAggregateV1 {
+            version: POLICY_AGGREGATE_VERSION,
+            purpose: POLICY_AGGREGATE_PURPOSE.into(),
+            audience: "lab-policy".into(),
+            issuer: "kbs".into(),
+            profile: POLICY_AGGREGATE_PROFILE.into(),
+            grant_sha384: issued.grant_digest.clone(),
+            authority_key_sha384: sha384(key(2).public_key().as_ref()),
+            session_id: "31".repeat(32),
+            nonce: "quote".into(),
+            runtime_sha384: "32".repeat(48),
+            init_data_sha384: "33".repeat(48),
+            evidence_sha384: "34".repeat(48),
+            recorder_key_sha384: sha384(key(3).public_key().as_ref()),
+            request: ResourcePolicyRequest {
+                method: "GET".into(),
+                plugin: "resource".into(),
+                resource_path: ["repo".into(), "key".into(), "v1".into()],
+                workflow_id: "workflow".into(),
+                request_nonce: "35".repeat(32),
+            },
+            as_evaluation: PolicyCommitments {
+                policy_id: "launch_cpu".into(),
+                policy_sha384: grant.binding.launch_policy_sha384.clone(),
+                input_sha384: "36".repeat(48),
+                data_sha384: None,
+            },
+            kbs_evaluation: PolicyCommitments {
+                policy_id: "restricted_resource".into(),
+                policy_sha384: "37".repeat(48),
+                input_sha384: "38".repeat(48),
+                data_sha384: Some("39".repeat(48)),
+            },
+        };
+        let pin = PolicyPin {
+            grant_id: grant.grant_id.clone(),
+            expected_json: serde_json::to_vec(&expected).unwrap(),
+            expected_digest: expected.digest_sha384().unwrap(),
+            guest_nonce: "41".repeat(32),
+            policy_digest: "42".repeat(48),
+        };
+        store.pin_policy(&pin).unwrap();
+        // Internal database fixture, not a contract/producer verification test.
+        // The public issuer path independently derives this complete template.
+        AdmissionAuthorizationV1 {
+            version: ADMISSION_VERSION,
+            purpose: ADMISSION_PURPOSE.into(),
+            audience: "guest".into(),
+            issuer: "authority".into(),
+            profile: ADMISSION_PROFILE.into(),
+            grant_id: grant.grant_id.clone(),
+            grant_sha384: issued.grant_digest.clone(),
+            aggregate_sha384: pin.expected_digest.clone(),
+            aggregate_key_sha384: sha384(key(4).public_key().as_ref()),
+            context_sha384: "43".repeat(48),
+            guest_nonce: pin.guest_nonce,
+            admission_policy_sha384: pin.policy_digest,
+            validity: grant.validity,
+            binding: grant.binding.clone(),
+        }
+    }
+
     fn verified(grant: &LaunchGrant, wire: &[u8], policy: u8) -> VerifiedStatements {
         let evaluation = EvaluationCommitments {
             policy_id: "policy".into(),
@@ -1816,6 +1900,18 @@ mod tests {
     thread_local! {
         static QUEUE_HOOK: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
     }
+    thread_local! {
+        static STATUS_READ_HOOK: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn after_policy_status_first_read() {
+        STATUS_READ_HOOK.with(|hook| {
+            if let Some((read, resume)) = hook.borrow_mut().take() {
+                read.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        });
+    }
+
     fn await_writer_release(_: i32) -> bool {
         QUEUE_HOOK.with(|hook| {
             if let Some((queued, released)) = hook.borrow_mut().take() {
@@ -1881,10 +1977,6 @@ mod tests {
 
     #[test]
     fn policy_receipt_signing_waits_for_writer_and_expiry_keeps_both_slots_empty() {
-        use execution_proof_contract::policy_receipt::{
-            PolicyCommitments, ResourcePolicyRequest, POLICY_AGGREGATE_PROFILE,
-            POLICY_AGGREGATE_PURPOSE, POLICY_AGGREGATE_VERSION,
-        };
         let dir = TestDir::new();
         let path = dir.db();
         let clock = Arc::new(ManualClock::new(1000));
@@ -1898,66 +1990,21 @@ mod tests {
             .unwrap()
             .record;
         let grant = launch(&reservation, &"21".repeat(48));
-        let expected = LaunchPolicyAggregateV1 {
-            version: POLICY_AGGREGATE_VERSION,
-            purpose: POLICY_AGGREGATE_PURPOSE.into(),
-            audience: "lab-policy".into(),
-            issuer: "kbs".into(),
-            profile: POLICY_AGGREGATE_PROFILE.into(),
-            grant_sha384: issued.grant_digest.clone(),
-            authority_key_sha384: sha384(&authority),
-            session_id: "31".repeat(32),
-            nonce: "quote".into(),
-            runtime_sha384: "32".repeat(48),
-            init_data_sha384: "33".repeat(48),
-            evidence_sha384: "34".repeat(48),
-            recorder_key_sha384: sha384(key(3).public_key().as_ref()),
-            request: ResourcePolicyRequest {
-                method: "GET".into(),
-                plugin: "resource".into(),
-                resource_path: ["repo".into(), "key".into(), "v1".into()],
-                workflow_id: "workflow".into(),
-                request_nonce: "35".repeat(32),
-            },
-            as_evaluation: PolicyCommitments {
-                policy_id: "launch_cpu".into(),
-                policy_sha384: grant.binding.launch_policy_sha384.clone(),
-                input_sha384: "36".repeat(48),
-                data_sha384: None,
-            },
-            kbs_evaluation: PolicyCommitments {
-                policy_id: "restricted_resource".into(),
-                policy_sha384: "37".repeat(48),
-                input_sha384: "38".repeat(48),
-                data_sha384: Some("39".repeat(48)),
-            },
-        };
-        let pin = PolicyPin {
-            grant_id: grant.grant_id.clone(),
-            expected_json: serde_json::to_vec(&expected).unwrap(),
-            expected_digest: expected.digest_sha384().unwrap(),
-            guest_nonce: "41".repeat(32),
-            policy_digest: "42".repeat(48),
-        };
-        store.pin_policy(&pin).unwrap();
-        // Internal database fixture, not a contract/producer verification test.
-        // The public issuer path independently derives this complete template.
-        let template = AdmissionAuthorizationV1 {
-            version: ADMISSION_VERSION,
-            purpose: ADMISSION_PURPOSE.into(),
-            audience: "guest".into(),
-            issuer: "authority".into(),
-            profile: ADMISSION_PROFILE.into(),
-            grant_id: grant.grant_id.clone(),
-            grant_sha384: issued.grant_digest,
-            aggregate_sha384: pin.expected_digest.clone(),
-            aggregate_key_sha384: sha384(key(4).public_key().as_ref()),
-            context_sha384: "43".repeat(48),
-            guest_nonce: pin.guest_nonce,
-            admission_policy_sha384: pin.policy_digest,
-            validity: grant.validity,
-            binding: grant.binding,
-        };
+        let early = verified(&grant, &issued.signed_grant_json, 1);
+        assert!(matches!(
+            store.redeem(&early, clock.as_ref()),
+            Err(StoreError::InvalidInput)
+        ));
+        assert!(matches!(
+            store.status(early.grant_id(), early.context_digest()),
+            Err(StoreError::InvalidInput)
+        ));
+        assert!(store
+            .get_issued(early.grant_id())
+            .unwrap()
+            .redemption_context
+            .is_none());
+        let template = policy_authorization_fixture(&store, &issued, &grant);
         let worker_store = Store::open_existing_policy(&path, &identity(), 2, authority).unwrap();
         worker_store
             .connection
@@ -1994,6 +2041,69 @@ mod tests {
             reopened.reserve(&candidate("after-policy-denial", 2), clock.as_ref(), 30),
             Err(StoreError::ClockRegression)
         ));
+    }
+
+    #[test]
+    fn policy_status_keeps_one_read_snapshot_during_cross_connection_redemption() {
+        let dir = TestDir::new();
+        let path = dir.db();
+        let authority: [u8; 32] = key(2).public_key().as_ref().try_into().unwrap();
+        let writer =
+            Store::initialize_new_policy(&path, &identity(), 2, &FixedClock, authority).unwrap();
+        let reservation = writer
+            .reserve_lab(&candidate("status-snapshot", 1))
+            .unwrap();
+        let (issued, grant, _) = issued_fixture(&writer, &reservation);
+        let template = policy_authorization_fixture(&writer, &issued, &grant);
+        let reader_store = Store::open_existing_policy(&path, &identity(), 2, authority).unwrap();
+        // No timing assumption: a competing commit either succeeds between the
+        // old autocommit reads or reports Busy while the fixed snapshot is live.
+        writer
+            .connection
+            .lock()
+            .unwrap()
+            .busy_timeout(Duration::ZERO)
+            .unwrap();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let reader_template = template.clone();
+        let reader = thread::spawn(move || {
+            STATUS_READ_HOOK.with(|hook| *hook.borrow_mut() = Some((read_tx, resume_rx)));
+            reader_store.policy_status(&reader_template)
+        });
+        read_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let concurrent_redemption = writer.redeem_policy(&template, &key(2), &FixedClock);
+        resume_tx.send(()).unwrap();
+        let reader_status = reader.join().unwrap();
+        if let Err(error) = &reader_status {
+            eprintln!("status during cross-connection redemption: {error}");
+        }
+        assert!(
+            matches!(reader_status, Ok(None)),
+            "status must retain the pending snapshot read before redemption"
+        );
+        assert!(matches!(concurrent_redemption, Err(StoreError::Busy)));
+        assert!(writer
+            .get_issued(&template.grant_id)
+            .unwrap()
+            .redemption_context
+            .is_none());
+        let publication = writer
+            .redeem_policy(&template, &key(2), &FixedClock)
+            .unwrap();
+        assert_eq!(
+            publication.publication,
+            AdmissionPublicationKind::FirstAuthorized
+        );
+        assert_eq!(
+            writer.policy_status(&template).unwrap(),
+            Some(publication.bytes.clone())
+        );
+        let retry = writer
+            .redeem_policy(&template, &key(2), &FixedClock)
+            .unwrap();
+        assert_eq!(retry.publication, AdmissionPublicationKind::Existing);
+        assert_eq!(retry.bytes, publication.bytes);
     }
 
     #[test]

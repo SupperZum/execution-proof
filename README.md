@@ -1,181 +1,183 @@
 # Execution Proof Prototype
 
-Rust libraries for signed workload launch authorization, policy admission, and
-boot-local handoff bookkeeping in an encrypted-image execution proof workflow.
-They authenticate software statements and constrain state transitions between a
-launch authority, a Key Broker Service (KBS) policy producer, and a guest runtime.
-They do not produce evidence that an application executed.
+Rust libraries for signed workload launch authorization, policy admission and
+one-use guest context in an encrypted-image execution proof workflow. They bind
+an independent launch authority, a Key Broker Service (KBS) policy producer and a
+guest runtime through explicit signatures and expected launch context.
 
-Content preparation is unavailable: `prepare_launch` and
-`GuestAdmissionGate::validate_for_preparation` always reject it. The workspace
-contains libraries, with no issuer daemon, command-line program, or deployment
-configuration.
+The workspace authenticates software statements and enforces local state
+transitions. It does not produce evidence that an application executed.
+`prepare_launch` and `GuestAdmissionGate::validate_for_preparation` reject content
+preparation until the required content and runtime adapters are available.
 
 ## Workspace
 
 | Crate | Responsibility |
 | --- | --- |
-| [`execution-proof-contract`](contract/) | Bounded signed objects, domain-separated transcripts, and verification of launch, bootstrap, session, policy, credential, and admission statements. |
-| [`execution-proof-handoff`](handoff/) | Guest-owned bundle verification and boot-local preparation-reference/task bookkeeping. |
-| [`execution-proof-issuer`](issuer/) | Software authority with signed intent/bootstrap verification, grant issuance, durable SQLite state, and policy admission. |
+| [`execution-proof-contract`](contract/) | Bounded wire types, domain-separated signing transcripts and verification of launch, bootstrap, policy, credential and admission statements. |
+| [`execution-proof-handoff`](handoff/) | Guest-owned admission, one-use accepted context and boot-local reference/task bookkeeping. |
+| [`execution-proof-issuer`](issuer/) | Signed grant issuance, trusted operator policy pins and durable SQLite admission decisions. |
 | [`execution-proof-client`](client/README.md) | Memory-only KBS launch protocol client and optional HTTPS transport. |
 
-The client, issuer, and handoff crates depend on `contract`. All path dependencies
-are inside this workspace. Building these libraries does not require the guest
-runtime or KBS source trees. Runtime and attester adapters belong in those
-components.
+These crates expose libraries; there is no command-line program or issuer daemon.
+The client, issuer and handoff crates depend on `contract`. The issuer's
+integration tests also use `handoff`. All path dependencies are inside the
+workspace, so building a checkout needs no guest runtime or KBS source tree.
 
 ## Build and test
 
-The manifests declare Rust 1.90 and edition 2021. Native dependencies `ring` and
-bundled SQLite require a C compiler and the platform's linker/build tools. A
-system SQLite installation is not required. Formatting and linting use the
-`rustfmt` and `clippy` toolchain components.
+Use stable Rust and Cargo with the `rustfmt` and `clippy` components. Building
+`ring` and bundled SQLite requires a C compiler and native linker/build tools.
+SQLite is built from the locked dependency; a system SQLite installation is not
+required.
 
 Run from the repository root:
 
 ```sh
 cargo build --workspace --locked
 cargo test --workspace --locked
-cargo test -p execution-proof-client --features https --locked
+cargo test --workspace --all-features --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo clippy -p execution-proof-client --all-targets --features https --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all --check
-cargo doc --workspace --features execution-proof-client/https --no-deps --locked
+cargo doc --workspace --all-features --no-deps --locked
 ```
 
-Dependencies are resolved by the committed `Cargo.lock`. Add `--offline` when
-the locked dependencies are already cached. Tests use ephemeral in-memory signing
-keys and temporary issuer databases; they need no VM, cloud account, root
-privileges, external service, or credentials. They exercise software contracts,
-not a deployed attestation or execution proof chain. These commands alone do not
-establish a supported platform or minimum-toolchain matrix.
+Dependencies are resolved by the committed `Cargo.lock`. Add `--offline` to Cargo
+build, test, lint or documentation commands when the locked dependencies are
+already cached. Tests need no VM, cloud account, root privileges, external
+service or credentials. They check signatures and state transitions with software
+fixtures; they do not validate a deployed attestation or execution proof chain.
 
-API documentation is generated under `target/doc/`. See the
-[client guide](client/README.md) for protocol sequencing, transport limits, and
-feature-specific checks. `https` is optional and disabled by default. All packages
-have `publish = false`.
+Default features are empty. `execution-proof-client/https` enables the HTTPS
+transport. `execution-proof-handoff/software-lab` exposes the association-only
+`register_lab` path and its lifecycle fixtures. `--all-features` exercises both;
+default-feature checks preserve the normal admission boundary.
 
-## Signed objects
+API documentation is generated by `cargo doc`; open
+`target/doc/execution_proof_handoff/index.html` after the documentation command
+above. All packages have `publish = false`.
 
-Trust roots and exact expected identities, policies, and inputs come from the
-relying party's configuration, never from the submitted bundle. Signing uses
-Ed25519, explicit purposes, ordered length framing, and SHA-384 commitments.
-Unsupported schemas and malformed, unknown, or duplicate fields are rejected.
+## Admission flow
 
-| Object | What authentication establishes |
-| --- | --- |
-| Launch grant (`LaunchGrant`, v3) | Authority authorization bound to tenant/workload/attempt, boot/channel, selected manifest, effective launch, profile, policies, bootstrap context, and a signed validity window. |
-| Appraisal (`ProofAppraisal`, v3) | An AS-signed association with the grant and evaluation commitments. KBS hashes in this object are AS assertions, not independently authenticated KBS decisions. |
-| Tenant intent and bootstrap (v2) | Signed tenant scope, authority challenge, bootstrap context, and recorder proof of possession used by the software issuer. They do not establish an attested boot or hardware key origin. |
-| Recorder session (v1) | Possession of the grant's recorder key bound to the session nonce and exact canonical runtime/evidence bytes. The KBS recipient key remains separate. |
-| Policy aggregate (v1) | A KBS producer's combined AS/KBS policy statement bound to grant/session/runtime/evidence and the typed resource request. This profile trusts that producer for both evaluations, without an independent AS signature or key-delivery claim. |
-| Credential delivery (v1) | KBS publication bound to the producer, grant, aggregate, request, session, recipient key, exact JWE ciphertext digest, and validity window. The receipt contains no plaintext or plaintext hash. |
-| Admission receipt (v1) | Authority acceptance of the exact grant/aggregate, authority/KBS key fingerprints, guest nonce, admission configuration, and unchanged launch binding/window. |
+Configure public keys, identities and policy expectations from a trusted source
+outside the request and Kubernetes control plane. Signed objects carry context;
+they cannot select their own trust anchors. Signed launch bindings cover
+authority, tenant, workload role, attempt, boot/channel key, selected manifest,
+effective launch and policy hashes. Ed25519 signing transcripts use separate
+domains, length framing and SHA-384 commitments.
 
-`verify_launch_grant` authenticates a grant and checks a supplied trusted current
-time without requiring an appraisal. `verify_statements_at` checks the signed
-grant/appraisal pair and time. `verify_statements` and
-`verify_launch_grant_historical` support historical authentication without a new
-authorization. `VerifiedStatements` proves signatures and configured bindings;
-it does not become a policy aggregate, admission capability, or execution proof.
+1. The issuer verifies a signed tenant intent, signed bootstrap statement and
+   recorder proof of possession, then signs a grant for that workload attempt.
+2. A trusted KBS producer signs a combined policy aggregate binding the grant,
+   session, runtime, evidence, resource request and AS/KBS evaluation commitments.
+   This profile trusts that producer to attest both evaluations.
+3. The guest owner creates a `GuestAdmissionGate` using the expected grant,
+   aggregate, roots and admission policy. The gate generates a 32-byte nonce.
+   Send `gate.challenge_nonce()` to the trusted issuer for immutable operator
+   pinning before it issues the admission receipt.
+4. The issuer authenticates the aggregate and recorder request against those
+   pins. It commits the signed receipt and consumes the grant atomically.
+5. The same pending guest gate authenticates the grant, aggregate and receipt,
+   then transfers one `AcceptedAttemptContext` to its caller.
 
-## Issuer state and time
-
-`SoftwareIssuer` verifies signed tenant intent, signed bootstrap statements, and
-recorder proof of possession before signing a grant. Open its SQLite store
-explicitly as new or existing. Missing, corrupt, wrong-identity, or incompatible
-state is rejected. Signing keys are supplied separately by the caller on creation
-and reopen; the database stores no private signing keys and provides no key
-recovery service.
-
-Policy-admission constructors use schema3 with a constructor-owned KBS root and
-static policy scope. The operator must pin the complete expected aggregate and
-guest nonce with `pin_policy_admission` before redemption. Request fields cannot
-select these expectations. Recorder proof of possession covers the admission
-context. Receipt publication and the consume slot shared with grant/appraisal
-redemption commit atomically. For an already published policy receipt, exact
-retry/status returns its original bytes without new authorization. Schema2
-constructors retain their separate store identity; they do not migrate into
-schema3.
-
-`IssuerClock` is a trusted constructor dependency; requests cannot supply `now`.
-New issue/redeem operations check time after acquiring the SQLite write lock.
-`ValidityWindow` uses Unix seconds and `not_before <= now < expires`. The issuer
-bounds the configured TTL to 1–3600 seconds and tenant-intent expiry. Grants copy
-the committed challenge window; retries do not extend it. Clock regression or
-unavailability rejects new authorization. The schema2 store retains clock
-high-water even on expected expiry denial. Historical `Existing`,
-`AlreadyRedeemed`, and status retrieval do not read the clock or issue another
-permission.
-
-The window describes authorization acceptance time, not a physical execution
-deadline after delivery or a paused guest. SQLite and its parent directory belong
-to the trusted issuer domain. Retained tombstones protect continuity within that
-store; restoring or cloning a database, or losing trusted state, lies outside
-this replay boundary.
-
-## Guest verification and handoff
-
-Construct `GuestAdmissionGate::new(config, clock)` with trusted
-`GuestAdmissionConfig` and an injected `GuestClock`. The gate creates a fresh
-32-byte nonce. Send `gate.challenge_nonce()` to the trusted issuer for admission
-pinning before it issues the receipt, and retain the same gate for the attempt.
-The first bundle verification checks the signed grant and receipt against the
-injected trusted guest clock. An ordinary guest wall clock controlled by the host
-is not a substitute for that dependency.
+Retain that gate for the lifetime of the pending attempt. Once the signed bundle
+arrives, use its existing state:
 
 ```rust
 use execution_proof_handoff::admission::{
-    AdmissionCheck, GuestAdmissionError, GuestAdmissionGate,
+    AcceptedAttemptContext, GuestAdmissionError, GuestAdmissionGate,
 };
 
-fn verify_admission(
+fn accept_authorization(
     gate: &GuestAdmissionGate,
     signed_grant: &[u8],
     signed_aggregate: &[u8],
     signed_receipt: &[u8],
-) -> Result<AdmissionCheck, GuestAdmissionError> {
-    gate.verify_bundle(signed_grant, signed_aggregate, signed_receipt)
+) -> Result<AcceptedAttemptContext, GuestAdmissionError> {
+    gate.verify_bundle(signed_grant, signed_aggregate, signed_receipt)?;
+    gate.take_accepted_attempt()
 }
 ```
 
-`FirstVerified` and `Historical` are metadata, not preparation permissions. The
-gate retains exact raw bytes; an exact retry is historical, skips a new time
-check, and cannot authorize preparation. A changed bundle conflicts. Its clock
-high-water is boot-local and does not provide rollback or clone resistance.
-`validate_for_preparation` always returns `ContentPreparationUnavailable` after
-successful verification; it creates no preparation reference or execution permit.
+The context has no public constructor, `Clone`, `Deserialize` or raw `Debug`
+implementation. `take_accepted_attempt` transfers it once, even if the caller
+subsequently drops it or preparation fails. Retrying the exact bundle returns
+historical metadata; a changed bundle conflicts. Creating a new gate generates a
+new nonce and rejects the old receipt. This is boot-local state, without durable
+replay or clone protection.
 
-`BootTable` separately registers a caller-supplied `PreparationReference` against
-`VerifiedStatements`, binds a task generation, and returns one `ReleasePermit`
-from a successful consume transition. A reference is an identifier and context
-commitment, not a protected rootfs handle. Status retrieval and repeated consume
-cannot produce another permit. The table retains grant/attempt/generation
-reservations and terminal tombstones, rejecting conflicts and capacity exhaustion
-rather than evicting records. Its trusted owner must retain it for the enrolled
-boot's lifetime; a restart does not provide replay protection.
+`BootTable::register` consumes the accepted context for reference/task
+bookkeeping. Tables support 1–1024 entries and retain terminal entries and
+task-generation reservations. Conflicts and capacity exhaustion reject further
+actions; old entries are never evicted to make space.
+A preparation reference is an untrusted identifier, not a protected rootfs
+handle. Registration and consume tokens do not perform image preparation,
+mounts, task start or FIFO release. The enrolled boot must retain its table for
+its lifetime; a restart is not replay protection. Aborting changes bookkeeping
+state without revoking a returned permit or stopping a task.
 
-The table does not open paths, mount filesystems, pull/decrypt images, release a
-FIFO, or execute tasks. Aborting changes bookkeeping state without revoking an
-already returned permit or stopping a task. See the
-[handoff integration tests](handoff/tests/admission_lifecycle.rs) and
-[issuer admission tests](issuer/tests/policy_admission.rs) for software fixtures.
+The default runtime API requires aggregate admission. The earlier
+`register_lab(&VerifiedStatements, ...)` path is available only with the
+`software-lab` feature. An issuer opened with policy-admission constructors uses
+schema 3 and rejects early grant/appraisal `redeem` and `status` calls before
+mutation. Missing policy evidence cannot select that fallback. Schema 2 lab
+stores retain their separate API; stores are not migrated automatically.
 
-## Trust boundaries
+See the [issuer-to-guest tests](issuer/tests/policy_admission.rs) and
+[guest gate tests](handoff/src/admission/tests.rs) for complete signed fixtures,
+including duplicate delivery, expiry, conflicts and one-use transfer.
 
-The libraries require independently configured roots and expectations outside a
-hostile Kubernetes control plane. A control-plane-supplied Pod UID is not an
-authoritative workload identity here. Signature verification, policy aggregates,
-credential publication, and bookkeeping permits each establish distinct facts;
-none establishes protected encrypted-content custody or observed execution.
+## Time and persistence
 
-A complete execution proof requires qualified boot/key-origin and measured
-configuration, authenticated authority/AS/KBS integration, fresh encrypted-content
-preparation with rootfs custody, authenticated content-to-runtime handoff,
-protected record capture with producer isolation, and independent verification.
-The guest verification path also requires a qualified trusted clock. The current
-software signatures and state-machine tests do not establish those capabilities,
-real Cloud KMS use, hardware quotes, rollback/clone resistance, or a deployed
-execution proof chain. Until the required adapters and trust boundaries are
-qualified, the preparation entrypoints remain closed.
+Grant/appraisal statements use wire version 3; tenant intent/bootstrap statements
+use version 2. Signed tenant intents, challenges and grants carry
+`ValidityWindow { not_before, expires }` in Unix seconds with
+`not_before <= now < expires`. The authority signs the challenge
+window, and the grant copies it unchanged. Retry cannot extend the window.
+
+The issuer receives its `IssuerClock` through trusted construction, never from
+request JSON. New authorization checks sample time after the SQLite writer lock.
+The configured TTL is 1–3600 seconds, clipped to tenant intent expiry. Persisted
+clock high-water checks reject regression; expected expiry denials retain the
+observed high-water without admitting or consuming the attempt. Clock failures
+reject new authorization. Exact historical receipt retrieval and status do not
+read the live clock or grant a new permission.
+
+Acceptance time belongs to the authority. A first committed receipt may reach
+the same live pending guest attempt after the signed window. The guest checks
+its nonce, retained expectations and signatures without assuming a trusted guest
+clock. The window bounds authority acceptance, not delivery or a later kernel
+execution deadline. Explicit historical verification APIs authenticate stored
+statements; current-time wrappers also check a caller-supplied trusted clock.
+
+The issuer opens a store explicitly as new or existing, rejects missing,
+corrupt or wrong-identity state, and retains consume records within its configured
+capacity of 1–1024 attempts. The caller supplies signing keys; the database stores
+no private keys. The issuer must own the store and its parent directory. SQLite
+persistence and high-water metadata cannot protect against
+malicious database restoration, copying or loss of trusted state. Reopen requires
+the caller's existing signing key; private-key recovery is not implemented.
+
+## Credentials and trust boundaries
+
+A KBS-signed credential publication binds the exact grant, aggregate, request,
+session, recipient key, ciphertext digest and validity window. A policy aggregate
+alone does not establish credential delivery. The client verifies the publication
+before exposing JWE bytes; plaintext and plaintext hashes are absent from the
+receipt. [Client integration and transport bounds](client/README.md) describe the
+exchange. Ciphertext authentication does not replace the one-use guest admission
+context required by a consuming adapter.
+
+The earlier `VerifiedStatements` type authenticates configured grant/appraisal
+signatures and AS-signed associations. Independent KBS policy evidence requires
+the separately signed aggregate. Recorder proof of possession authenticates a
+signature and context; it does not establish hardware key origin or an
+authenticated network channel. Kubernetes control-plane Pod metadata does not
+become authoritative through guest attestation.
+
+TEE appraisal, measured guest configuration, fresh encrypted-content preparation,
+rootfs custody, authenticated runtime handoff, protected execution recording and
+independent execution verification require their own trusted integrations.
+Software tests do not establish those boundaries or cloud/hardware acceptance.
+The preparation entry points remain closed and expose no execution verdict.

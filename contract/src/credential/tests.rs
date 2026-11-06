@@ -296,3 +296,45 @@ fn credential_operation_pop_cannot_reuse_policy_decision_signature() {
         Some(Error::InvalidSignature)
     );
 }
+
+#[test]
+fn historical_delivery_authentication_retains_exact_ciphertext_and_producer_checks() {
+    let f = fixture();
+    let aggregate =
+        verify_policy_aggregate(&wire(&f.expected.expected, &f.proof), &f.grant, &f.expected)
+            .unwrap();
+    let jwe = b"authority-accepted-jwe";
+    let statement = receipt(&f.grant, &aggregate, jwe);
+    let signed = sign(&statement, &f.proof);
+    let expected = expectations(&f);
+    let authenticated =
+        verify_credential_delivery_historical(&signed, &f.grant, &aggregate, &expected, jwe)
+            .unwrap();
+    assert_eq!(authenticated.validity(), f.grant.validity());
+    assert_eq!(
+        verify_credential_delivery(&signed, &f.grant, &aggregate, &expected, jwe, 200).err(),
+        Some(Error::Expired)
+    );
+    assert_eq!(
+        verify_credential_delivery_historical(
+            &signed,
+            &f.grant,
+            &aggregate,
+            &expected,
+            b"substituted"
+        )
+        .err(),
+        Some(Error::BindingMismatch)
+    );
+    assert_eq!(
+        verify_credential_delivery_historical(
+            &sign(&statement, &key()),
+            &f.grant,
+            &aggregate,
+            &expected,
+            jwe
+        )
+        .err(),
+        Some(Error::InvalidSignature)
+    );
+}

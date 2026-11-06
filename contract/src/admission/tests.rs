@@ -416,3 +416,38 @@ fn historical_grant_authentication_never_renews_its_signed_window() {
         Some(Error::InvalidSignature)
     );
 }
+
+#[test]
+fn historical_receipt_authentication_preserves_context_without_renewing_window() {
+    let f = fixture();
+    let receipt = wire(&f);
+    let authenticated =
+        verify_admission_authorization_historical(&receipt, &f.grant, &f.aggregate, &f.expected)
+            .unwrap();
+    assert_eq!(authenticated.validity(), f.grant.validity());
+    assert_eq!(authenticated.context_digest(), f.receipt.context_sha384);
+    assert_eq!(verify(&f, 200).err(), Some(Error::Expired));
+    let mut altered: Signed<AdmissionAuthorizationV1> = serde_json::from_slice(&receipt).unwrap();
+    altered.signature = crate::hex(
+        key()
+            .sign(&altered.statement.signing_bytes().unwrap())
+            .as_ref(),
+    );
+    assert_eq!(
+        verify_admission_authorization_historical(
+            &serde_json::to_vec(&altered).unwrap(),
+            &f.grant,
+            &f.aggregate,
+            &f.expected
+        )
+        .err(),
+        Some(Error::InvalidSignature)
+    );
+    let mut expected = f.expected;
+    expected.guest_nonce.push('x');
+    assert_eq!(
+        verify_admission_authorization_historical(&receipt, &f.grant, &f.aggregate, &expected)
+            .err(),
+        Some(Error::BindingMismatch)
+    );
+}

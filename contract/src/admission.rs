@@ -137,7 +137,7 @@ pub struct AdmissionExpectations {
     pub admission_policy_sha384: String,
 }
 
-/// Authenticated current software admission statement, not a one-time exec permit.
+/// Authenticated software admission statement, not a one-time exec permit.
 /// No public constructor, Deserialize, Clone, or raw Debug implementation.
 pub struct VerifiedAdmissionAuthorization {
     authorization: AdmissionAuthorizationV1,
@@ -177,12 +177,28 @@ impl VerifiedAdmissionAuthorization {
     }
 }
 
+/// Authenticates the statement and checks a trusted authority/lab clock.
 pub fn verify_admission_authorization(
     receipt_json: &[u8],
     grant: &VerifiedLaunchGrant,
     aggregate: &VerifiedPolicyAggregate,
     expected: &AdmissionExpectations,
     trusted_now: u64,
+) -> Result<VerifiedAdmissionAuthorization, Error> {
+    let verified =
+        verify_admission_authorization_historical(receipt_json, grant, aggregate, expected)?;
+    verified.validity().check_at(trusted_now)?;
+    Ok(verified)
+}
+
+/// Authenticates an already accepted publication and its exact signed context.
+/// This performs no current-time check and creates no new admission permission.
+/// A guest caller must retain its own pending nonce and one-use admission state.
+pub fn verify_admission_authorization_historical(
+    receipt_json: &[u8],
+    grant: &VerifiedLaunchGrant,
+    aggregate: &VerifiedPolicyAggregate,
+    expected: &AdmissionExpectations,
 ) -> Result<VerifiedAdmissionAuthorization, Error> {
     let signed: Signed<AdmissionAuthorizationV1> = decode(receipt_json)?;
     for id in [
@@ -237,7 +253,6 @@ pub fn verify_admission_authorization(
         return Err(Error::BindingMismatch);
     }
     verify_signature(&expected.authority_public_key, &bytes, &signed.signature)?;
-    authorization.validity.check_at(trusted_now)?;
     Ok(VerifiedAdmissionAuthorization {
         authorization: signed.statement,
         authority_key_digest,

@@ -1,28 +1,29 @@
 //! Guest-owned, boot-local verification of a software preparation admission.
 //!
-//! Constructor inputs and clock must come from the trusted guest owner. RPC
-//! fields cannot choose roots, expectations, time, or the generated nonce. This
-//! gate records verification of one exact bundle, not preparation, custody, an
-//! execution permission, or a durable/clone-resistant consume. Production
-//! preparation remains unavailable even after all signatures verify.
+//! Constructor inputs come from the trusted guest owner. RPC fields cannot choose
+//! roots, expectations, or the internally generated nonce. Authorities own live
+//! acceptance time; this gate authenticates the committed result against one
+//! still-live pending attempt and transfers its local context at most once.
+//! Production preparation remains unavailable. This is neither durable replay
+//! protection nor a claim of TEE/clone-resistant state or observed execution.
 
 use execution_proof_contract::{
-    admission::{verify_admission_authorization, AdmissionExpectations},
+    admission::{
+        verify_admission_authorization_historical, AdmissionExpectations,
+        VerifiedAdmissionAuthorization,
+    },
     policy_receipt::{
         verify_policy_aggregate, AggregateExpectations, POLICY_AGGREGATE_PROFILE,
         POLICY_AGGREGATE_PURPOSE, POLICY_AGGREGATE_VERSION,
     },
-    verify_launch_grant, GrantExpectations, LaunchGrant, GRANT_PURPOSE, MAX_WIRE_BYTES, VERSION,
+    verify_launch_grant_historical, GrantExpectations, LaunchBinding, LaunchGrant, ValidityWindow,
+    GRANT_PURPOSE, MAX_WIRE_BYTES, VERSION,
 };
 use ring::{
     digest,
     rand::{SecureRandom, SystemRandom},
 };
-use std::{
-    convert::Infallible,
-    fmt,
-    sync::{Arc, Mutex},
-};
+use std::{convert::Infallible, fmt, sync::Mutex};
 
 pub struct GuestAdmissionConfig {
     pub grant: GrantExpectations,
@@ -33,16 +34,76 @@ pub struct GuestAdmissionConfig {
     pub admission_policy_sha384: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GuestClockError {
-    Unavailable,
-    OutOfRange,
+/// One local admission, minted only by a live pending gate and transferred once.
+/// There is no public constructor, Clone, Deserialize, or raw Debug implementation.
+/// Borrow this context while preparing; consuming it for bookkeeping does not
+/// establish actual content preparation, rootfs custody, or execution.
+///
+/// Raw authenticated statements cannot be wrapped by an external caller:
+/// ```compile_fail
+/// use execution_proof_contract::admission::VerifiedAdmissionAuthorization;
+/// use execution_proof_handoff::admission::AcceptedAttemptContext;
+/// fn forge(authorization: VerifiedAdmissionAuthorization) -> AcceptedAttemptContext {
+///     AcceptedAttemptContext { authorization, workflow_id: String::new(), resource_path: Default::default() }
+/// }
+/// ```
+/// A transferred context cannot be duplicated:
+/// ```compile_fail
+/// use execution_proof_handoff::admission::AcceptedAttemptContext;
+/// fn duplicate(context: &AcceptedAttemptContext) -> AcceptedAttemptContext {
+///     context.clone()
+/// }
+/// ```
+/// It cannot be restored from wire data:
+/// ```compile_fail
+/// use execution_proof_handoff::admission::AcceptedAttemptContext;
+/// let _: AcceptedAttemptContext = serde_json::from_str("{}").unwrap();
+/// ```
+/// Raw formatting is deliberately unavailable:
+/// ```compile_fail
+/// use execution_proof_handoff::admission::AcceptedAttemptContext;
+/// fn log(context: &AcceptedAttemptContext) { let _ = format!("{context:?}"); }
+/// ```
+pub struct AcceptedAttemptContext {
+    authorization: VerifiedAdmissionAuthorization,
+    workflow_id: String,
+    resource_path: [String; 3],
 }
 
-/// The embedding guest chooses this dependency once. No request timestamp or
-/// default wall clock is provided: the host can change the ordinary guest clock.
-pub trait GuestClock: Send + Sync {
-    fn now_unix_seconds(&self) -> Result<u64, GuestClockError>;
+impl AcceptedAttemptContext {
+    pub fn binding(&self) -> &LaunchBinding {
+        self.authorization.binding()
+    }
+    pub fn grant_id(&self) -> &str {
+        self.authorization.grant_id()
+    }
+    pub fn grant_digest(&self) -> &str {
+        self.authorization.grant_digest()
+    }
+    pub fn aggregate_digest(&self) -> &str {
+        self.authorization.aggregate_digest()
+    }
+    pub fn authority_key_sha384(&self) -> &str {
+        self.authorization.authority_key_sha384()
+    }
+    pub fn aggregate_key_sha384(&self) -> &str {
+        self.authorization.aggregate_key_sha384()
+    }
+    pub fn validity(&self) -> &ValidityWindow {
+        self.authorization.validity()
+    }
+    pub fn context_digest(&self) -> &str {
+        self.authorization.context_digest()
+    }
+    pub fn guest_nonce(&self) -> &str {
+        self.authorization.guest_nonce()
+    }
+    pub fn workflow_id(&self) -> &str {
+        &self.workflow_id
+    }
+    pub fn resource_path(&self) -> &[String; 3] {
+        &self.resource_path
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +116,7 @@ pub enum AdmissionCheck {
 pub enum GateStatus {
     Pending,
     Verified,
+    Consumed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,9 +129,8 @@ pub enum GuestAdmissionError {
     InvalidConfiguration,
     EntropyUnavailable,
     TooLarge,
-    ClockUnavailable,
-    ClockOutOfRange,
-    ClockRegression,
+    NotReady,
+    AlreadyConsumed,
     Contract(execution_proof_contract::Error),
     BindingMismatch,
     Conflict,
@@ -83,9 +144,8 @@ impl fmt::Display for GuestAdmissionError {
             Self::InvalidConfiguration => "guest admission configuration rejected",
             Self::EntropyUnavailable => "guest admission entropy unavailable",
             Self::TooLarge => "guest admission bundle exceeds bounds",
-            Self::ClockUnavailable => "guest admission clock unavailable",
-            Self::ClockOutOfRange => "guest admission clock out of range",
-            Self::ClockRegression => "guest admission clock regressed",
+            Self::NotReady => "guest admission not yet verified",
+            Self::AlreadyConsumed => "guest admission context already transferred",
             Self::Contract(_) => "guest admission signatures or scope rejected",
             Self::BindingMismatch => "guest admission differs from trusted grant",
             Self::Conflict => "guest admission bundle conflicts with retained verification",
@@ -113,25 +173,22 @@ impl Bundle {
 }
 #[derive(Default)]
 struct State {
-    last_seen_unix_seconds: Option<u64>,
     verified: Option<Bundle>,
+    accepted: Option<AcceptedAttemptContext>,
 }
 
 /// One instance per trusted boot/attempt. The owner must retain it for that
-/// lifetime; creating another instance is not durable replay protection.
+/// lifetime. State loss creates a fresh nonce, rejecting old receipts; it cannot
+/// restore an old consumed grant or provide durable/clone-resistant protection.
 pub struct GuestAdmissionGate {
     grant: GrantExpectations,
     expected_grant_digest: String,
     expected: AdmissionExpectations,
-    clock: Arc<dyn GuestClock>,
     state: Mutex<State>,
 }
 
 impl GuestAdmissionGate {
-    pub fn new(
-        config: GuestAdmissionConfig,
-        clock: Arc<dyn GuestClock>,
-    ) -> Result<Self, GuestAdmissionError> {
+    pub fn new(config: GuestAdmissionConfig) -> Result<Self, GuestAdmissionError> {
         let expected_grant_digest = config
             .expected_grant
             .digest_sha384()
@@ -184,7 +241,6 @@ impl GuestAdmissionGate {
             grant: config.grant,
             expected_grant_digest,
             expected,
-            clock,
             state: Mutex::new(State::default()),
         })
     }
@@ -193,8 +249,11 @@ impl GuestAdmissionGate {
         &self.expected.guest_nonce
     }
 
-    /// Only metadata is returned. Historical success cannot authorize preparation.
-    /// Exact raw bytes are retained; a changed bundle never rearms this gate.
+    /// Authenticates one committed receipt for this still-live pending nonce.
+    /// First delivery may occur after the authority acceptance window: the guest
+    /// has no trusted current clock or physical exec deadline. Exact retries are
+    /// historical metadata and cannot replenish a transferred context. A changed
+    /// bundle never rearms this gate; new authority acceptance remains server-only.
     pub fn verify_bundle(
         &self,
         grant_json: &[u8],
@@ -218,26 +277,23 @@ impl GuestAdmissionGate {
                 Err(GuestAdmissionError::Conflict)
             };
         }
-        let now = self.clock.now_unix_seconds().map_err(|error| match error {
-            GuestClockError::Unavailable => GuestAdmissionError::ClockUnavailable,
-            GuestClockError::OutOfRange => GuestAdmissionError::ClockOutOfRange,
-        })?;
-        if now > i64::MAX as u64 {
-            return Err(GuestAdmissionError::ClockOutOfRange);
-        }
-        if state.last_seen_unix_seconds.is_some_and(|last| now < last) {
-            return Err(GuestAdmissionError::ClockRegression);
-        }
-        // Preserve healthy observed time even when subsequent validity/crypto
-        // checks reject. This watermark is boot-local, not anti-rollback storage.
-        state.last_seen_unix_seconds = Some(now);
-        let grant = verify_launch_grant(grant_json, &self.grant, now)?;
+        let grant = verify_launch_grant_historical(grant_json, &self.grant)?;
         if grant.grant_digest() != self.expected_grant_digest {
             return Err(GuestAdmissionError::BindingMismatch);
         }
         let aggregate = verify_policy_aggregate(aggregate_json, &grant, &self.expected.aggregate)?;
-        let _verified =
-            verify_admission_authorization(receipt_json, &grant, &aggregate, &self.expected, now)?;
+        let authorization = verify_admission_authorization_historical(
+            receipt_json,
+            &grant,
+            &aggregate,
+            &self.expected,
+        )?;
+        let request = &aggregate.statement().request;
+        state.accepted = Some(AcceptedAttemptContext {
+            authorization,
+            workflow_id: request.workflow_id.clone(),
+            resource_path: request.resource_path.clone(),
+        });
         state.verified = Some(Bundle {
             grant: grant_json.to_vec(),
             aggregate: aggregate_json.to_vec(),
@@ -251,11 +307,27 @@ impl GuestAdmissionGate {
             .state
             .lock()
             .map_err(|_| GuestAdmissionError::Poisoned)?;
-        Ok(if state.verified.is_some() {
-            GateStatus::Verified
-        } else {
-            GateStatus::Pending
+        Ok(match (&state.verified, &state.accepted) {
+            (None, _) => GateStatus::Pending,
+            (Some(_), Some(_)) => GateStatus::Verified,
+            (Some(_), None) => GateStatus::Consumed,
         })
+    }
+
+    /// Transfers the accepted context exactly once, including if the caller drops
+    /// it or later preparation fails. The retained bundle is a historical tombstone.
+    pub fn take_accepted_attempt(&self) -> Result<AcceptedAttemptContext, GuestAdmissionError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GuestAdmissionError::Poisoned)?;
+        if state.verified.is_none() {
+            return Err(GuestAdmissionError::NotReady);
+        }
+        state
+            .accepted
+            .take()
+            .ok_or(GuestAdmissionError::AlreadyConsumed)
     }
 
     /// Records verification only, then always refuses production preparation.
