@@ -1,4 +1,4 @@
-//! Durable policy admission with real signatures and physical SQLite files.
+//! Signed policy admission and receipt persistence in SQLite.
 //! Aggregates are signed software fixtures; no TEE or execution is claimed.
 
 mod support;

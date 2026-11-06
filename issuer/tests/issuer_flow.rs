@@ -1,4 +1,4 @@
-//! Real signatures and a physical SQLite store, with software-only boot/AS fixtures.
+//! Signature and persistent SQLite admission tests with software boot and AS fixtures.
 //! This suite does not attest hardware, prepare an encrypted rootfs, or execute a workload.
 
 mod support;

@@ -70,7 +70,7 @@ pub struct IssuedGrant {
     pub publication: GrantPublication,
 }
 
-/// Recorder authentication for a single exact operation and L/A context.
+/// Recorder authentication bound to one operation and its grant/context commitments.
 /// Possession proves a signature, not an authenticated network channel.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -143,7 +143,7 @@ impl From<StoreError> for Error {
     }
 }
 
-/// Real crypto and SQLite admission for the explicitly software-lab profile.
+/// Signed grant issuance and SQLite admission for the software profile.
 /// It does not verify TEE evidence, produce AS/KBS appraisals, prepare images or
 /// authorize the production Kata proof path. The clock governs authorization
 /// acceptance only, not the physical time or deadline of a later kernel exec.

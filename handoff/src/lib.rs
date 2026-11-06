@@ -375,8 +375,8 @@ impl BootTable {
         Ok(entry.status)
     }
 
-    /// Terminal bookkeeping only: this does not revoke an already returned
-    /// permit or kill a task. The future runtime owner must coordinate that I/O.
+    /// Marks terminal state without revoking a returned permit or stopping a task.
+    /// The runtime owner must coordinate revocation and task termination.
     pub fn abort(&self, reference: &PreparationReference) -> Result<Status, Error> {
         validate_reference(reference)?;
         let mut entries = self.entries.lock().map_err(|_| Error::Poisoned)?;

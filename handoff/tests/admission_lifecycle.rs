@@ -226,7 +226,7 @@ fn signed_grant_reservation_survives_abort_and_capacity_does_not_evict() {
         Status::AbortedBeforeConsume
     );
 
-    // A freshly signed statement is insufficient to reopen a consumed namespace.
+    // A new appraisal cannot reuse a grant ID reserved by an aborted attempt.
     let reused_grant = authenticated_statements_for_grant("attempt-second", "one-grant");
     assert_eq!(
         table
