@@ -68,6 +68,18 @@ pub struct PrivateFdChannel {
 }
 
 impl PrivateFdChannel {
+    #[cfg(feature = "rootfs-startup")]
+    pub(crate) fn into_startup_fd(self) -> Result<OwnedFd, TransportError> {
+        self.descriptor.ok_or(TransportError::Failed)
+    }
+
+    #[cfg(feature = "rootfs-startup")]
+    pub(crate) fn from_startup_fd(descriptor: OwnedFd) -> Self {
+        Self {
+            descriptor: Some(descriptor),
+        }
+    }
+
     pub fn pair() -> Result<(Self, Self), TransportError> {
         let mut descriptors = [-1; 2];
         // SAFETY: the output array holds exactly two descriptors; all arguments

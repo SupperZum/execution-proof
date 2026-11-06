@@ -13,6 +13,7 @@ repository.workspace = true
 default = []
 software-lab = []
 rootfs-transfer = ["dep:libc"]
+rootfs-startup = ["rootfs-transfer"]
 
 [[test]]
 name = "admission_lifecycle"
@@ -23,6 +24,12 @@ name = "rootfs_transfer_process"
 path = "tests/rootfs_transfer_process.rs"
 harness = false
 required-features = ["rootfs-transfer"]
+
+[[test]]
+name = "startup_exec_process"
+path = "tests/startup_exec_process.rs"
+harness = false
+required-features = ["rootfs-startup"]
 
 [dependencies]
 execution-proof-contract = { path = "../contract" }
