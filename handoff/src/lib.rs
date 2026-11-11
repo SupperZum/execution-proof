@@ -12,14 +12,20 @@ use execution_proof_contract::LaunchBinding;
 #[cfg(any(test, feature = "software-lab"))]
 use execution_proof_contract::VerifiedStatements;
 pub mod admission;
+#[cfg(feature = "rootfs-custody")]
+pub use execution_proof_contract::execution;
+#[cfg(feature = "rootfs-custody")]
+pub use execution_proof_contract::execution_quote;
 #[cfg(all(target_os = "linux", feature = "rootfs-transfer"))]
 pub mod fd_transport;
+#[cfg(all(target_os = "linux", feature = "gcp-startup"))]
+pub mod gcp_startup;
+#[cfg(all(target_os = "linux", feature = "rootfs-custody"))]
+pub mod rootfs_custody;
 #[cfg(all(target_os = "linux", feature = "rootfs-transfer"))]
 pub mod rootfs_offer;
 #[cfg(all(target_os = "linux", feature = "rootfs-startup"))]
 pub mod startup;
-#[cfg(all(target_os = "linux", feature = "rootfs-custody"))]
-pub mod rootfs_custody;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Mutex;

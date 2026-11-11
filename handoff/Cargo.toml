@@ -15,6 +15,7 @@ software-lab = []
 rootfs-transfer = ["dep:libc"]
 rootfs-startup = ["rootfs-transfer"]
 rootfs-custody = ["rootfs-startup", "dep:serde", "dep:serde_json"]
+gcp-startup = ["rootfs-custody"]
 
 [[test]]
 name = "admission_lifecycle"

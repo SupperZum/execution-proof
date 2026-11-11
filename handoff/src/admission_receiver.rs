@@ -5,6 +5,9 @@
 //! receiver independently verifies the signed admission bundle. It cannot obtain
 //! a preparation context or provision a gate from a caller-supplied raw nonce.
 
+#[path = "admission_receiver/gcp.rs"]
+pub mod gcp;
+
 use super::*;
 use crate::startup::{Role, StartupBoundChannel, StartupBoundPacket};
 

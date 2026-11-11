@@ -162,6 +162,8 @@ impl PinnedRoleExecutable {
 pub struct RoleCommand {
     executable: PinnedRoleExecutable,
     arguments: Vec<OsString>,
+    #[cfg(feature = "gcp-startup")]
+    capsule: Option<File>,
 }
 impl RoleCommand {
     pub fn new(
@@ -180,7 +182,22 @@ impl RoleCommand {
         Ok(Self {
             executable,
             arguments,
+            #[cfg(feature = "gcp-startup")]
+            capsule: None,
         })
+    }
+    /// Pass public authenticated configuration as a sealed data inode. Its FD
+    /// hint conveys no trust; the role independently validates embedded roots.
+    #[cfg(feature = "gcp-startup")]
+    pub fn with_gcp_capsule(mut self, bytes: &[u8]) -> Result<Self, StartupError> {
+        self.capsule = Some(
+            crate::gcp_startup::sealed_public_file(
+                bytes,
+                execution_proof_contract::gcp_startup::MAX_CAPSULE_BYTES,
+            )
+            .map_err(|_| StartupError::InvalidArguments)?,
+        );
+        Ok(self)
     }
 }
 
@@ -663,6 +680,10 @@ fn spawn_role(
     let channel_alias = reserve_inherited(&endpoint)?;
     let ticket_alias = reserve_inherited(&ticket)?;
     let executable_alias = reserve_inherited(&role.executable.file)?;
+    #[cfg(feature = "gcp-startup")]
+    let capsule_alias = role.capsule.as_ref().map(reserve_inherited).transpose()?;
+    #[cfg(feature = "gcp-startup")]
+    let capsule_raw = capsule_alias.as_ref().map(AsRawFd::as_raw_fd);
     let channel_raw = channel_alias.as_raw_fd();
     let ticket_raw = ticket_alias.as_raw_fd();
     let executable_raw = executable_alias.as_raw_fd();
@@ -677,6 +698,10 @@ fn spawn_role(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(feature = "gcp-startup")]
+    if let Some(raw) = capsule_raw {
+        command.env("ONB17_GCP_CAPSULE_FD", raw.to_string());
+    }
     // SAFETY: only fixed Linux syscalls and scalar errno creation occur after
     // fork. All descriptor allocation happened in the parent. CLOEXEC rather
     // than early closure preserves Command's separate exec-error socketpair;
@@ -701,6 +726,12 @@ fn spawn_role(
                 return Err(io::Error::last_os_error());
             }
             for raw in [channel_raw, ticket_raw] {
+                if libc::fcntl(raw, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            #[cfg(feature = "gcp-startup")]
+            if let Some(raw) = capsule_raw {
                 if libc::fcntl(raw, libc::F_SETFD, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }

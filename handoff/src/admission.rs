@@ -29,10 +29,14 @@ use std::{convert::Infallible, fmt, sync::Mutex};
 #[path = "admission_receiver.rs"]
 mod receiver;
 #[cfg(all(target_os = "linux", feature = "rootfs-custody"))]
+pub use receiver::gcp::GcpReceiverAdmissionVerifier;
+#[cfg(all(target_os = "linux", feature = "rootfs-custody"))]
 pub use receiver::{
     PendingReceiverEnrollment, ReceiverAdmissionVerifier, ReceiverChallenge,
     ReceiverEnrollmentError, VerifiedReceiverAdmission,
 };
+
+pub mod gcp;
 
 pub struct GuestAdmissionConfig {
     pub grant: GrantExpectations,

@@ -271,11 +271,13 @@ dependencies = [
  "base64",
  "execution-proof-contract",
  "kbs-types",
+ "openssl",
  "reqwest",
  "ring",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
+ "tokio",
 ]
 
 [[package]]
