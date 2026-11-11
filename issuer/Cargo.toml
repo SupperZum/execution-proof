@@ -9,8 +9,18 @@ readme.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+gcp = ["dep:base64", "dep:execution-proof-verifier", "dep:kbs-types", "dep:serde_json_canonicalizer", "dep:libc", "dep:zeroize"]
+
 [dependencies]
+base64 = { version = "=0.22.1", optional = true }
 execution-proof-contract = { path = "../contract" }
+execution-proof-verifier = { path = "../verifier", optional = true }
+kbs-types = { version = "=0.15.0", optional = true }
+serde_json_canonicalizer = { version = "=0.3.2", optional = true }
+libc = { workspace = true, optional = true }
+zeroize = { version = "=1.9.0", optional = true }
 ring.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
@@ -18,3 +28,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 execution-proof-handoff = { path = "../handoff", default-features = false }
+
+[[bin]]
+name = "gcp-authority"
+path = "src/bin/gcp-authority.rs"
+required-features = ["gcp"]

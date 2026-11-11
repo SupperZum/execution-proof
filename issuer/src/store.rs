@@ -81,12 +81,27 @@ const POLICY_SCHEMA: &str = "CREATE TABLE policy_admissions (
 enum StoreProfile {
     Legacy,
     PolicyAdmission([u8; 32]),
+    #[cfg(feature = "gcp")]
+    GcpPolicyAdmission {
+        authority: [u8; 32],
+        qualification: ValidityWindow,
+    },
 }
 impl StoreProfile {
     fn version(self) -> i64 {
         match self {
             Self::Legacy => SCHEMA_VERSION,
             Self::PolicyAdmission(_) => POLICY_SCHEMA_VERSION,
+            #[cfg(feature = "gcp")]
+            Self::GcpPolicyAdmission { .. } => 4,
+        }
+    }
+    fn policy_authority(self) -> Option<[u8; 32]> {
+        match self {
+            Self::Legacy => None,
+            Self::PolicyAdmission(key) => Some(key),
+            #[cfg(feature = "gcp")]
+            Self::GcpPolicyAdmission { authority, .. } => Some(authority),
         }
     }
 }
@@ -260,6 +275,45 @@ impl Store {
         )
     }
 
+    #[cfg(feature = "gcp")]
+    pub(crate) fn initialize_new_gcp_policy(
+        path: &Path,
+        identity: &str,
+        capacity: usize,
+        clock: &dyn IssuerClock,
+        authority: [u8; 32],
+        qualification: ValidityWindow,
+    ) -> Result<Self, StoreError> {
+        Self::initialize_profile(
+            path,
+            identity,
+            capacity,
+            clock,
+            StoreProfile::GcpPolicyAdmission {
+                authority,
+                qualification,
+            },
+        )
+    }
+    #[cfg(feature = "gcp")]
+    pub(crate) fn open_existing_gcp_policy(
+        path: &Path,
+        identity: &str,
+        capacity: usize,
+        authority: [u8; 32],
+        qualification: ValidityWindow,
+    ) -> Result<Self, StoreError> {
+        Self::open_profile(
+            path,
+            identity,
+            capacity,
+            StoreProfile::GcpPolicyAdmission {
+                authority,
+                qualification,
+            },
+        )
+    }
+
     fn initialize_profile(
         path: &Path,
         store_identity_sha384: &str,
@@ -270,6 +324,10 @@ impl Store {
         validate_config(store_identity_sha384, capacity)?;
         // A retryable clock failure must not leave a partially initialized file.
         let initial_time = clock_now(clock)?;
+        #[cfg(feature = "gcp")]
+        if let StoreProfile::GcpPolicyAdmission { qualification, .. } = profile {
+            check_window(qualification, initial_time)?;
+        }
         let mut options = OpenOptions::new();
         options.write(true).read(true).create_new(true);
         #[cfg(unix)]
@@ -293,7 +351,7 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(META_SCHEMA)?;
         transaction.execute_batch(RECORD_SCHEMA)?;
-        if matches!(profile, StoreProfile::PolicyAdmission(_)) {
+        if profile.policy_authority().is_some() {
             transaction.execute_batch(POLICY_SCHEMA)?;
         }
         transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
@@ -424,6 +482,16 @@ impl Store {
             .checked_add(ttl_seconds)
             .ok_or(StoreError::ClockOutOfRange)?
             .min(intent_window.expires);
+        #[cfg(feature = "gcp")]
+        let expires = if let StoreProfile::GcpPolicyAdmission { qualification, .. } = self.profile {
+            if let Err(error) = check_window(qualification, now) {
+                transaction.commit()?;
+                return Err(error);
+            }
+            expires.min(qualification.expires)
+        } else {
+            expires
+        };
         let mut actual = candidate.clone();
         actual.challenge.validity = ValidityWindow {
             not_before: now,
@@ -589,13 +657,13 @@ impl Store {
     /// Operator-owned immutable expectations. This never consumes a grant.
     pub(crate) fn pin_policy(&self, pin: &PolicyPin) -> Result<(), StoreError> {
         let authority = self.policy_authority()?;
-        validate_pin(pin)?;
+        validate_pin_profile(pin, self.profile)?;
         let mut connection = self.connection.lock().map_err(|_| StoreError::Corrupt)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (_, issued) = find_grant(&transaction, &pin.grant_id)?.decode()?;
         let issued = issued.ok_or(StoreError::NotFound)?;
-        validate_pin_issued(pin, &issued, &authority)?;
-        match read_policy_pin(&transaction, &pin.grant_id) {
+        validate_pin_issued_profile(pin, &issued, &authority, self.profile)?;
+        match read_policy_pin_profile(&transaction, &pin.grant_id, self.profile) {
             Ok((existing, _)) => {
                 if existing.expected_json != pin.expected_json
                     || existing.expected_digest != pin.expected_digest
@@ -623,7 +691,7 @@ impl Store {
         self.policy_authority()?;
         identifier(grant_id)?;
         let connection = self.connection.lock().map_err(|_| StoreError::Corrupt)?;
-        Ok(read_policy_pin(&connection, grant_id)?.0)
+        Ok(read_policy_pin_profile(&connection, grant_id, self.profile)?.0)
     }
 
     /// The authority signs only after acquiring the SQLite writer lock and
@@ -643,8 +711,9 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (_, issued) = find_grant(&transaction, &authorization.grant_id)?.decode()?;
         let issued = issued.ok_or(StoreError::NotFound)?;
-        let (pin, existing) = read_policy_pin(&transaction, &authorization.grant_id)?;
-        validate_pin_issued(&pin, &issued, &authority)?;
+        let (pin, existing) =
+            read_policy_pin_profile(&transaction, &authorization.grant_id, self.profile)?;
+        validate_pin_issued_profile(&pin, &issued, &authority, self.profile)?;
         validate_authorization(authorization, &pin, &issued)?;
         if let Some(context) = &issued.redemption_context {
             if context != &authorization.context_sha384 {
@@ -703,8 +772,9 @@ impl Store {
         let issued = issued.ok_or(StoreError::NotFound)?;
         #[cfg(test)]
         tests::after_policy_status_first_read();
-        let (pin, receipt) = read_policy_pin(&transaction, &authorization.grant_id)?;
-        validate_pin_issued(&pin, &issued, &authority)?;
+        let (pin, receipt) =
+            read_policy_pin_profile(&transaction, &authorization.grant_id, self.profile)?;
+        validate_pin_issued_profile(&pin, &issued, &authority, self.profile)?;
         validate_authorization(authorization, &pin, &issued)?;
         let receipt = match issued.redemption_context.as_deref() {
             None if receipt.is_none() => None,
@@ -722,10 +792,9 @@ impl Store {
     }
 
     fn policy_authority(&self) -> Result<[u8; 32], StoreError> {
-        match self.profile {
-            StoreProfile::PolicyAdmission(authority) => Ok(authority),
-            StoreProfile::Legacy => Err(StoreError::InvalidInput),
-        }
+        self.profile
+            .policy_authority()
+            .ok_or(StoreError::InvalidInput)
     }
 }
 
@@ -816,7 +885,7 @@ fn validate_database(
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     let mut expected_schema = vec![("challenges".into(), RECORD_SCHEMA.into())];
-    if matches!(profile, StoreProfile::PolicyAdmission(_)) {
+    if profile.policy_authority().is_some() {
         expected_schema.push(("policy_admissions".into(), POLICY_SCHEMA.into()));
     }
     expected_schema.push(("store_meta".into(), META_SCHEMA.into()));
@@ -843,7 +912,7 @@ fn validate_database(
     for row in rows {
         row?.decode()?;
     }
-    if let StoreProfile::PolicyAdmission(authority) = profile {
+    if let Some(authority) = profile.policy_authority() {
         let foreign_error: Option<i64> = connection
             .query_row(
                 "SELECT rowid FROM pragma_foreign_key_check LIMIT 1",
@@ -859,10 +928,11 @@ fn validate_database(
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         for id in ids {
-            let (pin, receipt) = read_policy_pin(connection, &id)?;
+            let (pin, receipt) = read_policy_pin_profile(connection, &id, profile)?;
             let (_, issued) = find_grant(connection, &id)?.decode()?;
             let issued = issued.ok_or(StoreError::Corrupt)?;
-            validate_pin_issued(&pin, &issued, &authority).map_err(|_| StoreError::Corrupt)?;
+            validate_pin_issued_profile(&pin, &issued, &authority, profile)
+                .map_err(|_| StoreError::Corrupt)?;
             if let Some(bytes) = receipt {
                 let statement = decode_receipt(&bytes, &pin, &issued, &authority)?;
                 if issued.redemption_context.as_deref() != Some(&statement.context_sha384) {
@@ -872,6 +942,95 @@ fn validate_database(
         }
     }
     Ok(())
+}
+
+fn validate_pin_profile(pin: &PolicyPin, profile: StoreProfile) -> Result<(), StoreError> {
+    #[cfg(feature = "gcp")]
+    if matches!(profile, StoreProfile::GcpPolicyAdmission { .. }) {
+        return validate_gcp_pin(pin).map(|_| ());
+    }
+    let _ = profile;
+    validate_pin(pin).map(|_| ())
+}
+fn validate_pin_issued_profile(
+    pin: &PolicyPin,
+    issued: &IssuedRecord,
+    authority: &[u8; 32],
+    profile: StoreProfile,
+) -> Result<(), StoreError> {
+    #[cfg(feature = "gcp")]
+    if matches!(profile, StoreProfile::GcpPolicyAdmission { .. }) {
+        let expected = validate_gcp_pin(pin)?;
+        let grant: Signed<LaunchGrant> =
+            serde_json::from_slice(&issued.signed_grant_json).map_err(|_| StoreError::Corrupt)?;
+        if pin.grant_id != issued.reservation.grant_id
+            || expected.grant_sha384 != issued.grant_digest
+            || expected.authority_key_sha384 != sha384(authority)
+            || expected.recorder_key_sha384
+                != sha384(
+                    &crate::decode_hex(&issued.recorder_public_key_hex, 32)
+                        .map_err(|_| StoreError::Corrupt)?,
+                )
+            || expected.boot_binding_sha384 != grant.statement.binding.profile_sha384
+        {
+            return Err(StoreError::Conflict);
+        }
+        return Ok(());
+    }
+    let _ = profile;
+    validate_pin_issued(pin, issued, authority)
+}
+fn read_policy_pin_profile(
+    connection: &Connection,
+    grant_id: &str,
+    profile: StoreProfile,
+) -> Result<(PolicyPin, Option<Vec<u8>>), StoreError> {
+    #[cfg(feature = "gcp")]
+    if matches!(profile, StoreProfile::GcpPolicyAdmission { .. }) {
+        return read_gcp_policy_pin(connection, grant_id);
+    }
+    let _ = profile;
+    read_policy_pin(connection, grant_id)
+}
+#[cfg(feature = "gcp")]
+fn validate_gcp_pin(
+    pin: &PolicyPin,
+) -> Result<execution_proof_contract::gcp_policy_receipt::GcpLaunchPolicyAggregateV2, StoreError> {
+    identifier(&pin.grant_id)?;
+    bounded_wire(&pin.expected_json)?;
+    hex(&pin.expected_digest, 48)?;
+    hex(&pin.policy_digest, 48)?;
+    if pin.guest_nonce.is_empty() || pin.guest_nonce.len() > 256 || !pin.guest_nonce.is_ascii() {
+        return Err(StoreError::InvalidInput);
+    }
+    let expected: execution_proof_contract::gcp_policy_receipt::GcpLaunchPolicyAggregateV2 =
+        serde_json::from_slice(&pin.expected_json).map_err(|_| StoreError::InvalidInput)?;
+    if expected
+        .digest_sha384()
+        .map_err(|_| StoreError::InvalidInput)?
+        != pin.expected_digest
+    {
+        return Err(StoreError::Conflict);
+    }
+    Ok(expected)
+}
+#[cfg(feature = "gcp")]
+fn read_gcp_policy_pin(
+    connection: &Connection,
+    grant_id: &str,
+) -> Result<(PolicyPin, Option<Vec<u8>>), StoreError> {
+    let (pin,receipt,wire_digest)=connection.query_row(
+        "SELECT expected_json,expected_digest,guest_nonce,policy_digest,receipt_json,receipt_wire_digest FROM policy_admissions WHERE grant_id=?1",[grant_id],|row|Ok((
+            PolicyPin{grant_id:grant_id.to_owned(),expected_json:row.get(0)?,expected_digest:row.get(1)?,guest_nonce:row.get(2)?,policy_digest:row.get(3)?},row.get::<_,Option<Vec<u8>>>(4)?,row.get::<_,Option<String>>(5)?
+        ))).optional()?.ok_or(StoreError::NotFound)?;
+    validate_gcp_pin(&pin).map_err(|_| StoreError::Corrupt)?;
+    match (&receipt, wire_digest) {
+        (None, None) => {}
+        (Some(bytes), Some(hash))
+            if !bytes.is_empty() && bytes.len() <= MAX_WIRE && sha384(bytes) == hash => {}
+        _ => return Err(StoreError::Corrupt),
+    }
+    Ok((pin, receipt))
 }
 
 fn validate_pin(pin: &PolicyPin) -> Result<LaunchPolicyAggregateV1, StoreError> {

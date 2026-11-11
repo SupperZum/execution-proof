@@ -1,5 +1,5 @@
 [workspace]
-members = ["contract", "handoff", "issuer", "client"]
+members = ["contract", "handoff", "issuer", "client", "verifier"]
 resolver = "2"
 
 [workspace.package]
