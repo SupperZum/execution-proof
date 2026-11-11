@@ -60,10 +60,29 @@ stable Rust and checks all targets with all features on Rust 1.90.0, on Linux.
 
 ## GCP guest runtime
 
-When assembling the measured guest image, include `libseccomp.so.2` and its
-shared-library dependencies in the authenticated runtime inventory. Kata
-loads the resolver with `dlopen` while preparing a task. A dependency scan of
-ELF `DT_NEEDED` entries alone does not discover it.
+Kata loads `libseccomp.so.2` with `dlopen` while preparing a task, so the guest
+rootfs packager adds it explicitly to the measured inventory.
+
+Use [package-rootfs.py](integration/gcp-guest/package-rootfs.py) with Python 3
+and GNU `readelf`. Supply the staged producer leaves, the matching boot
+config and producer core, and a pinned resolver compatible with the staged
+x86-64 GNU libc and loader.
+
+```sh
+python3 integration/gcp-guest/package-rootfs.py \
+  --leaves "$STAGED_LEAVES" --config "$BOOT_CONFIG" --core "$PRODUCER_CORE" \
+  --libseccomp "$LIBSECCOMP" --libseccomp-sha384 "$LIBSECCOMP_SHA384" \
+  --output tcb.tar
+```
+
+Pass the resulting USTAR archive to `mkfs.erofs --tar=f` with the selected
+build profile. Use the updated `onb17/boot/producer-core.json` from the
+archive as the producer core input for the boot artifact. The archive contains
+the original config and the exact pinned resolver bytes at
+`/lib/x86_64-linux-gnu/libseccomp.so.2`.
+
+Run `python3 -B integration/gcp-guest/test-package-rootfs.py` with a GNU C
+toolchain to check archive contents and input rejection.
 
 ## Use the admission API
 
