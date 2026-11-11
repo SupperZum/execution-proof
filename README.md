@@ -1,7 +1,7 @@
 # Execution Proof
 
-Rust libraries for signed workload launch authorization, policy admission, and
-one-use guest context in an encrypted-image execution proof workflow. They connect
+Rust libraries and a verifier CLI for signed workload launch authorization,
+policy admission, and encrypted-image execution evidence. They connect
 an independent launch authority, a Key Broker Service (KBS) policy producer, and a
 guest runtime through explicit signatures and context bindings.
 
@@ -16,8 +16,9 @@ preparation until the required content and runtime adapters are available.
 | --- | --- |
 | [`execution-proof-contract`](contract/) | Bounded wire types, domain-separated signing transcripts, and verification of launch, policy, credential, and admission statements. |
 | [`execution-proof-handoff`](handoff/) | Guest-owned admission, one-use accepted context, and boot-local reference/task bookkeeping. |
-| [`execution-proof-issuer`](issuer/) | Software authority with signed bootstrap/grant issuance, durable SQLite state, and atomic policy admission. This is a library, not a network service. |
+| [`execution-proof-issuer`](issuer/) | Software authority with signed bootstrap/grant issuance, durable SQLite state, and atomic policy admission. Its optional [GCP operator](issuer/README.md) processes local requests. |
 | [`execution-proof-client`](client/README.md) | Memory-only KBS launch protocol client and optional HTTPS transport. |
+| [`execution-proof-verifier`](verifier/README.md) | Bounded local evidence packs, independent graph verification, and a pinned TDX verifier worker. |
 
 The client, issuer, and handoff crates depend on `contract`. The issuer's
 integration tests also use `handoff`. All path dependencies are inside this
@@ -28,7 +29,8 @@ Runtime integrations belong in those components and must preserve the
 ## Build and test
 
 Use Rust 1.90 or newer with Cargo. Building `ring` and bundled SQLite requires a C
-compiler and the platform's native linker/build tools. SQLite is built from the
+compiler and the platform's native linker/build tools. Client HTTPS tests use
+OpenSSL and require its development libraries and pkg-config. SQLite is built from the
 locked dependency; a system SQLite installation is not required. Formatting and
 linting use the `rustfmt` and `clippy` toolchain components.
 
@@ -56,9 +58,20 @@ constructors and their lifecycle fixtures. `--all-features` tests both. The
 [CI workflow](.github/workflows/ci.yml) checks default and all-feature builds on
 stable Rust and checks all targets with all features on Rust 1.90.0, on Linux.
 
+## GCP guest runtime
+
+When assembling the measured guest image, include `libseccomp.so.2` and its
+shared-library dependencies in the authenticated runtime inventory. Kata
+loads the resolver with `dlopen` while preparing a task. A dependency scan of
+ELF `DT_NEEDED` entries alone does not discover it.
+
 ## Use the admission API
 
-These crates expose libraries; there is no command-line program or issuer daemon.
+The [GCP authority](issuer/README.md) processes local operator requests.
+The [verifier CLI](verifier/README.md) checks local evidence packs against
+separate trust configuration and a pinned verifier worker. The
+[trusted GCP service](integration/gcp-trusted-services/README.md) provides the
+optional HTTPS KBS and attestation integration.
 Configure public keys and expected identities/policies from a trusted source
 outside the request. The [design document](docs/design.md) describes the signed
 objects and authority-time model, and the [client guide](client/README.md)

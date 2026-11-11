@@ -1,0 +1,20 @@
+[package]
+name = "onb17-gcp-collateral-schema"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "../../../../trustee-launch-dev/deps/verifier/src/intel_dcap/collateral_service.rs"
+test = false
+
+[dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+chrono = { version = "=0.4.45", features = ["serde"] }
+hex = { version = "=0.4.3", features = ["serde"] }
+strum = { version = "=0.28.0", features = ["derive"] }
+
+[lints.rust]
+# Preserve the upstream source's public async collateral trait without changing
+# that provider API; this leaf only consumes its public deserialization types.
+async_fn_in_trait = "allow"
