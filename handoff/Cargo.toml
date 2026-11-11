@@ -33,6 +33,10 @@ path = "tests/startup_exec_process.rs"
 harness = false
 required-features = ["rootfs-startup"]
 
+[[example]]
+name = "gcp-build-inputs"
+required-features = ["gcp-startup"]
+
 [dependencies]
 execution-proof-contract = { path = "../contract" }
 libc = { workspace = true, optional = true }

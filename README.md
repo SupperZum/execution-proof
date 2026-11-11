@@ -60,6 +60,9 @@ stable Rust and checks all targets with all features on Rust 1.90.0, on Linux.
 
 ## GCP guest runtime
 
+Build a local `disk.tar.gz` by following the [GCP PodVM build guide](integration/gcp-guest/README.md).
+The full builder calls the measured rootfs packager below.
+
 Kata loads `libseccomp.so.2` with `dlopen` while preparing a task, so the guest
 rootfs packager adds it explicitly to the measured inventory.
 
