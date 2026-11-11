@@ -15,6 +15,8 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod gcp;
+
 pub const ADMISSION_VERSION: u16 = 1;
 pub const ADMISSION_PURPOSE: &str = "qlad.execution-proof.preparation-admission.v1";
 pub const ADMISSION_PROFILE: &str = "onb17.software-policy-admission-only.v1";

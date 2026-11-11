@@ -83,6 +83,67 @@ fn authentic_publication_binds_exact_ciphertext_not_plaintext_or_recipient_recei
 }
 
 #[test]
+fn public_metadata_authenticates_without_exposing_or_authorizing_ciphertext() {
+    let f = fixture();
+    let aggregate =
+        verify_policy_aggregate(&wire(&f.expected.expected, &f.proof), &f.grant, &f.expected)
+            .unwrap();
+    let raw = receipt(&f.grant, &aggregate, b"unexported-ciphertext");
+    let encoded = sign(&raw, &f.proof);
+    let verified =
+        verify_credential_metadata_historical(&encoded, &f.grant, &aggregate, &expectations(&f))
+            .unwrap();
+    assert!(verified.statement() == &raw);
+    assert_eq!(verified.receipt_sha384(), raw.digest_sha384().unwrap());
+    assert_eq!(
+        verified.kbs_proof_key_sha384(),
+        sha384(f.proof.public_key().as_ref())
+    );
+    assert_eq!(
+        verify_credential_delivery_historical(
+            &encoded,
+            &f.grant,
+            &aggregate,
+            &expectations(&f),
+            b"different-ciphertext",
+        )
+        .err(),
+        Some(Error::BindingMismatch)
+    );
+}
+
+#[test]
+fn public_metadata_rejects_foreign_signatures_and_substituted_expectations() {
+    let f = fixture();
+    let aggregate =
+        verify_policy_aggregate(&wire(&f.expected.expected, &f.proof), &f.grant, &f.expected)
+            .unwrap();
+    let raw = receipt(&f.grant, &aggregate, b"unexported-ciphertext");
+    assert_eq!(
+        verify_credential_metadata_historical(
+            &sign(&raw, &key()),
+            &f.grant,
+            &aggregate,
+            &expectations(&f),
+        )
+        .err(),
+        Some(Error::InvalidSignature)
+    );
+    let mut expected = expectations(&f);
+    expected.keywrap_sha384 = "99".repeat(48);
+    assert_eq!(
+        verify_credential_metadata_historical(
+            &sign(&raw, &f.proof),
+            &f.grant,
+            &aggregate,
+            &expected,
+        )
+        .err(),
+        Some(Error::BindingMismatch)
+    );
+}
+
+#[test]
 fn signatures_actual_producer_and_independent_aggregate_expectations_are_required() {
     let f = fixture();
     let aggregate =
