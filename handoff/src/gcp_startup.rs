@@ -303,11 +303,8 @@ pub fn load_embedded(role: Role) -> Result<EmbeddedRole> {
     }
     let mut files = vec![c_file, d_file];
     for leaf in &core.leaves {
-        let (file, bytes) = fixed_file(
-            &leaf.path,
-            usize::try_from(leaf.size_bytes).map_err(|_| StartupRejected)?,
-        )?;
-        if bytes.len() as u64 != leaf.size_bytes || hash(&bytes) != leaf.sha384 {
+        let file = open_fixed_file(&leaf.path, leaf.size_bytes)?;
+        if file_hash(&file, leaf.size_bytes)? != leaf.sha384 {
             return Err(StartupRejected);
         }
         files.push(file);
@@ -452,7 +449,7 @@ fn verify_inventory(core: &ProducerCoreV1) -> Result<()> {
     }
     visit("/", 0, &mut 0, core)
 }
-fn fixed_file(path: &str, max: usize) -> Result<(File, Vec<u8>)> {
+fn open_fixed_file(path: &str, max: u64) -> Result<File> {
     if !path.starts_with('/') || path.len() > 256 {
         return Err(StartupRejected);
     }
@@ -485,9 +482,13 @@ fn fixed_file(path: &str, max: usize) -> Result<(File, Vec<u8>)> {
         }
     }
     let meta = reject(file.metadata())?;
-    if !meta.is_file() || meta.len() == 0 || meta.len() > max as u64 {
+    if !meta.is_file() || meta.len() == 0 || meta.len() > max {
         return Err(StartupRejected);
     }
+    Ok(file)
+}
+fn fixed_file(path: &str, max: usize) -> Result<(File, Vec<u8>)> {
+    let file = open_fixed_file(path, max as u64)?;
     let mut bytes = Vec::new();
     reject((&file).take(max as u64 + 1).read_to_end(&mut bytes))?;
     if bytes.len() > max {
@@ -1070,6 +1071,15 @@ mod tests {
         }
         .encode()
         .is_err());
+    }
+    #[test]
+    fn file_hash_covers_multiple_chunks_and_requires_exact_size() {
+        let mut bytes = vec![0xa5; 8192 + 17];
+        bytes[8192] = 0x5a;
+        let file = sealed_public_file(&bytes, bytes.len()).unwrap();
+        assert_eq!(file_hash(&file, bytes.len() as u64).unwrap(), hash(&bytes));
+        assert!(file_hash(&file, bytes.len() as u64 - 1).is_err());
+        assert!(file_hash(&file, bytes.len() as u64 + 1).is_err());
     }
     #[test]
     fn ordinary_host_root_cannot_supply_a_trusted_role_view() {
