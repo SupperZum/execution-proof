@@ -362,17 +362,18 @@ impl Archive {
                 existing == &response.signed_delivery_b64,
                 "delivery receipt retry differs"
             );
-            return Ok(());
+        } else {
+            record.credential_receipt_b64 = Some(response.signed_delivery_b64);
+            let updated = serde_json::to_vec(&record)?;
+            ensure!(updated.len() <= MAX_ARCHIVE, "archive byte budget");
+            let mut temporary = tempfile::NamedTempFile::new_in(&self.path)?;
+            temporary.write_all(&updated)?;
+            temporary.as_file().sync_all()?;
+            temporary
+                .persist(&path)
+                .map_err(|_| anyhow::anyhow!("delivery archive commit rejected"))?;
         }
-        record.credential_receipt_b64 = Some(response.signed_delivery_b64);
-        let updated = serde_json::to_vec(&record)?;
-        ensure!(updated.len() <= MAX_ARCHIVE, "archive byte budget");
-        let mut temporary = tempfile::NamedTempFile::new_in(&self.path)?;
-        temporary.write_all(&updated)?;
-        temporary.as_file().sync_all()?;
-        temporary
-            .persist(&path)
-            .map_err(|_| anyhow::anyhow!("delivery archive commit rejected"))?;
+        // An exact retry may observe the rename after a failed directory sync.
         self.directory.sync_all()?;
         Ok(())
     }
@@ -580,6 +581,33 @@ mod tests {
             b"{ \"original\": true }"
         );
         archive.store_record(&stored).unwrap(); // Aggregate retry preserves the later receipt.
+    }
+    #[test]
+    fn delivery_retry_requires_directory_sync_after_rename() {
+        let (root, mut archive, scope, response, receipt) = delivery_fixture();
+        let directory = std::mem::replace(&mut archive.directory, File::open("/dev/null").unwrap());
+
+        // The rename is visible, but syncing the stand-in directory FD fails.
+        assert!(archive.store_delivery_response(&response, &scope).is_err());
+        let path = std::fs::read_dir(root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let raw = std::fs::read(&path).unwrap();
+        let stored: Record = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            STANDARD
+                .decode(stored.credential_receipt_b64.unwrap())
+                .unwrap(),
+            receipt
+        );
+        assert!(archive.store_delivery_response(&response, &scope).is_err());
+
+        archive.directory = directory;
+        archive.store_delivery_response(&response, &scope).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), raw);
     }
     #[test]
     fn delivery_rejects_foreign_key_domain_and_private_or_duplicate_fields_before_archive_update() {
