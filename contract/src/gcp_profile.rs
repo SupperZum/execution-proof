@@ -1,6 +1,6 @@
 //! An independently selected reference authority's signed qualification decision.
-//! Authentication proves that authority made this exact statement; it does not
-//! independently reproduce the deployment review or confer runtime permission.
+//! The signature authenticates the authority's statement. Runtime admission
+//! requires a separate authorization.
 //! The decision is outside B, preventing a profile/qualification hash cycle.
 
 use crate::{

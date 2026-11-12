@@ -5,10 +5,17 @@ policy admission, and encrypted-image execution evidence. They connect
 an independent launch authority, a Key Broker Service (KBS) policy producer, and a
 guest runtime through explicit signatures and context bindings.
 
-The workspace authenticates software statements and enforces local state
-transitions. It does not produce evidence that an application executed.
-`prepare_launch` and `GuestAdmissionGate::validate_for_preparation` reject content
-preparation until the required content and runtime adapters are available.
+The software admission API authenticates signed statements and tracks local
+state transitions. `prepare_launch` and
+`GuestAdmissionGate::validate_for_preparation` reject content preparation in
+this API.
+
+The GCP/Intel TDX execution path uses `gcp-authority` for admission,
+`gcp-trusted-kbs` for attestation and credential delivery, the measured guest
+for encrypted-image preparation and protected execution capture, and
+`gcp-execution-proof-verifier` for independent verification. The
+[GCP execution path](docs/design.md#gcp-execution-path) describes the entry
+points and their trust inputs.
 
 ## Workspace
 
@@ -89,11 +96,6 @@ toolchain to check archive contents and input rejection.
 
 ## Use the admission API
 
-The [GCP authority](issuer/README.md) processes local operator requests.
-The [verifier CLI](verifier/README.md) checks local evidence packs against
-separate trust configuration and a pinned verifier worker. The
-[trusted GCP service](integration/gcp-trusted-services/README.md) provides the
-optional HTTPS KBS and attestation integration.
 Configure public keys and expected identities/policies from a trusted source
 outside the request. The [design document](docs/design.md) describes the signed
 objects and authority-time model, and the [client guide](client/README.md)
