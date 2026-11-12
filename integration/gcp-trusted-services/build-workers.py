@@ -17,7 +17,10 @@ def sha(path):
     with path.open('rb')as f:return hashlib.file_digest(f,'sha384').hexdigest()
 def sources():
     paths=[]
-    for root in [EPP/'contract',EPP/'verifier',EPP/'issuer',TRUSTEE/'deps/verifier',TRUSTEE/'deps/eventlog']:
+    for root in [
+        EPP / 'contract', EPP / 'verifier', EPP / 'issuer', EPP / 'handoff',
+        TRUSTEE / 'deps/verifier', TRUSTEE / 'deps/eventlog',
+    ]:
         paths.extend(root.rglob('*.rs'));paths.append(root/'Cargo.toml')
     paths += [EPP/'Cargo.toml',EPP/'Cargo.lock',TRUSTEE/'Cargo.toml',TRUSTEE/'Cargo.lock',Path(__file__)]
     return {str(p):sha(p)for p in sorted(set(paths))}
