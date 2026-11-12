@@ -44,7 +44,11 @@ func New(c Config, credentials Credentials) (*Relay, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &Relay{config: c, tlsConfig: tc, backendPath: BackendSocket, buffers: make(chan *relayBuffers, c.MaxConnections), sessions: make(map[*session]struct{}, c.MaxConnections)}
+	backend := BackendSocket
+	if c.SandboxGateway {
+		backend = SandboxGatewaySocket
+	}
+	r := &Relay{config: c, tlsConfig: tc, backendPath: backend, buffers: make(chan *relayBuffers, c.MaxConnections), sessions: make(map[*session]struct{}, c.MaxConnections)}
 	for range c.MaxConnections {
 		r.buffers <- new(relayBuffers)
 	}

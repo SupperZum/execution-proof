@@ -20,6 +20,7 @@ import (
 )
 
 const BackendSocket = "/run/onb17/kata-agent.sock"
+const SandboxGatewaySocket = "/run/onb17/kata-sandbox.sock"
 const ListenPort = 15150
 const BufferBytes = 16 << 10
 const MaxCredentialBytes = 64 << 10
@@ -47,6 +48,7 @@ type Config struct {
 	IdleMilliseconds      int    `json:"idle_milliseconds"`
 	SessionMilliseconds   int    `json:"session_milliseconds"`
 	MaxBytes              int64  `json:"max_bytes"`
+	SandboxGateway        bool   `json:"sandbox_gateway,omitempty"`
 }
 
 // Credentials are consumed by New and never formatted or logged. Go may retain
@@ -110,13 +112,16 @@ func DecodeConfig(wire []byte) (Config, error) {
 			return c, ErrConfiguration
 		}
 		switch k {
-		case "version", "purpose", "listen_ip", "server_name", "client_ca_pem_sha384", "server_cert_pem_sha384", "client_leaf_der_sha384", "max_connections", "handshake_milliseconds", "dial_milliseconds", "idle_milliseconds", "session_milliseconds", "max_bytes":
+		case "version", "purpose", "listen_ip", "server_name", "client_ca_pem_sha384", "server_cert_pem_sha384", "client_leaf_der_sha384", "max_connections", "handshake_milliseconds", "dial_milliseconds", "idle_milliseconds", "session_milliseconds", "max_bytes", "sandbox_gateway":
 		default:
 			return c, ErrConfiguration
 		}
 		seen[k] = true
 		var raw json.RawMessage
 		if scan.Decode(&raw) != nil {
+			return c, ErrConfiguration
+		}
+		if k == "sandbox_gateway" && !bytes.Equal(raw, []byte("true")) && !bytes.Equal(raw, []byte("false")) {
 			return c, ErrConfiguration
 		}
 	}
@@ -126,6 +131,7 @@ func DecodeConfig(wire []byte) (Config, error) {
 	if _, err := scan.Token(); err != io.EOF {
 		return c, ErrConfiguration
 	}
+	delete(seen, "sandbox_gateway")
 	if len(seen) != 13 {
 		return c, ErrConfiguration
 	}

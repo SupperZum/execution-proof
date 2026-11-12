@@ -1,9 +1,10 @@
 # Closed management TLS relay
 
-This explicit entrypoint carries the existing CAA TCP byte stream to the fixed
-proof-enabled Kata Unix socket `/run/onb17/kata-agent.sock`. It does not run APF,
-the CAA interceptor, PodSetup, network/module/mount helpers, or a protocol-aware
-proxy. Kata must enforce its own proof-required RPC gate before side effects.
+The relay carries the CAA TCP byte stream to `/run/onb17/kata-agent.sock`.
+The measured `"sandbox_gateway": true` setting selects
+`/run/onb17/kata-sandbox.sock` for the early sandbox profile. Kata must enforce
+the proof-required RPC gate before side effects. APF, the CAA interceptor,
+PodSetup, and guest setup run separately.
 
 `New(Config, Credentials)` accepts trusted startup inputs and allocates bounded
 copy buffers. `Relay.Run(ctx)` listens on the configured literal IPv4 address at

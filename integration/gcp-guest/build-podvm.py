@@ -99,7 +99,9 @@ def build(args):
     leaves = output / "leaves"
     core = stage_files(files, config, leaves)
     base_core.write_text(json.dumps(core, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    subprocess.run([validator, boot_config, base_core], check=True)
+    relay = leaves / "onb17/management/relay.json"
+    relay_args = [relay] if relay.is_file() else []
+    subprocess.run([validator, boot_config, base_core, *relay_args], check=True)
 
     archive = output / "tcb.tar"
     run_script(
@@ -110,7 +112,7 @@ def build(args):
     payload = output / "payload"
     run_script("build-payload.py", "--archive", archive, "--erofs-tools", args.erofs_tools,
                "--output", payload)
-    subprocess.run([validator, boot_config, payload / "producer-core.json"], check=True)
+    subprocess.run([validator, boot_config, payload / "producer-core.json", *relay_args], check=True)
 
     kernel = output / "kernel"
     run_script(

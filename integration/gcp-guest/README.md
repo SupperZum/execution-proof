@@ -153,6 +153,11 @@ Use the immutable configuration section of
 KMS key version to the same deployment. Match the public relay certificate,
 client CA and client leaf hash in the boot configuration to `relay.json`.
 
+For the early sandbox profile, set `"sandbox_gateway": true` in `relay.json`
+and generate `rpc.json` with `gcp-build-inputs --sandbox-rpc-policy`. Set the
+boot configuration's relay and RPC digests from these exact bytes. The builder
+checks that the measured relay config selects the supplied RPC policy.
+
 The Ubuntu resolver from `libseccomp2` version
 `2.5.5-1ubuntu3.1` has the digest shown below. For a different compatible build,
 select its package and expected SHA-384 explicitly.

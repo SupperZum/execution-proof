@@ -24,6 +24,8 @@ pub mod gcp_startup;
 pub mod rootfs_custody;
 #[cfg(all(target_os = "linux", feature = "rootfs-transfer"))]
 pub mod rootfs_offer;
+#[cfg(all(target_os = "linux", feature = "gcp-startup"))]
+pub mod sandbox_gateway;
 #[cfg(all(target_os = "linux", feature = "rootfs-startup"))]
 pub mod startup;
 use std::collections::BTreeMap;

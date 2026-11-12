@@ -37,6 +37,15 @@ pub const WORKLOAD_SYSCALLS: [&str; 3] = ["execveat", "exit_group", "write"];
 pub const MAX_IMAGE_BYTES: u64 = 32 << 20;
 pub const MAX_IMAGE_INODES: u64 = 4096;
 pub const RPC_POLICY_BYTES: &[u8] = br#"{"version":1,"purpose":"qlad.execution-proof.gcp-rpc-policy.v1","service":"grpc.AgentService","task_methods":["CloseStdin","CreateContainer","ReadStderr","ReadStdout","RemoveContainer","SignalProcess","StartContainer","WaitProcess","WriteStdin"],"handshake_methods":["CreateSandbox","GetGuestDetails"],"task_requires_sandbox_ack":true,"inflight_requests":32,"sandbox_alias_bytes":128,"sandbox_dns":false,"sandbox_storages":false,"sandbox_hooks":false,"sandbox_kernel_modules":false,"sandbox_shared_pidns":false,"memory_hotplug":false,"signals":[9],"stdio_bytes":32768,"unknown_top_level_fields":false,"other_methods":false}"#;
+pub const SANDBOX_RPC_POLICY_BYTES: &[u8] = br#"{"version":1,"purpose":"qlad.execution-proof.gcp-sandbox-rpc-policy.v1","service":"grpc.AgentService","agent_methods":["CloseStdin","CopyFile","CreateContainer","CreateSandbox","DestroySandbox","GetGuestDetails","ReadStderr","ReadStdout","RemoveContainer","SignalProcess","StartContainer","WaitProcess","WriteStdin"],"health_methods":["Check","Version"],"inflight_requests":32,"max_rpc_payload_bytes":278528,"pause":"fixed-unprivileged-process","copy_file":"validate-and-discard-cri-metadata","copy_file_max_bytes":4096,"copy_file_max_wire_bytes":4608,"copy_file_max_pause":3,"copy_file_max_app":4,"app":"one-signed-projected-create-after-protected-custody","other_methods":false}"#;
+
+pub fn rpc_policy_bytes(sandbox_gateway: bool) -> &'static [u8] {
+    if sandbox_gateway {
+        SANDBOX_RPC_POLICY_BYTES
+    } else {
+        RPC_POLICY_BYTES
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StartupRejected;
@@ -81,9 +90,13 @@ pub struct LoadedRole {
     aggregate: GcpLaunchPolicyAggregateV2,
     plan: GcpAttemptPlanV1,
     expected: ExpectedStartup,
+    sandbox_gateway: bool,
     _files: Vec<File>,
 }
 impl LoadedRole {
+    pub fn sandbox_gateway_enabled(&self) -> bool {
+        self.sandbox_gateway
+    }
     pub fn artifacts(&self) -> &AuthenticatedArtifacts {
         &self.artifacts
     }
@@ -152,6 +165,7 @@ pub fn load_capsule(role: Role, capsule_file: File) -> Result<LoadedRole> {
         d,
         mut files,
         expected: expected_startup,
+        sandbox_gateway,
     } = load_embedded(role)?;
     let (binding, artifacts) = authenticate_artifacts(
         &config,
@@ -210,6 +224,7 @@ pub fn load_capsule(role: Role, capsule_file: File) -> Result<LoadedRole> {
         aggregate: ag.statement,
         plan,
         expected: expected_startup,
+        sandbox_gateway,
         _files: files,
     })
 }
@@ -221,8 +236,12 @@ pub struct EmbeddedRole {
     d: Vec<u8>,
     files: Vec<File>,
     expected: ExpectedStartup,
+    sandbox_gateway: bool,
 }
 impl EmbeddedRole {
+    pub fn sandbox_gateway_enabled(&self) -> bool {
+        self.sandbox_gateway
+    }
     pub fn config(&self) -> &ClosedBootConfigV1 {
         &self.config
     }
@@ -258,14 +277,22 @@ impl EmbeddedRole {
         Ok(bytes)
     }
 }
+
 /// Perform this fixed immutable closure check before generating recorder keys or
 /// opening any host-reachable listener. No untrusted path or root is accepted.
 pub fn load_embedded(role: Role) -> Result<EmbeddedRole> {
     let (c_file, c) = fixed_file(CONFIG_PATH, gcp_artifact::MAX_CONFIG_BYTES)?;
     let (d_file, d) = fixed_file(CORE_PATH, gcp_artifact::MAX_CORE_BYTES)?;
     let (config, core) = reject(gcp_artifact::validate_config_core(&c, &d))?;
+    let sandbox_gateway = match &config.management_relay {
+        Some(relay) => {
+            let (_, bytes) = fixed_file(&relay.configuration_path, 16 << 10)?;
+            reject(relay.authenticated_config(&bytes))?.sandbox_gateway
+        }
+        None => false,
+    };
     if core.config_sha384 != hash(&c)
-        || config.rpc_policy_sha384 != hash(RPC_POLICY_BYTES)
+        || config.rpc_policy_sha384 != hash(rpc_policy_bytes(sandbox_gateway))
         || !core.leaves.iter().any(|l| {
             l.path == WORKLOAD_POLICY_PATH
                 && l.sha384 == hash(WORKLOAD_POLICY_BYTES)
@@ -284,10 +311,6 @@ pub fn load_embedded(role: Role) -> Result<EmbeddedRole> {
             return Err(StartupRejected);
         }
         files.push(file);
-    }
-    if let Some(relay) = &config.management_relay {
-        let (_, bytes) = fixed_file(&relay.configuration_path, 16 << 10)?;
-        reject(relay.check_config_bytes(&bytes))?;
     }
     verify_inventory(&core)?;
     let own = match role {
@@ -332,6 +355,7 @@ pub fn load_embedded(role: Role) -> Result<EmbeddedRole> {
         d,
         files,
         expected,
+        sandbox_gateway,
     })
 }
 fn authenticate_artifacts(

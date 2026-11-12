@@ -279,6 +279,9 @@ impl GcpManagementRelayV1 {
     /// Check exact authenticated config bytes before the startup owner launches
     /// the role. This authenticates public configuration, never key custody.
     pub fn check_config_bytes(&self, bytes: &[u8]) -> Result<(), Error> {
+        self.authenticated_config(bytes).map(|_| ())
+    }
+    pub fn authenticated_config(&self, bytes: &[u8]) -> Result<GcpManagementRelayConfigV1, Error> {
         self.validate()?;
         let config: GcpManagementRelayConfigV1 = decode(bytes, 16 << 10)?;
         config.validate()?;
@@ -289,11 +292,11 @@ impl GcpManagementRelayV1 {
         {
             return Err(Error::BindingMismatch);
         }
-        Ok(())
+        Ok(config)
     }
 }
-/// Exact public JSON shared with the dedicated Go relay. Backend path, port,
-/// TLS floor, inherited FD numbers, and copy-buffer size are fixed in its code.
+/// Exact public JSON shared with the dedicated Go relay. The sandbox flag
+/// selects a fixed backend. The port, TLS floor, and buffer size are fixed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GcpManagementRelayConfigV1 {
@@ -310,6 +313,8 @@ pub struct GcpManagementRelayConfigV1 {
     pub idle_milliseconds: u32,
     pub session_milliseconds: u32,
     pub max_bytes: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sandbox_gateway: bool,
 }
 impl GcpManagementRelayConfigV1 {
     pub fn validate(&self) -> Result<(), Error> {

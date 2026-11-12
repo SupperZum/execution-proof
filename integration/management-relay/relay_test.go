@@ -357,6 +357,59 @@ func TestIdleTotalAndTransferLimitsCloseAndJoin(t *testing.T) {
 		})
 	}
 }
+
+func TestPendingCreateResponseAndIdleBudget(t *testing.T) {
+	for _, profile := range []struct {
+		name string
+		idle int
+	}{
+		{"short-idle-timeout", 1000},
+		{"long-idle-timeout", 30000},
+	} {
+		t.Run(profile.name, func(t *testing.T) {
+			p := fixture(t)
+			p.config.IdleMilliseconds = profile.idle
+			p.config.SessionMilliseconds = 300000
+			p.config.SandboxGateway = true
+			s := start(t, p)
+			client := dial(t, s, p.clientTLS())
+			backend := accept(t, s)
+			if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if err := backend.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+
+			request := frame(1, 1, 0, []byte("pending create"))
+			if _, err := client.Write(request); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(request))
+			if _, err := io.ReadFull(backend, got); err != nil || !bytes.Equal(got, request) {
+				t.Fatalf("request did not reach the gateway: %v", err)
+			}
+			if profile.idle == 1000 {
+				wait(t, func() bool { return s.relay.Stats().Active == 0 })
+				if n, err := client.Read(got); n != 0 || err == nil {
+					t.Fatalf("expected relay disconnect while the response was pending: %d %v", n, err)
+				}
+				return
+			}
+
+			time.Sleep(1800 * time.Millisecond)
+			response := frame(1, 2, 0, []byte("admitted"))
+			if _, err := backend.Write(response); err != nil {
+				t.Fatal(err)
+			}
+			got = make([]byte, len(response))
+			if _, err := io.ReadFull(client, got); err != nil || !bytes.Equal(got, response) {
+				t.Fatalf("delayed response did not reach the client: %v", err)
+			}
+		})
+	}
+}
+
 func TestShutdownJoinsDuringHandshakeAndEstablishedCopy(t *testing.T) {
 	for _, phase := range []string{"handshake", "copy"} {
 		t.Run(phase, func(t *testing.T) {
@@ -432,6 +485,40 @@ func TestSharedRustPublicConfigurationShape(t *testing.T) {
 	canonical, err := json.Marshal(c)
 	if err != nil || !bytes.Equal(canonical, bytes.TrimSpace(wire)) {
 		t.Fatal("Rust/Go public config shape mismatch")
+	}
+}
+
+func TestMeasuredSandboxGatewaySelectsFixedBackend(t *testing.T) {
+	p := fixture(t)
+	for _, selected := range []bool{false, true} {
+		p.config.SandboxGateway = selected
+		wire, err := json.Marshal(p.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := DecodeConfig(wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := New(c, p.credentials)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := BackendSocket
+		if selected {
+			want = SandboxGatewaySocket
+		}
+		if r.backendPath != want {
+			t.Fatalf("selected backend %q; want %q", r.backendPath, want)
+		}
+		if selected {
+			for _, invalid := range []string{`"sandbox_gateway":null`, `"sandbox_gateway":"true"`, `"sandbox_gateway":true,"sandbox_gateway":false`} {
+				mutated := bytes.Replace(wire, []byte(`"sandbox_gateway":true`), []byte(invalid), 1)
+				if _, err := DecodeConfig(mutated); err == nil {
+					t.Fatal("invalid sandbox selection accepted")
+				}
+			}
+		}
 	}
 }
 

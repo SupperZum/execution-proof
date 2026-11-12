@@ -528,7 +528,28 @@ fn relay_config() -> GcpManagementRelayConfigV1 {
         idle_milliseconds: 30000,
         session_milliseconds: 300000,
         max_bytes: 64 << 20,
+        sandbox_gateway: false,
     }
+}
+
+#[test]
+fn sandbox_gateway_mode_is_selected_by_exact_relay_config() {
+    let mut config = relay_config();
+    let original = config.encode().unwrap();
+    let mut pins = relay();
+    assert!(
+        !pins
+            .authenticated_config(&original)
+            .unwrap()
+            .sandbox_gateway
+    );
+
+    config.sandbox_gateway = true;
+    let enabled = config.encode().unwrap();
+    assert!(pins.authenticated_config(&enabled).is_err());
+    pins.configuration_sha384 = sha384(&enabled);
+    assert!(pins.authenticated_config(&enabled).unwrap().sandbox_gateway);
+    assert!(pins.authenticated_config(&original).is_err());
 }
 fn relay() -> GcpManagementRelayV1 {
     GcpManagementRelayV1 {
