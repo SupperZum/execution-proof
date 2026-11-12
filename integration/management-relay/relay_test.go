@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -30,6 +31,20 @@ type pki struct {
 	client      tls.Certificate
 	roots       *x509.CertPool
 	config      Config
+}
+
+func differentPin(t *testing.T, pin string) string {
+	t.Helper()
+	raw, err := hex.DecodeString(pin)
+	if err != nil || len(raw) != 48 {
+		t.Fatal("invalid fixture SHA-384 pin")
+	}
+	mask := byte(1)
+	if raw[0] == mask {
+		mask = 2 // Keep the mutated digest nonzero.
+	}
+	raw[0] ^= mask
+	return hex.EncodeToString(raw)
 }
 
 func makeCert(t *testing.T, template, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) ([]byte, *ecdsa.PrivateKey, []byte) {
@@ -240,7 +255,7 @@ func TestWrongMissingClientCertAndTLS12NeverReachBackend(t *testing.T) {
 			case "tls12":
 				config.MaxVersion = tls.VersionTLS12
 			case "wrong-pin":
-				p.config.ClientLeafDERSHA384 = "11" + p.config.ClientLeafDERSHA384[2:]
+				p.config.ClientLeafDERSHA384 = differentPin(t, p.config.ClientLeafDERSHA384)
 			}
 			s := start(t, p)
 			conn, err := tls.DialWithDialer(&net.Dialer{Timeout: time.Second}, "tcp", s.address, config)
@@ -459,7 +474,12 @@ func TestStrictConfigAndCredentialPins(t *testing.T) {
 			t.Fatal("invalid config accepted")
 		}
 	}
-	for _, change := range []func(*Config){func(c *Config) { c.MaxConnections = 9 }, func(c *Config) { c.ListenIP = "hostname.example" }, func(c *Config) { c.ServerName = "wrong-san" }, func(c *Config) { c.ClientCAPEMSHA384 = "00" + c.ClientCAPEMSHA384[2:] }} {
+	for _, change := range []func(*Config){
+		func(c *Config) { c.MaxConnections = 9 },
+		func(c *Config) { c.ListenIP = "hostname.example" },
+		func(c *Config) { c.ServerName = "wrong-san" },
+		func(c *Config) { c.ClientCAPEMSHA384 = differentPin(t, c.ClientCAPEMSHA384) },
+	} {
 		c := p.config
 		change(&c)
 		if _, err := New(c, p.credentials); err == nil {

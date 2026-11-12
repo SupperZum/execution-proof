@@ -57,11 +57,9 @@ budget ≤64 MiB. Copy goroutines, handshake, dial, listener watcher, and active
 sockets remain owned and are joined on shutdown. One EOF half-closes the other
 writer while the reverse direction remains bounded by idle/total deadlines.
 
-Local validation uses actual TCP, TLS, AF_UNIX, and sealed memfds. Raw ttrpc
-fixtures follow containerd/ttrpc v1.2.7's ten-byte big-endian headers, including
-fragmented/coalesced/multiple streams and half-close. This tests transport
-compatibility with the inspected CAA TLS/wire profile; it is not a deployed CAA
-or Kata acceptance run, producer qualification, or GCP hardware evidence.
+Tests use TCP, TLS, Unix sockets and sealed memfds. The ttrpc fixtures use
+the ten-byte big-endian header from containerd/ttrpc v1.2.7 and cover frame
+fragmentation, multiple streams and half-close.
 
 ```sh
 GOTOOLCHAIN=local GOPROXY=off go test -race -count=1 ./...
