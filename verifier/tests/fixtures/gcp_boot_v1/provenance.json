@@ -1,0 +1,46 @@
+{
+  "scope": "GCP Intel TDX boot evidence for structural verifier tests.",
+  "profiles": {
+    "baseline": "Measured guest entry point",
+    "mutant": "Modified guest producer core",
+    "wrapper": "Alternate entry point"
+  },
+  "shared_inputs": [
+    "baseline-acpi-ccel.bin",
+    "baseline-host-challenge.bin"
+  ],
+  "files": [
+    {
+      "file": "baseline-quote.bin",
+      "sha384": "e1bd5f3845b46184202532bdf4231bb9fc6e95fa9487d2f85ebb546438766fca9ba5b2ad67ceaf83eddf98660f2c0e04"
+    },
+    {
+      "file": "baseline-ccel.bin",
+      "sha384": "e2ce0cca9934d3d1f1d49708ad163052b02667ef0aa8337cec1fc0f273023b56e55efcd4029cd1fae66d3af933a13cbe"
+    },
+    {
+      "file": "baseline-acpi-ccel.bin",
+      "sha384": "e3ab50cab4a89e6cb6fad0a30a2898a65098b214d8167ee42485f2712d17f8db10074e87c67e602eb27b23868eebc227"
+    },
+    {
+      "file": "baseline-host-challenge.bin",
+      "sha384": "c38de44165feeab0f7a340e6e1772f2977449bc2be17aca1e486f43114482224be16fca4791c369c8281aec49a9cfce1"
+    },
+    {
+      "file": "mutant-quote.bin",
+      "sha384": "052e88d6e848287795420686bb96790c2e966f92ddd35a127e4b1571b41373f4ad5c9e55d44bd2fd30cb93010ff0220a"
+    },
+    {
+      "file": "mutant-ccel.bin",
+      "sha384": "3a3b042284aca28dfdce4db0ed6749bd7b819f721a80c5957a2e08379278d38ac6cfea72a26070e616cba5d095f90271"
+    },
+    {
+      "file": "wrapper-quote.bin",
+      "sha384": "0282f4572dbb7568382a946d7d67e43f924f23a5d6df1e256df1104af7e5ced17fa5d7a0b4974e41a5d48d7ba09858f4"
+    },
+    {
+      "file": "wrapper-ccel.bin",
+      "sha384": "0a6543e6875dc84e3afac1aaff3cd1f47ca0ebcf9579411fe4cd3a5db57ddfc14e23ca7b9c5a8ff6b341b0c59f5e6785"
+    }
+  ]
+}

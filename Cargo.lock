@@ -271,11 +271,13 @@ dependencies = [
  "base64",
  "execution-proof-contract",
  "kbs-types",
+ "openssl",
  "reqwest",
  "ring",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
+ "tokio",
 ]
 
 [[package]]
@@ -292,6 +294,7 @@ name = "execution-proof-handoff"
 version = "0.1.0"
 dependencies = [
  "execution-proof-contract",
+ "libc",
  "ring",
  "serde",
  "serde_json",
@@ -301,10 +304,29 @@ dependencies = [
 name = "execution-proof-issuer"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "execution-proof-contract",
  "execution-proof-handoff",
+ "execution-proof-verifier",
+ "kbs-types",
+ "libc",
  "ring",
  "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "zeroize",
+]
+
+[[package]]
+name = "execution-proof-verifier"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "execution-proof-contract",
+ "execution-proof-handoff",
+ "libc",
+ "ring",
  "serde",
  "serde_json",
 ]

@@ -22,3 +22,7 @@ base64 = "=0.22.1"
 serde_json_canonicalizer = "=0.3.2"
 kbs-types = "=0.15.0"
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"], optional = true }
+
+[dev-dependencies]
+openssl = "=0.10.81"
+tokio = { version = "=1.53.2", features = ["rt", "time", "net"] }

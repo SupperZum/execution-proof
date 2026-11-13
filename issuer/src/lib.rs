@@ -1,7 +1,12 @@
-//! Software-lab issuer with signed intent, bootstrap PoP and durable admission.
-//! Hardware bootstrap and execution-proof production adapters are unavailable.
+//! Signed intent, bootstrap PoP and durable admission for the software profile.
+//! The default-off GCP module adds a separately qualified hardware bootstrap;
+//! neither profile produces protected execution evidence.
 
 mod clock;
+#[cfg(feature = "gcp")]
+pub mod gcp;
+#[cfg(feature = "gcp")]
+pub mod gcp_operator;
 mod policy_admission;
 mod store;
 

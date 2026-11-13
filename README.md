@@ -1,14 +1,21 @@
 # Execution Proof
 
-Rust libraries for signed workload launch authorization, policy admission, and
-one-use guest context in an encrypted-image execution proof workflow. They connect
+Rust libraries and a verifier CLI for signed workload launch authorization,
+policy admission, and encrypted-image execution evidence. They connect
 an independent launch authority, a Key Broker Service (KBS) policy producer, and a
 guest runtime through explicit signatures and context bindings.
 
-The workspace authenticates software statements and enforces local state
-transitions. It does not produce evidence that an application executed.
-`prepare_launch` and `GuestAdmissionGate::validate_for_preparation` reject content
-preparation until the required content and runtime adapters are available.
+The software admission API authenticates signed statements and tracks local
+state transitions. `prepare_launch` and
+`GuestAdmissionGate::validate_for_preparation` reject content preparation in
+this API.
+
+The GCP/Intel TDX execution path uses `gcp-authority` for admission,
+`gcp-trusted-kbs` for attestation and credential delivery, the measured guest
+for encrypted-image preparation and protected execution capture, and
+`gcp-execution-proof-verifier` for independent verification. The
+[GCP execution path](docs/design.md#gcp-execution-path) describes the entry
+points and their trust inputs.
 
 ## Workspace
 
@@ -16,8 +23,9 @@ preparation until the required content and runtime adapters are available.
 | --- | --- |
 | [`execution-proof-contract`](contract/) | Bounded wire types, domain-separated signing transcripts, and verification of launch, policy, credential, and admission statements. |
 | [`execution-proof-handoff`](handoff/) | Guest-owned admission, one-use accepted context, and boot-local reference/task bookkeeping. |
-| [`execution-proof-issuer`](issuer/) | Software authority with signed bootstrap/grant issuance, durable SQLite state, and atomic policy admission. This is a library, not a network service. |
+| [`execution-proof-issuer`](issuer/) | Software authority with signed bootstrap/grant issuance, durable SQLite state, and atomic policy admission. Its optional [GCP operator](issuer/README.md) processes local requests. |
 | [`execution-proof-client`](client/README.md) | Memory-only KBS launch protocol client and optional HTTPS transport. |
+| [`execution-proof-verifier`](verifier/README.md) | Bounded local evidence packs, independent graph verification, and a pinned TDX verifier worker. |
 
 The client, issuer, and handoff crates depend on `contract`. The issuer's
 integration tests also use `handoff`. All path dependencies are inside this
@@ -28,7 +36,8 @@ Runtime integrations belong in those components and must preserve the
 ## Build and test
 
 Use Rust 1.90 or newer with Cargo. Building `ring` and bundled SQLite requires a C
-compiler and the platform's native linker/build tools. SQLite is built from the
+compiler and the platform's native linker/build tools. Client HTTPS tests use
+OpenSSL and require its development libraries and pkg-config. SQLite is built from the
 locked dependency; a system SQLite installation is not required. Formatting and
 linting use the `rustfmt` and `clippy` toolchain components.
 
@@ -56,9 +65,37 @@ constructors and their lifecycle fixtures. `--all-features` tests both. The
 [CI workflow](.github/workflows/ci.yml) checks default and all-feature builds on
 stable Rust and checks all targets with all features on Rust 1.90.0, on Linux.
 
+## GCP guest runtime
+
+Build a local `disk.tar.gz` by following the [GCP PodVM build guide](integration/gcp-guest/README.md).
+The full builder calls the measured rootfs packager below.
+
+Kata loads `libseccomp.so.2` with `dlopen` while preparing a task, so the guest
+rootfs packager adds it explicitly to the measured inventory.
+
+Use [package-rootfs.py](integration/gcp-guest/package-rootfs.py) with Python 3
+and GNU `readelf`. Supply the staged producer leaves, the matching boot
+config and producer core, and a pinned resolver compatible with the staged
+x86-64 GNU libc and loader.
+
+```sh
+python3 integration/gcp-guest/package-rootfs.py \
+  --leaves "$STAGED_LEAVES" --config "$BOOT_CONFIG" --core "$PRODUCER_CORE" \
+  --libseccomp "$LIBSECCOMP" --libseccomp-sha384 "$LIBSECCOMP_SHA384" \
+  --output tcb.tar
+```
+
+Pass the resulting USTAR archive to `mkfs.erofs --tar=f` with the selected
+build profile. Use the updated `onb17/boot/producer-core.json` from the
+archive as the producer core input for the boot artifact. The archive contains
+the original config and the exact pinned resolver bytes at
+`/lib/x86_64-linux-gnu/libseccomp.so.2`.
+
+Run `python3 -B integration/gcp-guest/test-package-rootfs.py` with a GNU C
+toolchain to check archive contents and input rejection.
+
 ## Use the admission API
 
-These crates expose libraries; there is no command-line program or issuer daemon.
 Configure public keys and expected identities/policies from a trusted source
 outside the request. The [design document](docs/design.md) describes the signed
 objects and authority-time model, and the [client guide](client/README.md)

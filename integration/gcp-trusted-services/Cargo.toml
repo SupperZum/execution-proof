@@ -1,0 +1,55 @@
+[package]
+name = "onb17-gcp-trusted-services"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+publish = false
+
+[workspace]
+members = ["policy-engine", "jwe", "collateral-schema"]
+
+[features]
+default = []
+server = ["launch-gcp-credentials"]
+launch-gcp-credentials = []
+
+[[bin]]
+name = "gcp-trusted-kbs"
+path = "src/main.rs"
+required-features = ["server"]
+
+[dependencies]
+policy-engine = { package = "onb17-gcp-policy-engine", path = "policy-engine", features = ["evaluation-capture"] }
+credential-jwe = { package = "onb17-gcp-jwe", path = "jwe" }
+collateral-schema = { package = "onb17-gcp-collateral-schema", path = "collateral-schema" }
+verifier = { path = "../../../trustee-launch-dev/deps/verifier", default-features = false, features = ["execution-quote-worker-tdx"] }
+execution-proof-contract = { path = "../../contract" }
+execution-proof-verifier = { path = "../../verifier" }
+execution-proof-client = { path = "../../client" }
+key-value-storage = { path = "../../../trustee-launch-dev/deps/key-value-storage", default-features = false }
+actix-web = { version = "=4.14.0", default-features = false, features = ["macros", "openssl"] }
+anyhow = "=1.0.103"
+async-trait = "=0.1.89"
+base64 = "=0.22.1"
+hex = "=0.4.3"
+kbs-types = "=0.15.0"
+libc = "=0.2.186"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+serde_json_canonicalizer = "=0.3.2"
+sha2 = "=0.10.9"
+ring = "=0.17.14"
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "signal", "time"] }
+zeroize = "=1.9.0"
+regex = "=1.13.0"
+regorus = { version = "=0.10.1", default-features = false, features = ["std", "regex", "base64", "time"] }
+openssl = "=0.10.81"
+prometheus = "=0.14.0"
+rsa = { version = "=0.9.10", features = ["sha2"] }
+tempfile = "=3.27.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("aws", "gcp", "vault", "aliyun"))'] }
+
+[dev-dependencies]
+rstest = "=0.26.1"

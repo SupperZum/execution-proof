@@ -540,3 +540,5 @@ fn registration_failure_also_consumes_the_local_context() {
         Some(GuestAdmissionError::AlreadyConsumed)
     );
 }
+#[cfg(feature = "rootfs-custody")]
+mod receiver_enrollment_tests;
