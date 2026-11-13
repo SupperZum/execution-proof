@@ -1,7 +1,6 @@
 //! These in-memory fixtures test signatures and graph logic. The private
 //! response constructor below is never a production TDX verification backend.
 use super::*;
-#[path = "gcp_artifact_fixture.rs"]
 mod artifact_fixture;
 use crate::schema::*;
 use crate::{gcp_worker_protocol::GcpHardwareFacts, hash};
@@ -541,9 +540,9 @@ fn fixture_with_qualification_window(
 
 fn raw_evidence() -> GcpLaunchEvidenceV2 {
     GcpLaunchEvidenceV2::new(
-        include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-quote.bin").to_vec(),
-        include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-acpi-ccel.bin").to_vec(),
-        include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-ccel.bin").to_vec(),
+        include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-quote.bin").to_vec(),
+        include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-acpi-ccel.bin").to_vec(),
+        include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-ccel.bin").to_vec(),
     )
     .unwrap()
 }

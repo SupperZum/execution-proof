@@ -68,9 +68,9 @@ fn request() -> GcpPregrantRequest {
         authority_public_key: authority.public_key().as_ref().try_into().unwrap(),
         binding,
         evidence: GcpLaunchEvidenceV2::new(
-            include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-quote.bin").to_vec(),
-            include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-acpi-ccel.bin").to_vec(),
-            include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-ccel.bin").to_vec()).unwrap(),
+            include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-quote.bin").to_vec(),
+            include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-acpi-ccel.bin").to_vec(),
+            include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-ccel.bin").to_vec()).unwrap(),
         boot_policy: GcpBootEvidencePolicy {
             expected_pe_sha384: "c4240c5a835ca1c7b6b9c3dd762477870ba5b7a295ec0f551eb45d442be8926b3d887ea59fa348ff5e8832aaf595c8b4".into(),
             expected_firmware_mrtd: "f21e6b48743fe14c2d090078ca1197f09ae4c99438677f2c79901ef80e2aeefe2f9a7eb6e3eb3b5047c4f1511731e5d3".into(),

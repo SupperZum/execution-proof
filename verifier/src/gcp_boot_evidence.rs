@@ -634,5 +634,4 @@ pub fn check_boot_evidence(
 }
 
 #[cfg(test)]
-#[path = "gcp_boot_evidence_tests.rs"]
 mod tests;

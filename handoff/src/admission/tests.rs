@@ -541,5 +541,4 @@ fn registration_failure_also_consumes_the_local_context() {
     );
 }
 #[cfg(feature = "rootfs-custody")]
-#[path = "../admission_receiver_tests.rs"]
 mod receiver_enrollment_tests;

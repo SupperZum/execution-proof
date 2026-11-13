@@ -313,5 +313,4 @@ pub fn check_report_data(
 }
 
 #[cfg(test)]
-#[path = "gcp_bootstrap_tests.rs"]
 mod tests;

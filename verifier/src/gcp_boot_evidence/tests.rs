@@ -1,10 +1,10 @@
 use super::*;
 
-const QUOTE: &[u8] = include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-quote.bin");
-const LOG: &[u8] = include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-ccel.bin");
-const TABLE: &[u8] = include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-acpi-ccel.bin");
+const QUOTE: &[u8] = include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-quote.bin");
+const LOG: &[u8] = include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-ccel.bin");
+const TABLE: &[u8] = include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-acpi-ccel.bin");
 const REPORT: &[u8; 64] =
-    include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-host-challenge.bin");
+    include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-host-challenge.bin");
 // Firmware MRTD and PE Authenticode digests are independent fixture references.
 const FIRMWARE: &str = "f21e6b48743fe14c2d090078ca1197f09ae4c99438677f2c79901ef80e2aeefe2f9a7eb6e3eb3b5047c4f1511731e5d3";
 const BASE_PE: &str = "c4240c5a835ca1c7b6b9c3dd762477870ba5b7a295ec0f551eb45d442be8926b3d887ea59fa348ff5e8832aaf595c8b4";
@@ -40,8 +40,8 @@ fn baseline_replays_all_four_registers_with_independent_references() {
 
 #[test]
 fn real_mutant_requires_its_independent_reference_and_real_wrapper_rejects() {
-    let quote = include_bytes!("../tests/fixtures/gcp_boot_v1/mutant-quote.bin");
-    let log = include_bytes!("../tests/fixtures/gcp_boot_v1/mutant-ccel.bin");
+    let quote = include_bytes!("../../tests/fixtures/gcp_boot_v1/mutant-quote.bin");
+    let log = include_bytes!("../../tests/fixtures/gcp_boot_v1/mutant-ccel.bin");
     let mut p = policy();
     p.expected_instance.instance_id = 8408765100589872418;
     assert_eq!(
@@ -55,8 +55,8 @@ fn real_mutant_requires_its_independent_reference_and_real_wrapper_rejects() {
     assert_eq!(
         check_boot_evidence(
             TABLE,
-            include_bytes!("../tests/fixtures/gcp_boot_v1/wrapper-ccel.bin"),
-            include_bytes!("../tests/fixtures/gcp_boot_v1/wrapper-quote.bin"),
+            include_bytes!("../../tests/fixtures/gcp_boot_v1/wrapper-ccel.bin"),
+            include_bytes!("../../tests/fixtures/gcp_boot_v1/wrapper-quote.bin"),
             REPORT,
             &p
         ),

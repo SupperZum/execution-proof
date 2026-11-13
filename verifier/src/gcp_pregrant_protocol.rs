@@ -168,5 +168,4 @@ impl GcpPregrantResponse {
 }
 
 #[cfg(test)]
-#[path = "gcp_pregrant_protocol_tests.rs"]
 mod tests;

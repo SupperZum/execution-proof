@@ -468,7 +468,6 @@ fn validate_credential(bytes: &[u8], project: &str, email: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "server_tests.rs"]
 mod tests;
 struct Deadline {
     cancel: Option<mpsc::SyncSender<()>>,

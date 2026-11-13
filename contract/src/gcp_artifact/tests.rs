@@ -597,7 +597,8 @@ fn optional_management_role_preserves_vsock_wire_and_rejects_mixed_transport() {
 fn management_public_config_pins_paths_credentials_and_bounds_without_key_material() {
     let r = relay();
     let bytes = relay_config().encode().unwrap();
-    let shared = include_bytes!("../tests/fixtures/gcp-management-relay/public-config-shape.json");
+    let shared =
+        include_bytes!("../../tests/fixtures/gcp-management-relay/public-config-shape.json");
     assert_eq!(bytes, shared.trim_ascii());
     let mut selected = r.clone();
     selected.configuration_sha384 = sha384(shared);

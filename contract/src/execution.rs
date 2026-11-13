@@ -148,5 +148,4 @@ impl ExecutionRecord {
 }
 
 #[cfg(test)]
-#[path = "execution_tests.rs"]
 mod tests;

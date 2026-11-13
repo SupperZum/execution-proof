@@ -887,5 +887,4 @@ fn dns_name(host: &str) -> bool {
 }
 
 #[cfg(test)]
-#[path = "gcp_artifact_tests.rs"]
 mod tests;

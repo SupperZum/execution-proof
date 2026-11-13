@@ -371,5 +371,4 @@ impl ValidatedGraph {
 }
 
 #[cfg(test)]
-#[path = "graph_tests.rs"]
 mod tests;

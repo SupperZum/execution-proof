@@ -83,7 +83,6 @@ impl GcpHardwareRequest {
 }
 
 #[cfg(test)]
-#[path = "gcp_worker_protocol_tests.rs"]
 mod tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -945,5 +945,4 @@ fn deserialize_statement<'de, D: Deserializer<'de>>(deserializer: D) -> Result<V
 }
 
 #[cfg(test)]
-#[path = "rootfs_custody_tests.rs"]
 mod tests;

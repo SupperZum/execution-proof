@@ -551,5 +551,4 @@ fn binding() -> execution_proof_contract::gcp_boot_binding::GcpBootBindingV1 {
 }
 
 #[cfg(feature = "rootfs-custody")]
-#[path = "receiver_tests.rs"]
 mod receiver_enrollment_tests;

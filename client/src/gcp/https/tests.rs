@@ -296,3 +296,42 @@ fn trusted_transport_requires_bounded_cert_only_roots_and_exact_fixed_addresses(
         ));
     }
 }
+
+#[test]
+fn only_explicit_https_origins_and_static_routes_are_supported() {
+    for origin in [
+        "http://example.com",
+        "https://user:password@example.com",
+        "https://@example.com",
+        "https://example.com/path",
+        "https://example.com/a/..",
+        "https://example.com/%2e",
+        "https://example.com?query=1",
+        "https://example.com#fragment",
+        "https://example.com\\",
+        " https://example.com",
+    ] {
+        assert!(matches!(
+            GcpHttpsTransport::new(origin),
+            Err(ClientError::InvalidOrigin)
+        ));
+    }
+    for origin in [
+        "https://example.com",
+        "https://example.com/",
+        "https://example.com:8443",
+    ] {
+        let transport = GcpHttpsTransport::new(origin).unwrap();
+        for route in [
+            GcpLaunchRoute::Begin,
+            GcpLaunchRoute::Capture,
+            GcpLaunchRoute::ResourceChallenge,
+            GcpLaunchRoute::ResourceDecision,
+            GcpLaunchRoute::CredentialDelivery,
+        ] {
+            let url = transport.origin.join(route.path()).unwrap();
+            assert_eq!(url.origin(), transport.origin.origin());
+            assert!(url.path().starts_with("/kbs/launch/gcp/v2/"));
+        }
+    }
+}

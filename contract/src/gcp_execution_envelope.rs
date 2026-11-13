@@ -199,5 +199,4 @@ impl<'de> Deserialize<'de> for GcpExecutionEnvelope {
 }
 
 #[cfg(test)]
-#[path = "gcp_execution_envelope_tests.rs"]
 mod tests;

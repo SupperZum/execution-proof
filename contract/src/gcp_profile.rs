@@ -193,5 +193,4 @@ pub fn verify_gcp_qualification_historical(
 }
 
 #[cfg(test)]
-#[path = "gcp_profile_tests.rs"]
 mod tests;

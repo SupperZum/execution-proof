@@ -639,6 +639,3 @@ pub fn verify_statements_at(
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod gcp_prelaunch_tests;

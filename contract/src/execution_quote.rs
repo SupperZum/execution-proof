@@ -220,5 +220,4 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-#[path = "execution_quote_tests.rs"]
 mod tests;

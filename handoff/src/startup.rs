@@ -969,5 +969,4 @@ pub(crate) fn test_pair() -> (StartupBoundChannel, StartupBoundChannel) {
 }
 
 #[cfg(test)]
-#[path = "startup_tests.rs"]
 mod tests;

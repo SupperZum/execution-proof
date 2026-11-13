@@ -447,5 +447,4 @@ fn commitment(domain: &[u8], bytes: &[u8]) -> [u8; 48] {
 }
 
 #[cfg(test)]
-#[path = "rootfs_offer_tests.rs"]
 mod tests;

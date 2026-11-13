@@ -61,9 +61,9 @@ fn request() -> GcpHardwareRequest {
                 boot_binding: binding.clone(),
                 trust_snapshot_sha384: "09".repeat(48),
             },
-            include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-quote.bin").to_vec(),
-            include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-acpi-ccel.bin").to_vec(),
-            include_bytes!("../tests/fixtures/gcp_boot_v1/baseline-ccel.bin").to_vec(),
+            include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-quote.bin").to_vec(),
+            include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-acpi-ccel.bin").to_vec(),
+            include_bytes!("../../tests/fixtures/gcp_boot_v1/baseline-ccel.bin").to_vec(),
         )
         .unwrap(),
         expected_report_data: format!("{}{}", "12".repeat(48), "00".repeat(16)),

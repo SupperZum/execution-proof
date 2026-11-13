@@ -317,5 +317,4 @@ fn last_error() -> TransportError {
 }
 
 #[cfg(test)]
-#[path = "fd_transport_tests.rs"]
 mod tests;

@@ -121,5 +121,4 @@ pub fn report_data(
 }
 
 #[cfg(test)]
-#[path = "gcp_execution_quote_tests.rs"]
 mod tests;

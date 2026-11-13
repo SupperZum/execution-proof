@@ -467,5 +467,4 @@ pub fn verify_gcp_with_workers(
 }
 
 #[cfg(test)]
-#[path = "gcp_graph_tests.rs"]
 mod tests;

@@ -670,5 +670,4 @@ impl GcpClientProtocol {
     }
 }
 #[cfg(test)]
-#[path = "gcp_tests.rs"]
 mod tests;
