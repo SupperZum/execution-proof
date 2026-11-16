@@ -17,6 +17,9 @@ for encrypted-image preparation and protected execution capture, and
 [GCP execution path](docs/design.md#gcp-execution-path) describes the entry
 points and their trust inputs.
 
+Follow the [prototype run guide](docs/run-prototype.md) to verify the sample
+evidence offline or run an encrypted workload on GKE with Intel TDX.
+
 ## Workspace
 
 | Crate | Responsibility |
