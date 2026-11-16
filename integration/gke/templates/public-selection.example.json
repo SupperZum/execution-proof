@@ -1,0 +1,157 @@
+{
+  "version": 1,
+  "purpose": "onb17.manual-public-pack-selection.v1",
+  "protected_export": {
+    "path": "/absolute/public-evidence/protected_export.json",
+    "sha384": "SET_SHA384"
+  },
+  "bootstrap_transcript": {
+    "path": "/absolute/public-evidence/bootstrap_transcript.json",
+    "sha384": "SET_SHA384"
+  },
+  "signed_bootstrap_challenge": {
+    "path": "/absolute/public-evidence/signed_bootstrap_challenge.json",
+    "sha384": "SET_SHA384"
+  },
+  "original_policy_archive": {
+    "path": "/absolute/public-evidence/original_policy_archive.json",
+    "sha384": "SET_SHA384"
+  },
+  "policy_transcript": {
+    "path": "/absolute/public-evidence/policy_transcript.json",
+    "sha384": "SET_SHA384"
+  },
+  "signed_qualification": {
+    "path": "/absolute/public-evidence/signed_qualification.json",
+    "sha384": "SET_SHA384"
+  },
+  "trust": {
+    "path": "/absolute/public-evidence/trust.json",
+    "sha384": "SET_SHA384"
+  },
+  "challenge": {
+    "path": "/absolute/public-evidence/challenge.json",
+    "sha384": "SET_SHA384"
+  },
+  "objects": [
+    {
+      "kind": "admission_policy",
+      "file": {
+        "path": "/absolute/public-evidence/admission_policy",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "image_policy",
+      "file": {
+        "path": "/absolute/public-evidence/image_policy",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "producer_profile",
+      "file": {
+        "path": "/absolute/public-evidence/producer_profile",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "gcp_config",
+      "file": {
+        "path": "/absolute/public-evidence/gcp_config",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "gcp_artifact_manifest",
+      "file": {
+        "path": "/absolute/public-evidence/gcp_artifact_manifest",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "gcp_reference_policy",
+      "file": {
+        "path": "/absolute/public-evidence/gcp_reference_policy",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "trust_snapshot",
+      "file": {
+        "path": "/absolute/public-evidence/trust_snapshot",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "signature_key",
+      "file": {
+        "path": "/absolute/public-evidence/signature_key",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "signature_payload",
+      "file": {
+        "path": "/absolute/public-evidence/signature_payload",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "signature",
+      "file": {
+        "path": "/absolute/public-evidence/signature",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "signature_repository",
+      "file": {
+        "path": "/absolute/public-evidence/signature_repository",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "gcp_artifact_closure",
+      "file": {
+        "path": "/absolute/public-evidence/gcp_artifact_closure",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "gcp_firmware_causality",
+      "file": {
+        "path": "/absolute/public-evidence/gcp_firmware_causality",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "gcp_producer_isolation",
+      "file": {
+        "path": "/absolute/public-evidence/gcp_producer_isolation",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "gcp_no_state_copy",
+      "file": {
+        "path": "/absolute/public-evidence/gcp_no_state_copy",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "gcp_qualification_review",
+      "file": {
+        "path": "/absolute/public-evidence/gcp_qualification_review",
+        "sha384": "SET_SHA384"
+      }
+    },
+    {
+      "kind": "dcap_collateral",
+      "file": {
+        "path": "/absolute/public-evidence/dcap_collateral",
+        "sha384": "SET_SHA384"
+      }
+    }
+  ]
+}

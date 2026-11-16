@@ -1,0 +1,4 @@
+{
+  "bootstrap_worker": {"path": "/absolute/bin/gcp-tdx-bootstrap-history-verifier", "sha384": "SET_SHA384"},
+  "execution_worker": {"path": "/absolute/bin/gcp-tdx-hardware-verifier", "sha384": "SET_SHA384"}
+}

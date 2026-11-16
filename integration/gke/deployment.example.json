@@ -1,0 +1,10 @@
+{
+  "project": "replace-with-project",
+  "zone": "us-central1-a",
+  "network": "replace-with-vpc",
+  "subnet": "replace-with-subnet",
+  "podvm_image": "execution-proof-tdx",
+  "machine_type": "c3-standard-4",
+  "kubernetes_version": "1.36.4",
+  "workload_image": "registry.example.invalid/workloads/proof@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

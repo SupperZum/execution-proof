@@ -69,14 +69,11 @@ Obtain the deployment inputs before creating a Pod:
 | Operator tools | The qualification driver and signer, the stock-CAA launch controller, evidence assembler and their configuration templates. The launch controller ties the Kubernetes Pod to its Compute instance and drives guest boot and admission. |
 | Workload and trust | A signed encrypted OCI image with a platform manifest digest, its Cloud KMS key version, Authority/KBS policy, TLS and signing roots, and TDX collateral. Generate private keys and obtain credentials in your deployment. |
 
-Get the Kubernetes profile and operator tools from the prototype operator.
-Keep deployment-specific configuration and credentials in a private staging
-directory.
-
-The GKE setup kit includes the stock CAA image, manifest renderer, worker
-readback helpers, qualification and launch controllers, signers and evidence
-assembler. Follow its README to render the Kubernetes profile and
-`CONTROLLERS.md` to configure the controllers for your deployment.
+The [GKE deployment guide](../integration/gke/README.md) builds the standard
+CAA image and the worker helpers from source and downloads the pinned Helm
+charts. It also prepares the manifest renderer, signers and evidence
+assembler in this repository. Keep deployment-specific configuration and
+credentials in a private staging directory.
 
 ### Configure the cluster and PodVM
 
@@ -145,9 +142,10 @@ certificates and the attempt credentials.
    evidence assembler to produce the pack and preserve the independently
    selected trust configuration and challenge.
 
-Run these commands from the kit directory after preparing the deployment
-profile and the two operator configurations in `CONTROLLERS.md`. Run
-`qualify` and `launch` in their respective private service sessions.
+Run these commands from `integration/gke` after preparing the deployment
+profile and the two operator configurations in the
+[controller guide](../integration/gke/CONTROLLERS.md). Run `qualify` and
+`launch` in their respective private service sessions.
 
 ```bash
 python3 -B tools/controller/run.py qualify deployment.json qualification-operator.json
@@ -166,7 +164,7 @@ python3 -B tools/controller/run.py launch deployment.json pod-operator.json
 
 ### Verify the new execution
 
-Use the kit's evidence assembler with the original protocol records and the
+Use the evidence assembler with the original protocol records and the
 relying party's independently selected trust and challenge files.
 
 Run the [GCP verifier](../verifier/README.md#gcp-tdx) with the resulting

@@ -1,0 +1,34 @@
+image:
+  reference: quay.io/kata-containers/kata-deploy@sha256:460128eea49aee30fd023f1eabd94dc75fd694dff9a09ed82daeba5c126b2b0e
+kubectlImage:
+  reference: quay.io/kata-containers/kubectl@sha256:ef04d159d5714fdc22527db377ba9adb4769e634d95555970e04f4b9c5743366
+nodeSelector:
+  kubernetes.io/os: linux
+  kubernetes.io/arch: amd64
+  execution-proof-worker: "true"
+priorityClassName: ""
+snapshotter:
+  setup:
+    - nydus
+shims:
+  disableAll: true
+  remote:
+    enabled: true
+    supportedArches:
+      - amd64
+    dropIn: |
+      [hypervisor.remote]
+      remote_hypervisor_socket = "/run/peerpod/hypervisor.sock"
+      remote_hypervisor_timeout = 600
+    containerd:
+      snapshotter: nydus
+    runtimeClass:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        kubernetes.io/os: linux
+        execution-proof-worker: "true"
+defaultShim:
+  amd64: remote
+runtimeClasses:
+  enabled: true
+  createDefault: false

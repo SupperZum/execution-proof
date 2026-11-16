@@ -1,0 +1,9 @@
+{
+  "endpoint": "192.0.2.10:15150",
+  "server_ca_path": "/absolute/profile/relay-server-ca.pem",
+  "server_ca_sha384": "SET_SHA384",
+  "server_leaf_der_sha384": "SET_SHA384_OF_DER_CERTIFICATE",
+  "client_cert_path": "/absolute/profile/relay-client.pem",
+  "client_cert_sha384": "SET_SHA384",
+  "client_key_path": "/absolute/private/relay-client-key.pem"
+}

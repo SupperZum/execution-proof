@@ -1,0 +1,4 @@
+version = 3
+
+[plugins."io.containerd.cri.v1.images".runtime_platforms."kata-remote"]
+  snapshotter = "nydus-for-kata-tee"
