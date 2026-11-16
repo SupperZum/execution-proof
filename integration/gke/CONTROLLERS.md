@@ -11,8 +11,8 @@ from the guest.
 
 Follow the Execution Proof run guide to clone the branches, build the measured
 PodVM, build the independent TDX workers and import the Compute image. Follow
-the [deployment guide](README.md) to deploy Kata and stock CAA. Build the qualification
-experiment authority from the kit and the normal authority from Execution Proof:
+the [deployment guide](README.md) to deploy Kata and stock CAA. Build the
+qualification and normal Authority binaries from this checkout:
 
 ```bash
 cargo build --locked --manifest-path tools/qualification-experiment/Cargo.toml
