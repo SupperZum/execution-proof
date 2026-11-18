@@ -89,7 +89,7 @@ fn required_optional_hash<'de, D: Deserializer<'de>>(
 }
 
 impl PolicyCommitments {
-    fn append_to(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+    pub(crate) fn append_to(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         identifier(&self.policy_id)?;
         hex_bytes(&self.policy_sha384, 48)?;
         hex_bytes(&self.input_sha384, 48)?;

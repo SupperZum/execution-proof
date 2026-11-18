@@ -1,3 +1,5 @@
+mod gcp_prelaunch;
+
 use super::*;
 use ring::{
     rand::SystemRandom,

@@ -27,6 +27,7 @@ pub const MAX_RUNTIME_BYTES: usize = 16 * 1024;
 pub const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
 pub const MAX_CREDENTIAL_RESPONSE_BYTES: usize = 256 * 1024;
 
+pub mod gcp;
 #[cfg(feature = "https")]
 pub mod https;
 

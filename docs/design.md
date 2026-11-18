@@ -3,21 +3,30 @@
 ## Components
 
 `contract` defines the signed objects and bounded verification primitives.
-`client`, `issuer`, and `handoff` depend on it without depending on each other in
-production. The issuer's integration tests exercise the guest gate through a
-development dependency on `handoff`.
+`client`, `issuer`, and `handoff` share that contract.
 
-Module-local tests cover codecs, signatures, binding mismatches and state
-transitions. `issuer/tests/` covers persistence, authority time, concurrent
-admission and guest verification. `handoff/tests/admission_lifecycle.rs` exercises
-the association-only lifecycle behind `software-lab`. Software fixtures generate
-ephemeral signing keys in memory; they do not provide hardware evidence.
+The software admission API receives trust roots, expected context, capacities,
+the clock and issuer database paths through constructors.
 
-Trust roots, full expected context, capacities, clock and issuer database paths
-are constructor inputs. There is no configuration-file loader, environment-based
-trust-root discovery, server process or deployment manifest in this workspace.
+## GCP execution path
+
+- [`gcp-authority`](../issuer/README.md) loads explicit operator configuration
+  and uses SQLite for bootstrap, grant and admission state.
+- [`gcp-trusted-kbs`](../integration/gcp-trusted-services/README.md) runs HTTPS
+  attestation, policy evaluation and credential delivery on the trusted side.
+  Its build uses a matching Trustee checkout.
+- The [measured PodVM](../integration/gcp-guest/README.md) uses Guest Components
+  for preparation and Kata for protected execution capture. The guest build
+  requires the corresponding checkouts and pinned build inputs.
+- [`gcp-execution-proof-verifier`](../verifier/README.md) checks the evidence
+  graph using separate trust and challenge inputs and pinned TDX verifier
+  workers. Its successful claim is an authorized workload attempt. Associating
+  that attempt with a Kubernetes Pod UID requires separate trusted identity
+  readbacks.
 
 ## Signed objects
+
+The following objects describe the software admission API.
 
 All signing transcripts use explicit purposes, ordered length framing and SHA-384
 commitments with Ed25519 signatures. Unknown or duplicate JSON fields and
@@ -129,10 +138,11 @@ effects and has the uninhabited success type `Infallible`.
 returns `ContentPreparationUnavailable`. No public flag or caller boolean opens a
 positive preparation path.
 
-A complete execution proof still requires qualified boot/key-origin and measured
+A complete execution proof requires qualified boot/key-origin and measured
 configuration, deployed authority/AS/KBS authentication, fresh encrypted-content
 preparation with rootfs custody, authenticated content-to-runtime handoff,
 protected record capture with producer isolation, and independent verification.
-Those capabilities are outside this workspace's current preparation API. Local
-signature and lifecycle tests do not qualify cloud KMS use, hardware quotes,
-rollback/clone resistance or a deployed execution proof chain.
+The GCP execution path uses this architecture for a specific measured guest
+profile. Local signature and lifecycle tests cover software behavior.
+Producer isolation and rollback resistance depend on evidence for the exact
+measured build and its platform.

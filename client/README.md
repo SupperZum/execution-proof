@@ -1,6 +1,7 @@
 # Launch policy client
 
-`execution-proof-client` implements the memory-only `/kbs/launch/v1` exchange. It
+`execution-proof-client` implements the memory-only KBS launch exchange.
+The v1 client uses `/kbs/launch/v1`. It
 creates recorder proofs of possession, checks server context against its own
 signed grant, key, initialization data and evidence, and retains exact request
 bytes for explicit retries. HTTP success does not establish policy acceptance.
@@ -51,3 +52,12 @@ Run from the workspace root. The unit tests check protocol handling, bounds and
 origin/route selection; they do not connect to a deployed TLS service or exercise
 a hardware attester. Workspace checks and build requirements are in the
 [root README](../README.md#build-and-test).
+
+## GCP credential delivery
+
+`gcp::GcpClientProtocol` uses `/kbs/launch/gcp/v2/` and binds requests to the
+selected GCP boot profile. In the measured guest, construct
+`gcp::https::GcpHttpsTransport::with_trusted_roots` with the selected CA
+certificates and a fixed server address. The transport authenticates the
+configured HTTPS name and permits up to 6 MiB per encoded request or response.
+The decoded evidence limit remains 1 MiB.
