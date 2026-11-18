@@ -56,6 +56,12 @@ python3 package-runtime.py --workers-build worker-build \
 
 The experiment executable must be named `onb17-qualification-experiment`.
 Supply a hosts file with literal addresses for the private service endpoints.
+For the journal-enabled Authority or verifier, also pass
+`--journal-ca-bundle PATH` and `--journal-dns-server ADDRESS` using the deployment's
+trusted CA bundle and resolver. This packages the CA file and resolver
+configuration in the chroot inventory. Entries in the selected hosts file take
+precedence over DNS.
+
 The packager checks the selected worker binaries and source digests before
 copying them, verifies that debug stripping preserves loadable bytes, and
 copies the GNU loader and recursive shared-library dependencies into the

@@ -18,7 +18,7 @@ def sha(path):
 def sources():
     paths=[]
     for root in [
-        EPP / 'contract', EPP / 'verifier', EPP / 'issuer', EPP / 'handoff',
+        EPP / 'contract', EPP / 'verifier', EPP / 'issuer', EPP / 'handoff', EPP / 'gcp-journal',
         TRUSTEE / 'deps/verifier', TRUSTEE / 'deps/eventlog',
     ]:
         paths.extend(root.rglob('*.rs'));paths.append(root/'Cargo.toml')
@@ -79,7 +79,7 @@ def main():
         (EPP, ['build', '-p', 'execution-proof-issuer', '--no-default-features',
                '--features', 'gcp', '--bin', 'gcp-authority'], 'gcp-authority'),
         (EPP, ['build', '-p', 'execution-proof-verifier', '--no-default-features',
-               '--bin', 'gcp-execution-proof-verifier'], 'gcp-execution-proof-verifier'),
+               '--features', 'gcp-journal', '--bin', 'gcp-execution-proof-verifier'], 'gcp-execution-proof-verifier'),
     ]
     plans.extend((TRUSTEE, ['rustc', '-p', 'verifier', '--no-default-features',
                            '--features', 'execution-quote-worker-tdx', '--bin', name], name)

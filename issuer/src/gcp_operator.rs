@@ -8,7 +8,10 @@ use crate::{
     gcp::{GcpBootstrapSubmission, GcpIssuer, GcpIssuerConfig, GcpIssuerError},
     AdmissionPublicationKind, GrantPublication,
 };
-use execution_proof_contract::gcp_policy_receipt::GcpLaunchPolicyAggregateV2;
+use execution_proof_contract::{
+    admission::gcp::GcpAdmissionOperation, gcp_policy_receipt::GcpLaunchPolicyAggregateV2,
+};
+use execution_proof_gcp_journal::{Error as JournalError, Journal, PublicationJournal};
 use ring::signature::Ed25519KeyPair;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -147,6 +150,7 @@ pub enum PublicError {
     HardwareUnavailable,
     HardwareRejected,
     StateRejected,
+    JournalUnavailable,
     IoDeadline,
     Io,
     ResponseLimit,
@@ -169,9 +173,26 @@ impl From<GcpIssuerError> for PublicError {
     }
 }
 
+impl From<JournalError> for PublicError {
+    fn from(error: JournalError) -> Self {
+        match error {
+            JournalError::Conflict => Self::StateRejected,
+            JournalError::Unavailable => Self::JournalUnavailable,
+        }
+    }
+}
+
 /// Dispatches only the typed authority operations. The caller owns the already
 /// configured authority and the authenticated transport; this does not add one.
 pub fn execute_request(issuer: &GcpIssuer, bytes: &[u8]) -> Result<Response, PublicError> {
+    dispatch(issuer, bytes, None)
+}
+
+pub(crate) fn dispatch(
+    issuer: &GcpIssuer,
+    bytes: &[u8],
+    journal: Option<&dyn PublicationJournal>,
+) -> Result<Response, PublicError> {
     if bytes.is_empty() || bytes.len() > MAX_REQUEST_BYTES {
         return Err(PublicError::RequestLimit);
     }
@@ -183,6 +204,9 @@ pub fn execute_request(issuer: &GcpIssuer, bytes: &[u8]) -> Result<Response, Pub
     let result = match request.request {
         Operation::Begin { signed_intent_json } => {
             let signed = issuer.begin(&signed_intent_json)?;
+            if let Some(journal) = journal {
+                issuer.journal_begin(journal, &signed.statement.challenge_id)?;
+            }
             ResponseBody::Challenge {
                 signed_challenge_json: serde_json::to_vec(&signed)
                     .map_err(|_| PublicError::Internal)?,
@@ -192,12 +216,21 @@ pub fn execute_request(issuer: &GcpIssuer, bytes: &[u8]) -> Result<Response, Pub
             challenge_id,
             submission,
         } => {
+            if let Some(journal) = journal {
+                issuer.journal_attempt(&challenge_id)?.check(journal)?;
+            }
             let issued = issuer.issue(&challenge_id, &submission)?;
+            let first = if let Some(journal) = journal {
+                issuer.journal_issue(journal, &challenge_id, &issued.signed_grant_json)?
+            } else {
+                matches!(issued.publication, GrantPublication::FirstIssued)
+            };
             ResponseBody::Grant {
                 signed_grant_json: issued.signed_grant_json,
-                publication: match issued.publication {
-                    GrantPublication::FirstIssued => Publication::FirstIssued,
-                    GrantPublication::Existing => Publication::Existing,
+                publication: if first {
+                    Publication::FirstIssued
+                } else {
+                    Publication::Existing
                 },
             }
         }
@@ -207,21 +240,32 @@ pub fn execute_request(issuer: &GcpIssuer, bytes: &[u8]) -> Result<Response, Pub
             container_id,
             trust_snapshot_sha384,
             execution_audience,
-        } => ResponseBody::StartupPlan {
-            signed_plan_json: issuer.startup_plan(
-                &grant_id,
-                &aggregate_json,
-                &container_id,
-                &trust_snapshot_sha384,
-                &execution_audience,
-            )?,
-        },
+        } => {
+            if let Some(journal) = journal {
+                issuer.check_journal_grant(journal, &grant_id)?;
+            }
+            ResponseBody::StartupPlan {
+                signed_plan_json: issuer.startup_plan(
+                    &grant_id,
+                    &aggregate_json,
+                    &container_id,
+                    &trust_snapshot_sha384,
+                    &execution_audience,
+                )?,
+            }
+        }
         Operation::PinPolicyAdmission {
             grant_id,
             expected,
             guest_nonce,
         } => {
+            if let Some(journal) = journal {
+                issuer.check_journal_grant(journal, &grant_id)?;
+            }
             issuer.pin_policy_admission(&grant_id, &expected, &guest_nonce)?;
+            if let Some(journal) = journal {
+                issuer.publish_journal_pin(journal, &grant_id)?;
+            }
             ResponseBody::PolicyPinned
         }
         Operation::RedeemPolicyAggregate {
@@ -229,16 +273,37 @@ pub fn execute_request(issuer: &GcpIssuer, bytes: &[u8]) -> Result<Response, Pub
             aggregate_json,
             recorder_request_json,
         } => {
-            let publication = issuer.redeem_policy_aggregate(
-                &grant_id,
-                &aggregate_json,
-                &recorder_request_json,
-            )?;
+            let (wire, first) = if let Some(journal) = journal {
+                let entry = issuer
+                    .journal_admission(
+                        journal,
+                        &grant_id,
+                        &aggregate_json,
+                        &recorder_request_json,
+                        GcpAdmissionOperation::Redeem,
+                    )?
+                    .ok_or(PublicError::Internal)?;
+                (entry.payload, entry.first)
+            } else {
+                let publication = issuer.redeem_policy_aggregate(
+                    &grant_id,
+                    &aggregate_json,
+                    &recorder_request_json,
+                )?;
+                (
+                    publication.signed_authorization_json,
+                    matches!(
+                        publication.publication,
+                        AdmissionPublicationKind::FirstAuthorized
+                    ),
+                )
+            };
             ResponseBody::Admission {
-                signed_authorization_json: publication.signed_authorization_json,
-                publication: match publication.publication {
-                    AdmissionPublicationKind::FirstAuthorized => Publication::FirstAuthorized,
-                    AdmissionPublicationKind::Existing => Publication::Existing,
+                signed_authorization_json: wire,
+                publication: if first {
+                    Publication::FirstAuthorized
+                } else {
+                    Publication::Existing
                 },
             }
         }
@@ -247,11 +312,23 @@ pub fn execute_request(issuer: &GcpIssuer, bytes: &[u8]) -> Result<Response, Pub
             aggregate_json,
             recorder_request_json,
         } => ResponseBody::PolicyStatus {
-            signed_authorization_json: issuer.status_policy_aggregate(
-                &grant_id,
-                &aggregate_json,
-                &recorder_request_json,
-            )?,
+            signed_authorization_json: if let Some(journal) = journal {
+                issuer
+                    .journal_admission(
+                        journal,
+                        &grant_id,
+                        &aggregate_json,
+                        &recorder_request_json,
+                        GcpAdmissionOperation::Status,
+                    )?
+                    .map(|entry| entry.payload)
+            } else {
+                issuer.status_policy_aggregate(
+                    &grant_id,
+                    &aggregate_json,
+                    &recorder_request_json,
+                )?
+            },
         },
     };
     let response = Response::new(result);
@@ -267,6 +344,7 @@ struct Arguments {
     store: PathBuf,
     collateral: PathBuf,
     capacity: usize,
+    journal_bucket: Option<String>,
 }
 impl Arguments {
     fn parse(mut values: impl Iterator<Item = OsString>) -> Result<Self, PublicError> {
@@ -281,6 +359,7 @@ impl Arguments {
         let mut store = None;
         let mut collateral = None;
         let mut capacity = None;
+        let mut journal_bucket = None;
         while let Some(flag) = values.next() {
             let value = values.next().ok_or(PublicError::Arguments)?;
             let destination = match flag.to_str() {
@@ -289,6 +368,13 @@ impl Arguments {
                 Some("--signer") => &mut signer,
                 Some("--store") => &mut store,
                 Some("--collateral") => &mut collateral,
+                Some("--journal-bucket") => {
+                    if initialize || journal_bucket.is_some() {
+                        return Err(PublicError::Arguments);
+                    }
+                    journal_bucket = Some(value.into_string().map_err(|_| PublicError::Arguments)?);
+                    continue;
+                }
                 Some("--capacity") => {
                     if capacity.is_some() {
                         return Err(PublicError::Arguments);
@@ -316,6 +402,7 @@ impl Arguments {
             store: store.ok_or(PublicError::Arguments)?,
             collateral: collateral.ok_or(PublicError::Arguments)?,
             capacity: capacity.ok_or(PublicError::Arguments)?,
+            journal_bucket,
         })
     }
 }
@@ -494,7 +581,17 @@ fn run_inner() -> Result<Response, PublicError> {
     if args.initialize {
         return Ok(Response::new(ResponseBody::Initialized));
     }
-    execute_request(&issuer, &read_request(libc::STDIN_FILENO, IO_TIMEOUT)?)
+    let request = read_request(libc::STDIN_FILENO, IO_TIMEOUT)?;
+    let journal = args
+        .journal_bucket
+        .as_deref()
+        .map(Journal::connect)
+        .transpose()?;
+    dispatch(
+        &issuer,
+        &request,
+        journal.as_ref().map(|v| v as &dyn PublicationJournal),
+    )
 }
 /// Dedicated-process entrypoint. Every failure is one fixed public code; no
 /// private key, path, environment, request or nested source error is formatted.

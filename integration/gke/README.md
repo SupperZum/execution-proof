@@ -186,6 +186,23 @@ gcp-execution-proof-verifier \
   --gcp-bootstrap-worker "$BOOTSTRAP_WORKER" --gcp-bootstrap-worker-sha384 "$BOOTSTRAP_WORKER_SHA384"
 ```
 
+For a deployment that requires a Cloud Storage publication journal, build the
+GCP verifier with `--features gcp-journal` and pass `--journal-bucket BUCKET`.
+Set `authority_journal_bucket` in the trusted operator configuration to pass the
+corresponding flag to Authority requests. Keep these settings in the relying
+party and Authority deployment. Use a new journal with new attempts, or a
+journal that already contains the authoritative history for those attempts.
+Authority and verifier need read and conditional-create access through their
+attached runtime identities. The Storage objects, deployment configuration and
+identity grants must be outside the workload restore domain. The runtime needs
+access to the metadata credential endpoint and to Cloud Storage through trusted
+DNS and TLS.
+
+In journal mode the verifier prints the same verdict schema. It emits
+`event_journal_publication=first` or `event_journal_publication=existing` on
+stderr only after successful journal readback.
+
+
 The expected fresh result is `verified_exec / exec_committed` with identity
 scope `authorized_workload_attempt`. Match the attempt, container ID, VM and
 encrypted manifest digest to the independently collected observations.

@@ -82,7 +82,7 @@ fn read(path: &Path, limit: usize) -> Result<Vec<u8>, VerificationError> {
 
 fn run() -> Result<execution_proof_verifier::VerificationVerdict, VerificationError> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
-    if arguments.len() != 14 {
+    if arguments.len() != 14 && !(cfg!(feature = "gcp-journal") && arguments.len() == 16) {
         return Err(VerificationError::Invalid(
             "expected_gcp_pack_trust_challenge_and_two_pinned_workers",
         ));
@@ -100,6 +100,8 @@ fn run() -> Result<execution_proof_verifier::VerificationVerdict, VerificationEr
             "--tdx-worker-sha384",
             "--gcp-bootstrap-worker",
             "--gcp-bootstrap-worker-sha384",
+            #[cfg(feature = "gcp-journal")]
+            "--journal-bucket",
         ]
         .contains(&key)
             || options.insert(key, &pair[1]).is_some()
@@ -130,7 +132,43 @@ fn run() -> Result<execution_proof_verifier::VerificationVerdict, VerificationEr
     let bootstrap = TrustedWorker::open(Path::new(get("--gcp-bootstrap-worker")?), bootstrap_hash)
         .map_err(|_| VerificationError::BackendUnavailable("bootstrap_worker_pin_rejected"))?
         .with_process_budget();
-    verify_gcp_with_workers(graph, &bootstrap, &worker)
+    let verdict = verify_gcp_with_workers(graph, &bootstrap, &worker)?;
+    #[cfg(feature = "gcp-journal")]
+    if let Some(bucket) = options.get("--journal-bucket") {
+        use execution_proof_gcp_journal::PublicationJournal;
+        let (event, digest) = verdict
+            .event_binding()
+            .ok_or(VerificationError::Invalid("verified_event_binding"))?;
+        let bucket = bucket
+            .to_str()
+            .ok_or(VerificationError::Invalid("argument_encoding"))?;
+        let journal = execution_proof_gcp_journal::Journal::connect(bucket)
+            .map_err(|_| VerificationError::BackendUnavailable("event_journal_unavailable"))?;
+        let entry = journal
+            .publish(
+                "event",
+                event.as_bytes(),
+                digest.as_bytes(),
+                digest.as_bytes(),
+                None,
+            )
+            .map_err(|error| match error {
+                execution_proof_gcp_journal::Error::Unavailable => {
+                    VerificationError::BackendUnavailable("event_journal_unavailable")
+                }
+                execution_proof_gcp_journal::Error::Conflict => {
+                    VerificationError::Invalid("event_journal_conflict")
+                }
+            })?;
+        if entry.payload != digest.as_bytes() {
+            return Err(VerificationError::Invalid("event_journal_conflict"));
+        }
+        eprintln!(
+            "event_journal_publication={}",
+            if entry.first { "first" } else { "existing" }
+        );
+    }
+    Ok(verdict)
 }
 
 fn main() {

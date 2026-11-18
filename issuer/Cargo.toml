@@ -11,9 +11,10 @@ repository.workspace = true
 
 [features]
 default = []
-gcp = ["dep:base64", "dep:execution-proof-verifier", "dep:kbs-types", "dep:serde_json_canonicalizer", "dep:libc", "dep:zeroize"]
+gcp = ["dep:base64", "dep:execution-proof-gcp-journal", "dep:execution-proof-verifier", "dep:kbs-types", "dep:serde_json_canonicalizer", "dep:libc", "dep:zeroize"]
 
 [dependencies]
+execution-proof-gcp-journal = { path = "../gcp-journal", optional = true }
 base64 = { version = "=0.22.1", optional = true }
 execution-proof-contract = { path = "../contract" }
 execution-proof-verifier = { path = "../verifier", optional = true }

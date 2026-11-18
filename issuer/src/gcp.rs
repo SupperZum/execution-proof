@@ -3,6 +3,8 @@
 //! No default service activation, discovery enrollment, or qualification signing
 //! is provided by this module.
 
+pub(crate) mod journal;
+
 use super::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use execution_proof_contract::{

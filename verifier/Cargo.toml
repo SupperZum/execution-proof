@@ -9,7 +9,11 @@ readme.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+gcp-journal = ["dep:execution-proof-gcp-journal"]
+
 [dependencies]
+execution-proof-gcp-journal = { path = "../gcp-journal", optional = true }
 base64 = "=0.22.1"
 execution-proof-contract = { path = "../contract" }
 execution-proof-handoff = { path = "../handoff", features = ["rootfs-custody"] }

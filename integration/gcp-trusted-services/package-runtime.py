@@ -4,7 +4,7 @@
 Keys/config/collateral/SA JSON are deliberately absent. All native processes use
 only already-pinned public code. Source binaries remain unchanged.
 """
-import argparse, hashlib, importlib.util, ipaddress, json, re, shutil, struct, subprocess
+import argparse, hashlib, importlib.util, ipaddress, json, re, shutil, ssl, struct, subprocess
 from pathlib import Path
 
 HERE=Path(__file__).resolve().parent
@@ -14,7 +14,7 @@ def sha(path):
     with path.open('rb')as f:return hashlib.file_digest(f,'sha384').hexdigest()
 def digest(raw):return hashlib.sha384(raw).hexdigest()
 def inventory():
-    roots=[HERE,EPP/'contract',EPP/'client',EPP/'issuer',EPP/'verifier',EPP/'handoff',TRUSTEE/'attestation-service/src',TRUSTEE/'kbs/src',TRUSTEE/'deps/verifier',TRUSTEE/'deps/eventlog',TRUSTEE/'deps/policy-engine',TRUSTEE/'deps/key-value-storage']
+    roots=[HERE,EPP/'contract',EPP/'client',EPP/'issuer',EPP/'verifier',EPP/'handoff',EPP/'gcp-journal',TRUSTEE/'attestation-service/src',TRUSTEE/'kbs/src',TRUSTEE/'deps/verifier',TRUSTEE/'deps/eventlog',TRUSTEE/'deps/policy-engine',TRUSTEE/'deps/key-value-storage']
     paths=[]
     for root in roots:
         paths += [p for p in root.rglob('*') if p.is_file() and p.suffix in {'.rs','.toml','.lock','.rego','.c','.h','.py'} and not set(p.parts)&{'target','__pycache__','.git'}]
@@ -61,13 +61,32 @@ def hosts(path):
     return '\n'.join(entries) + '\n'
 
 
+def journal_network(ca_bundle, dns_server):
+    if ca_bundle is None:
+        return None
+    with ca_bundle.open('rb') as bundle:
+        ca_pem = bundle.read((1 << 20) + 1)
+    if len(ca_pem) > 1 << 20:
+        raise ValueError('journal CA bundle exceeds 1 MiB')
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_verify_locations(cadata=ca_pem.decode('ascii'))
+    if context.cert_store_stats()['x509_ca'] == 0:
+        raise ValueError('journal CA bundle contains no root certificates')
+    return ca_pem, str(ipaddress.ip_address(dns_server))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--workers-build', type=Path, required=True)
     parser.add_argument('--experiment', type=Path, required=True)
     parser.add_argument('--hosts-file', type=Path, required=True)
+    parser.add_argument('--journal-ca-bundle', type=Path)
+    parser.add_argument('--journal-dns-server')
     parser.add_argument('--output', type=Path, required=True)
     a = parser.parse_args()
+    if (a.journal_ca_bundle is None) != (a.journal_dns_server is None):
+        parser.error('provide both journal network options')
+    network = journal_network(a.journal_ca_bundle, a.journal_dns_server)
     selected_hosts = hosts(a.hosts_file)
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -119,7 +138,15 @@ def main():
         todo += info['needed']
     loader=Path('/lib64/ld-linux-x86-64.so.2').resolve(strict=True)
     shutil.copyfile(loader,root/'lib64/ld-linux-x86-64.so.2');(root/'lib64/ld-linux-x86-64.so.2').chmod(0o555)
-    (root/'etc/nsswitch.conf').write_text('hosts: files\n')
+    if network is None:
+        (root/'etc/nsswitch.conf').write_text('hosts: files\n')
+    else:
+        ca_pem, dns_server = network
+        certs = root/'etc/ssl/certs'
+        certs.mkdir(parents=True)
+        (certs/'ca-certificates.crt').write_bytes(ca_pem)
+        (root/'etc/nsswitch.conf').write_text('hosts: files dns\n')
+        (root/'etc/resolv.conf').write_text(f'nameserver {dns_server}\n')
     (root/'etc/hosts').write_text(selected_hosts)
     checks=[]
     for artifact in artifacts:

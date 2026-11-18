@@ -85,6 +85,11 @@ impl VerificationVerdict {
     pub fn status(&self) -> &str {
         self.status
     }
+
+    #[cfg(feature = "gcp-journal")]
+    pub fn event_binding(&self) -> Option<(&str, &str)> {
+        Some((self.event_id.as_deref()?, self.record_sha384.as_deref()?))
+    }
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {

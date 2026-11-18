@@ -693,3 +693,179 @@ fn startup_plan_signs_only_stored_grant_and_actual_configured_kbs_aggregate() {
         .startup_plan(id, &a_bytes, "application", &"91".repeat(48), "auditor")
         .is_err());
 }
+
+#[test]
+fn stdio_dispatch_only_publishes_committed_journal_results() {
+    use crate::gcp_operator::{dispatch, PublicError, ResponseBody, REQUEST_PURPOSE};
+    use execution_proof_gcp_journal::{Entry, Error as JournalError, PublicationJournal};
+    use std::{cell::RefCell, collections::BTreeMap};
+
+    type Records = BTreeMap<(String, Vec<u8>), (Vec<u8>, Vec<u8>)>;
+    #[derive(Default)]
+    struct JournalFixture {
+        records: RefCell<Records>,
+    }
+    impl PublicationJournal for JournalFixture {
+        fn publish(
+            &self,
+            stage: &str,
+            identity: &[u8],
+            binding: &[u8],
+            payload: &[u8],
+            window: Option<(u64, u64)>,
+        ) -> Result<Entry, JournalError> {
+            if let Some(payload) = self.read(stage, identity, binding, window)? {
+                return Ok(Entry {
+                    first: false,
+                    payload,
+                });
+            }
+            self.records.borrow_mut().insert(
+                (stage.into(), identity.to_vec()),
+                (binding.to_vec(), payload.to_vec()),
+            );
+            Ok(Entry {
+                first: true,
+                payload: payload.to_vec(),
+            })
+        }
+
+        fn read(
+            &self,
+            stage: &str,
+            identity: &[u8],
+            binding: &[u8],
+            _: Option<(u64, u64)>,
+        ) -> Result<Option<Vec<u8>>, JournalError> {
+            match self
+                .records
+                .borrow()
+                .get(&(stage.into(), identity.to_vec()))
+            {
+                Some((saved, payload)) if saved == binding => Ok(Some(payload.clone())),
+                Some(_) => Err(JournalError::Conflict),
+                None => Ok(None),
+            }
+        }
+    }
+
+    let directory = TestDir::new();
+    let config = config();
+    let clock = Arc::new(ManualClock::new(150));
+    let issuer = issuer(&directory, config.clone(), clock.clone());
+    let journal = JournalFixture::default();
+    let snapshot = |directory: &TestDir| {
+        let copy = TestDir::new();
+        rusqlite::Connection::open(directory.db())
+            .unwrap()
+            .execute("VACUUM INTO ?1", [copy.db().to_str().unwrap()])
+            .unwrap();
+        copy
+    };
+    let reopen = |copy: &TestDir| {
+        GcpIssuer::open_existing_with_clock(
+            &copy.db(),
+            config.clone(),
+            &qualification(&config),
+            key(1),
+            16,
+            clock.clone(),
+        )
+        .unwrap()
+    };
+    let before_reserve = snapshot(&directory);
+    let call = |issuer: &GcpIssuer, request| {
+        let wire = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "purpose": REQUEST_PURPOSE, "request": request,
+        }))
+        .unwrap();
+        dispatch(issuer, &wire, Some(&journal)).map(|response| response.result)
+    };
+    let begin =
+        serde_json::json!({"operation":"begin","signed_intent_json":intent(&config,"attempt-one")});
+    let Ok(ResponseBody::Challenge {
+        signed_challenge_json,
+    }) = call(&issuer, begin.clone())
+    else {
+        panic!("expected a committed challenge");
+    };
+    let Ok(ResponseBody::Challenge {
+        signed_challenge_json: retry,
+    }) = call(&issuer, begin.clone())
+    else {
+        panic!("expected the same challenge after retry");
+    };
+    assert_eq!(retry, signed_challenge_json);
+    assert!(matches!(
+        call(&reopen(&before_reserve), begin),
+        Err(PublicError::StateRejected)
+    ));
+
+    // The pregrant fixture checks software inputs before returning its fixed verdict.
+    let (grant, _) = issue_fixture(&issuer);
+    let challenge: Signed<GcpBootstrapChallenge> =
+        serde_json::from_slice(&signed_challenge_json).unwrap();
+    let (grant_id, aggregate, redeem) =
+        policy_wires(&issuer, &grant, GcpAdmissionOperation::Redeem);
+    let (_, _, status) = policy_wires(&issuer, &grant, GcpAdmissionOperation::Status);
+    let redeem = serde_json::json!({"operation":"redeem_policy_aggregate","grant_id":grant_id,
+        "aggregate_json":aggregate,"recorder_request_json":redeem});
+    let status = serde_json::json!({"operation":"status_policy_aggregate","grant_id":grant_id,
+        "aggregate_json":aggregate,"recorder_request_json":status});
+    assert!(matches!(
+        call(&issuer, redeem.clone()),
+        Err(PublicError::StateRejected)
+    ));
+    assert!(issuer
+        .journal_issue(
+            &journal,
+            &challenge.statement.challenge_id,
+            &grant.signed_grant_json
+        )
+        .unwrap());
+    assert!(matches!(
+        call(&issuer, redeem.clone()),
+        Err(PublicError::StateRejected)
+    ));
+    issuer.publish_journal_pin(&journal, &grant_id).unwrap();
+
+    let before_consume = snapshot(&directory);
+
+    assert!(matches!(
+        call(&issuer, status.clone()),
+        Ok(ResponseBody::PolicyStatus {
+            signed_authorization_json: None
+        })
+    ));
+    let Ok(ResponseBody::Admission {
+        signed_authorization_json,
+        publication: crate::gcp_operator::Publication::FirstAuthorized,
+    }) = call(&issuer, redeem.clone())
+    else {
+        panic!("expected first journaled receipt");
+    };
+    let Ok(ResponseBody::Admission {
+        signed_authorization_json: retry,
+        publication: crate::gcp_operator::Publication::Existing,
+    }) = call(&issuer, redeem)
+    else {
+        panic!("expected existing journaled receipt");
+    };
+    assert_eq!(retry, signed_authorization_json);
+    clock.set(Err(ClockError::Unavailable));
+    let restored = reopen(&before_consume);
+    assert_eq!(
+        restored
+            .status_policy_aggregate(
+                &grant_id,
+                &aggregate,
+                &serde_json::from_value::<Vec<u8>>(status["recorder_request_json"].clone())
+                    .unwrap(),
+            )
+            .unwrap(),
+        None
+    );
+    assert!(
+        matches!(call(&restored, status), Ok(ResponseBody::PolicyStatus { signed_authorization_json: Some(receipt) }) if receipt == signed_authorization_json)
+    );
+}

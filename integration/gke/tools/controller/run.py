@@ -290,7 +290,13 @@ def executor(config, *, experimental):
         allowed = ("bootstrap-only", "issue", "startup-plan", "redeem") if experimental else ("init", "request")
         require(family == ("experiment" if experimental else "normal") and operation in allowed,
                 "authority_operation")
-        return binary(config["authority"], [operation, *args], deadline, raw)
+        journal = []
+        if not experimental and operation == "request" and "authority_journal_bucket" in config:
+            bucket = config["authority_journal_bucket"]
+            require(type(bucket) is str and re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket),
+                    "authority_journal_bucket")
+            journal = ["--journal-bucket", bucket]
+        return binary(config["authority"], [operation, *args, *journal], deadline, raw)
     return execute
 
 
