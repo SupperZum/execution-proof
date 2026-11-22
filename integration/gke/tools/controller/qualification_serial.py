@@ -69,7 +69,7 @@ def _finished(value):
 
 
 def drive(gateway, authority, kata, *, expected_cid, manifest, references, effective_spec,
-          management_key, archive_directory, deadline, phase_hooks=None, target_receipt=None):
+          management_key, archive_directory, deadline, phase_hooks=None, target_receipt=None, outcome=None):
     """Archive the protected export before ACK, then join the operator's Kata caller."""
     require(controller._deadline_is_bounded(deadline), "attempt_deadline")
     validate_cid(expected_cid)
@@ -77,6 +77,8 @@ def drive(gateway, authority, kata, *, expected_cid, manifest, references, effec
     serial._signed_public(manifest, "qlad.execution-proof.gcp-boot-artifact-manifest.v1", 1)
     serial._signed_public(references, "qlad.execution-proof.gcp-reference-policy-set.v1", 1)
     attempt.public_json(effective_spec, 256 << 10)
+    if outcome is None:
+        outcome = controller.AttemptOutcome()
     archive = attempt.PublicArchive(archive_directory, management_key)
     try:
         controller._sync_archive_parent(archive)
@@ -130,10 +132,7 @@ def drive(gateway, authority, kata, *, expected_cid, manifest, references, effec
         request = gateway.receive_admission_request()
         archive.put("admission-request.json", attempt.encode(request))
         _live(bind_deadline)
-        authorization = authority.admit(
-            grant, aggregate, request["guest_nonce"], attempt.wire(request, "recorder_request_json"),
-            bind_deadline,
-        )
+        authorization = attempt.admit_pending(authority, gateway, grant, aggregate, request, bind_deadline)
         serial._signed_public(authorization, "qlad.execution-proof.preparation-admission.v1", 1)
         archive.put("authorization.json", authorization)
         if phase_hooks is not None:
@@ -149,17 +148,18 @@ def drive(gateway, authority, kata, *, expected_cid, manifest, references, effec
         require(phase in ("export", "unproven"), "unexpected_execution_phase")
         if phase == "export":
             archive.put("export.json", controller._protected_export(publication, expected_cid))
-        else:
-            serial._keys(publication, [])
+            outcome.protected_export_available = True
         result = {
             "mode": "qualification_experiment",
             "phase": phase,
             "container_id": expected_cid,
             "candidate": candidate,
-            "protected_export_available": phase == "export",
+            "protected_export_available": outcome.protected_export_available,
             "producer_qualified": False,
             "execution_verified": False,
         }
+        if phase == "unproven":
+            result.update(serial.report_cleanup_result(publication))
         archive.put("result.json", attempt.encode(result))
         _live(deadline)
         gateway.send_stop()
@@ -168,6 +168,7 @@ def drive(gateway, authority, kata, *, expected_cid, manifest, references, effec
         if target_receipt is not None:
             receipt["target"] = target_receipt
         archive.put("controller.json", attempt.encode(receipt))
+        outcome.transport_completed = True
         return result | {"transport_completed": True}
     finally:
         archive.close()
@@ -196,15 +197,35 @@ class KataProcess:
     def __enter__(self):
         return self
 
-    def __exit__(self, *_):
-        if self.process is not None:
+    def __exit__(self, exc_type, exc, traceback):
+        if self.process is None:
+            return
+        failures = []
+        try:
             try:
                 if self.process.poll() is None:
                     self.process.kill()
+            except OSError:
+                failures.append("qualification_kata_kill_failed")
+            try:
                 self.process.wait(timeout=3)
-            finally:
-                self.process.stdin.close()
-                self.process.stdout.close()
+            except subprocess.TimeoutExpired:
+                failures.append("qualification_kata_wait_timeout")
+            except OSError:
+                failures.append("qualification_kata_wait_failed")
+        finally:
+            for stream in (self.process.stdin, self.process.stdout):
+                try:
+                    stream.close()
+                except OSError:
+                    failures.append("qualification_kata_pipe_close_failed")
+
+        if failures:
+            primary = exc if exc is not None else attempt.AttemptError(failures.pop(0))
+            for code in failures:
+                primary.add_note("serial_cleanup: " + code)
+            if exc is None:
+                raise primary
 
     def _receipt(self, deadline):
         while b"\n" not in self.buffer:

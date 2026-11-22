@@ -7,6 +7,7 @@ access. This module has no resource discovery, provisioning, or cleanup calls.
 from dataclasses import asdict, dataclass
 import hashlib
 import re
+import time
 
 import authority_frontend as frontend
 import kubernetes_serial as controller
@@ -163,8 +164,8 @@ class GceSerial(serial.SerialGateway):
         self.read_target = read_target
         self._candidate = None
 
-    def _public(self, phases):
-        result = controller.LocalSerial._public(self, phases)
+    def _public(self, phases, *, deadline=float("inf")):
+        result = controller.LocalSerial._public(self, phases, deadline=deadline)
         self._frames += 1
         return result
 
@@ -186,19 +187,40 @@ class LateCidAuthority(frontend.Authority):
         self.execution_audience = execution_audience
         self.selection = self.challenge = self.grant = self.aggregate = self.plan = None
         self.admitted = False
+        self._plan_retry = None
 
     def startup_plan(self, grant, aggregate, cid, deadline):
-        require(self.selection is None and self.grant == grant and grant is not None, "authority_order")
+        previous = self.selection
+        selection = frontend.Selection(cid, self.trust_snapshot_sha384, self.execution_audience)
+        # Retain the original wire even when the caller supplied a mutable buffer.
+        if isinstance(aggregate, bytearray):
+            aggregate = bytes(aggregate)
+        inputs = (self.grant, aggregate, selection, deadline)
+        if previous is not None:
+            pending, self._plan_retry = self._plan_retry, None
+            require(inputs == pending and selection == previous, "authority_order")
+        require(self.grant == grant and grant is not None, "authority_order")
         serial._hex(cid, 32)
-        self.selection = frontend.Selection(cid, self.trust_snapshot_sha384, self.execution_audience)
-        self.selection.validate()
-        return super().startup_plan(grant, aggregate, deadline)
+        selection.validate()
+        self.selection = selection
+        require(time.monotonic() < deadline, "authority_deadline")
+        try:
+            return super().startup_plan(grant, aggregate, deadline)
+        except frontend.AuthorityUnavailable:
+            if previous is None:
+                self._plan_retry = inputs
+            raise
+
+
+def matches_instance_pin(pin, identity):
+    return (type(pin) is dict and type(pin.get("instance_id")) is int
+            and type(pin.get("numerical_project_id")) is int and pin == identity)
 
 
 def validate_issuer_pins(target, issuer_config, signed_intent, effective_spec):
     config = protocol.public_json(issuer_config, 4 << 20)
     boot = _object(config, "boot_policy")
-    require(boot.get("expected_instance") == target.gce_identity(), "authority_instance_pin")
+    require(matches_instance_pin(boot.get("expected_instance"), target.gce_identity()), "authority_instance_pin")
     intent = serial._signed_public(signed_intent, "qlad.execution-proof.tenant-intent.v2", 2)["statement"]
     protocol.public_json(effective_spec, 256 << 10)
     require(intent.get("container_role") == "application-init"

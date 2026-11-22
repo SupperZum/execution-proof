@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import select
+import subprocess
 import tempfile
 from threading import Event
 import time
@@ -15,6 +16,7 @@ from unittest import mock
 
 import kubernetes_serial as transport
 import qualification_serial as controller
+import run
 from test_kubernetes_serial import (
     SPEC, PipePeer, b64, encode, export_fixture, policy_fixture, publish, record, request, signed,
 )
@@ -95,12 +97,22 @@ class QualificationSerialTests(unittest.TestCase):
         self.events.attach_mock(self.authority, "authority")
         self.events.attach_mock(self.kata, "kata")
 
-    def drive(self):
+    def drive(self, *, outcome=None):
         return controller.drive(
             self.gateway, self.authority, self.kata, expected_cid=CID, manifest=MANIFEST,
             references=REFERENCES, effective_spec=SPEC, management_key=MANAGEMENT,
-            archive_directory=self.archive, deadline=self.deadline,
+            archive_directory=self.archive, deadline=self.deadline, outcome=outcome,
         )
+
+    def test_boot_preserves_pem_line_endings_in_framed_json(self):
+        for ending in (b"\n", b"\r\n"):
+            with self.subTest(ending=ending):
+                key = MANAGEMENT.replace(b"\n", ending)
+                self.gateway._stage = "control-ready"
+                self.gateway.send_boot(MANIFEST, REFERENCES, CHALLENGE, key)
+                decoded = request(self.peer)
+                self.assertEqual(decoded["management_tls_private_key_pem"].encode("ascii"), key)
+                self.assertEqual(self.gateway._stage, "boot-sent")
 
     def publish_candidate(self, candidate=CANDIDATE):
         self.peer.sendall(transport.serial.MARKER
@@ -186,6 +198,23 @@ class QualificationSerialTests(unittest.TestCase):
         for file in self.archive.iterdir():
             self.assertNotIn(b"PRIVATE KEY", file.read_bytes(), file.name)
 
+    def test_kata_finish_failure_reports_archived_export(self):
+        raw = qualification_export()
+        def fixture():
+            self.publish_ready()
+            publish(self.peer, "export", {"export_json_base64": b64(raw)})
+            self.assertEqual(request(self.peer), {"stop": True})
+
+        self.kata.finish.side_effect = TimeoutError()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            peer = executor.submit(fixture)
+            with mock.patch("builtins.print") as report, self.assertRaises(TimeoutError):
+                run.controller_attempt(self.drive)
+            peer.result(timeout=1)
+        self.assertEqual(json.loads(report.call_args.args[0]), {
+            "protected_export_available": True, "transport_completed": False, "retirement": "external"})
+        self.assertEqual((self.archive / "export.json").read_bytes(), raw)
+
     def test_unproven_stops_and_finishes_without_export(self):
         def fixture():
             self.publish_ready()
@@ -199,6 +228,21 @@ class QualificationSerialTests(unittest.TestCase):
             result = self.drive()
             peer.result(timeout=1)
         self.assert_authority_and_kata_order()
+        self.assertEqual(result["phase"], "unproven")
+        self.assertFalse(result["protected_export_available"])
+        self.assertFalse((self.archive / "export.json").exists())
+
+    def test_report_cleanup_alone_is_retained_on_qualification(self):
+        def fixture():
+            self.publish_ready()
+            publish(self.peer, "unproven", {"report_cleanup": "report_cleanup_failed"})
+            self.assertEqual(request(self.peer), {"stop": True})
+            return json.loads((self.archive / "result.json").read_bytes())
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            peer = executor.submit(fixture)
+            result = self.drive()
+            self.assertEqual(peer.result(timeout=1)["report_cleanup"], "report_cleanup_failed")
         self.assertEqual(result["phase"], "unproven")
         self.assertFalse(result["protected_export_available"])
         self.assertFalse((self.archive / "export.json").exists())
@@ -253,6 +297,32 @@ class QualificationSerialTests(unittest.TestCase):
 
 
 class KataProcessTests(unittest.TestCase):
+    def test_wait_failure_preserves_primary_and_closes_both_pipes(self):
+        for primary, wait_error, code in (
+            (controller.attempt.AttemptError("attempt_deadline"), subprocess.TimeoutExpired("fixture", 3),
+             "qualification_kata_wait_timeout"),
+            (None, OSError("fixture"), "qualification_kata_wait_failed"),
+        ):
+            with self.subTest(primary=primary):
+                kata = controller.KataProcess("/bin/cat", "ab" * 48, "/tmp/fixture.sock",
+                    cid=CID, sandbox="qexp-sandbox", image="local/app@sha256:" + "12" * 32)
+                with subprocess.Popen(["/bin/cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE) as process:
+                    kata.process = process
+                    with mock.patch.object(process, "wait", side_effect=wait_error) as wait:
+                        with self.assertRaises(controller.attempt.AttemptError) as failed:
+                            with kata:
+                                if primary is not None:
+                                    raise primary
+                    wait.assert_called_once_with(timeout=3)
+                    if primary is not None:
+                        self.assertIs(failed.exception, primary)
+                        self.assertEqual(primary.__notes__, ["serial_cleanup: " + code])
+                    else:
+                        self.assertEqual(failed.exception.args, (code,))
+                    self.assertTrue(process.stdin.closed)
+                    self.assertTrue(process.stdout.closed)
+                    self.assertIsNotNone(process.wait(timeout=3))
+
     def test_pinned_executable_and_start_gate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -20,7 +20,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -335,7 +334,7 @@ func TestIdleTotalAndTransferLimitsCloseAndJoin(t *testing.T) {
 				p.config.HandshakeMilliseconds = 80
 				p.config.DialMilliseconds = 80
 				p.config.IdleMilliseconds = 100
-				p.config.SessionMilliseconds = 180
+				p.config.SessionMilliseconds = 360
 			}
 			if mode == "bytes" {
 				p.config.MaxBytes = 8
@@ -346,24 +345,36 @@ func TestIdleTotalAndTransferLimitsCloseAndJoin(t *testing.T) {
 			if mode == "bytes" {
 				client.Write(bytes.Repeat([]byte{1}, 32))
 			} else if mode == "total" {
-				var traffic sync.WaitGroup
-				traffic.Add(1)
-				go func() {
-					defer traffic.Done()
-					for range 15 {
-						if _, err := client.Write([]byte{1}); err != nil {
-							return
-						}
-						time.Sleep(20 * time.Millisecond)
-					}
-				}()
-				buf := make([]byte, 1)
+				start := time.Now()
+				guard := start.Add(time.Second)
+				if err := client.SetDeadline(guard); err != nil {
+					t.Fatal(err)
+				}
+				if err := backend.SetDeadline(guard); err != nil {
+					t.Fatal(err)
+				}
+				roundTrips := 0
+				var buf [1]byte
 				for {
-					if _, err := backend.Read(buf); err != nil {
+					if _, err := client.Write([]byte{1}); err != nil {
 						break
 					}
+					if _, err := io.ReadFull(backend, buf[:]); err != nil {
+						break
+					}
+					if _, err := backend.Write(buf[:]); err != nil {
+						break
+					}
+					if _, err := io.ReadFull(client, buf[:]); err != nil {
+						break
+					}
+					roundTrips++
+					time.Sleep(15 * time.Millisecond)
 				}
-				traffic.Wait()
+				elapsed := time.Since(start)
+				if roundTrips < 5 || elapsed < 240*time.Millisecond || elapsed > 700*time.Millisecond {
+					t.Fatalf("relay closed after %s with %d bidirectional exchanges", elapsed, roundTrips)
+				}
 			}
 			wait(t, func() bool { return s.relay.Stats().Active == 0 })
 			if mode == "bytes" && s.relay.Stats().TransferredBytes > 8 {
@@ -404,8 +415,12 @@ func TestPendingCreateResponseAndIdleBudget(t *testing.T) {
 			if _, err := io.ReadFull(backend, got); err != nil || !bytes.Equal(got, request) {
 				t.Fatalf("request did not reach the gateway: %v", err)
 			}
+			pendingSince := time.Now()
 			if profile.idle == 1000 {
 				wait(t, func() bool { return s.relay.Stats().Active == 0 })
+				if elapsed := time.Since(pendingSince); elapsed < 800*time.Millisecond || elapsed > 2*time.Second {
+					t.Fatalf("relay disconnected after %v with 1s idle timeout", elapsed)
+				}
 				if n, err := client.Read(got); n != 0 || err == nil {
 					t.Fatalf("expected relay disconnect while the response was pending: %d %v", n, err)
 				}
@@ -413,6 +428,9 @@ func TestPendingCreateResponseAndIdleBudget(t *testing.T) {
 			}
 
 			time.Sleep(1800 * time.Millisecond)
+			if elapsed := time.Since(pendingSince); elapsed < 1800*time.Millisecond || s.relay.Stats().Active != 1 {
+				t.Fatalf("delayed Create lost its connection after %v", elapsed)
+			}
 			response := frame(1, 2, 0, []byte("admitted"))
 			if _, err := backend.Write(response); err != nil {
 				t.Fatal(err)

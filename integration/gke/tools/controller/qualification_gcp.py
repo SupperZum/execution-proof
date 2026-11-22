@@ -68,9 +68,7 @@ def validate_experiment_pins(target, experiment_config, signed_intent, effective
     require(type(config) is dict and type(config.get("version")) is int and config["version"] == 1
             and config.get("purpose") == _EXPERIMENT, "qualification_config_domain")
     expected_instance = cloud._object(cloud._object(config, "boot_policy"), "expected_instance")
-    require(type(expected_instance.get("instance_id")) is int
-            and type(expected_instance.get("numerical_project_id")) is int
-            and expected_instance == target.gce_identity(), "qualification_instance_pin")
+    require(cloud.matches_instance_pin(expected_instance, target.gce_identity()), "qualification_instance_pin")
     qualification.validate_cid(cid)
     require(config.get("container_id") == cid, "qualification_selected_cid")
     audience = config.get("execution_audience")

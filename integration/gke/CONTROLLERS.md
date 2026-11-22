@@ -50,6 +50,12 @@ serial SSH public key is registered for this deployment's `serial_user`
 and instance before opening a connection. Use known host keys and an
 independently selected SSH endpoint for the dedicated GKE worker.
 
+Both `launch` and `qualify` report `protected_export_available` once the
+original export has been synced. If Stop or local cleanup fails after that
+point, the command exits unsuccessfully and the archive retains the export.
+Their output reports `"retirement": "external"`. The caller owns Pod or VM
+retirement and its absence readbacks.
+
 Use a separate user systemd service for each `qualify` and `launch` command.
 Run it with `MemoryAccounting=yes`, `MemorySwapMax=0`, `MemoryZSwapMax=0`,
 `LimitCORE=0` and `KillMode=control-group`. Set `unit` to the exact service
@@ -116,8 +122,9 @@ python3 -B tools/controller/run.py preflight deployment.json qualification-opera
 1. Create `rendered/pod.yaml` with the scheduling gate intact. In the Pod
    operator JSON set `authority` to the normal Authority executable and its
    SHA-384, set the live Q and reviewed selection, and use a new signed
-   tenant intent for the Pod spec. The scheduled Pod receipt path must be
-   new. The scheduler writes it before patching the exact Pod UID.
+   tenant intent for the Pod spec. Choose a fresh receipt path for each new Pod.
+   The scheduler records the Pod UID, context, PodVM image ID and signed Q digest
+   before removing the gate.
 
    ```bash
    kubectl --context "$CONTEXT" create -f rendered/pod.yaml
@@ -140,7 +147,9 @@ python3 -B tools/controller/run.py preflight deployment.json qualification-opera
 3. Run the launch controller in its private service. It rejects an
    attached Google service account and an unexpected source image, starts
    the CAA heartbeat, binds the app CID to authenticated CRI readback, and
-   archives the protected export before acknowledging it.
+   archives the protected export before acknowledging it. After archival it closes
+   the heartbeat helper and checks its exit status before sending Stop. A failed
+   heartbeat is reported even when the export has already been acknowledged.
 
    ```bash
    python3 -B tools/controller/run.py launch deployment.json pod-operator.json
@@ -153,6 +162,7 @@ python3 -B tools/controller/run.py preflight deployment.json qualification-opera
    workers. Use `verified_exec / exec_committed` for the expected attempt,
    VM, CID and encrypted digest as the acceptance condition.
 
-If the scheduling patch response is interrupted, inspect the saved receipt
-and the current object's UID and gate before deciding how to resume. Use a
-fresh intent and private store for a fresh Pod.
+If scheduling is interrupted, rerun `schedule` with the same operator configuration
+and receipt. It checks the receipt against the current Pod UID and deployment inputs.
+If the gate is already gone it returns success. If the original gate is present it
+retries the guarded patch. A replacement Pod requires a fresh intent and private store.

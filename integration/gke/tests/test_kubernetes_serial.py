@@ -10,6 +10,8 @@ from pathlib import Path
 import select
 import stat
 import struct
+import sys
+from types import SimpleNamespace
 import tempfile
 from threading import Event
 import time
@@ -18,6 +20,7 @@ from unittest import mock
 import zlib
 
 import kubernetes_serial as controller
+import run
 
 
 CID = "a1" * 32
@@ -147,6 +150,32 @@ class SerialTests(unittest.TestCase):
             self.host_read, self.host_write, self.deadline, phase_seconds=0.5
         )
 
+    def test_partial_control_write_stops_on_simultaneous_input_and_writability(self):
+        ssh = controller.serial.SerialGateway(self.gateway.config)
+        with open(self.host_write, "wb", buffering=0, closefd=False) as stdin, open(
+                self.host_read, "rb", buffering=0, closefd=False) as stdout:
+            ssh._child = SimpleNamespace(stdin=stdin, stdout=stdout, stderr=None)
+            ssh._stderr_open = False
+            for gateway in (ssh, self.gateway):
+                with self.subTest(transport=type(gateway).__name__):
+                    gateway._stage = "bootstrap"
+                    write = os.write
+
+                    def short_write(fd, data):
+                        count = write(fd, data[:1])
+                        write(self.peer.write_fd, b"!")
+                        return count
+
+                    with mock.patch.object(os, "write", side_effect=short_write) as writes:
+                        with self.assertRaisesRegex(controller.GatewayError, "^unsolicited_serial_output$"):
+                            gateway.send_grant(signed("qlad.execution-proof.launch.v3", 3))
+                    writes.assert_called_once()
+                    self.assertEqual(self.peer.recv(16), b"\x00")
+                    self.assert_no_control()
+                    self.assertEqual(gateway._stage, "bootstrap")
+                    self.assertEqual(gateway._failure, "unsolicited_serial_output")
+                    self.assertEqual(gateway._buffer, b"!")
+
     def startup_local(self):
         publish(self.peer, "control-ready", {})
         publish(self.peer, "sandbox-ready", {})
@@ -246,6 +275,65 @@ class SerialTests(unittest.TestCase):
             peer.result(timeout=1)
         self.assert_no_control()
 
+    def test_attester_failure_reaches_the_attempt_record_before_the_next_request(self):
+        for stage, previous, phase, reason in (
+            ("bootstrap_collect", "boot-sent", "receive-bootstrap", "guest_bootstrap_failed"),
+            ("collect", "grant-sent", "receive-policy", "guest_postgrant_failed"),
+        ):
+            for cause in controller.serial.COLLECTION_ERROR_CLASSES:
+                with self.subTest(stage=stage, cause=cause):
+                    gateway = controller.LocalSerial(self.host_read, self.host_write, self.deadline)
+                    gateway._stage = previous
+                    publish(self.peer, "unproven", {"stage": stage, "error_class": cause})
+                    receive = gateway.receive_bootstrap if previous == "boot-sent" else gateway.receive_policy
+                    with self.assertRaises(controller.GatewayError) as failed:
+                        receive()
+                    record = controller.attempt.failure_record(failed.exception, phase)
+                    self.assertEqual((record["reason"], record["guest_stage"], record["error_class"]),
+                                     (reason, stage, cause))
+                    self.assertFalse(record["raw_serial_retained"])
+                    self.assertFalse(record["execution_verified"])
+                    self.assertEqual(gateway._stage, "unproven")
+        self.assert_no_control()
+
+    def test_preparation_rejections_reach_the_attempt_record_before_ready(self):
+        for cause in (
+            'executable_invalid_limits', 'executable_too_large',
+            'executable_missing_node', 'executable_identity_mismatch',
+            'executable_workspace_mismatch', 'executable_permission_denied',
+            'executable_content_mismatch', 'executable_file_operation',
+            'executable_elf_rejected', 'staging_write_failed', 'staging_write_failed_cleanup_failed',
+            'builder_child_failed_scratch_failed', 'builder_cancelled_reap_and_scratch_failed',
+        ):
+            with self.subTest(cause=cause):
+                gateway = controller.LocalSerial(self.host_read, self.host_write, self.deadline)
+                gateway._stage = "admission-sent"
+                publish(self.peer, "unproven", {"stage": "prepare", "error_class": cause})
+                with self.assertRaises(controller.GatewayError) as failed:
+                    gateway.receive_ready()
+                record = controller.attempt.failure_record(failed.exception, "receive-ready")
+                self.assertEqual((record["reason"], record["guest_stage"], record["error_class"]),
+                                 ("guest_ready_failed", "prepare", cause))
+                self.assertFalse(record["execution_verified"])
+                self.assertEqual(gateway._stage, "unproven")
+        self.assert_no_control()
+
+    def test_attester_diagnostics_reject_wrong_stage_phase_or_extra_data(self):
+        for publication, previous, code in (
+            ({"stage": "begin", "error_class": "binding_mismatch"}, "grant-sent", "public_schema"),
+            ({"stage": "collect", "error_class": "arbitrary"}, "grant-sent", "public_schema"),
+            ({"stage": "collect", "error_class": "too_large", "evidence": []}, "grant-sent", "public_schema"),
+            ({"stage": "collect", "error_class": "invalid_evidence"}, "boot-sent", "unexpected_phase"),
+            ({"stage": "bootstrap_collect", "error_class": "too_large"}, "grant-sent", "unexpected_phase"),
+        ):
+            with self.subTest(publication=publication, previous=previous):
+                gateway = controller.LocalSerial(self.host_read, self.host_write, self.deadline)
+                gateway._stage = previous
+                publish(self.peer, "unproven", publication)
+                with self.assertRaisesRegex(controller.GatewayError, "^" + code + "$"):
+                    (gateway.receive_bootstrap if previous == "boot-sent" else gateway.receive_policy)()
+        self.assert_no_control()
+
     def test_duplicate_public_phase_field_fails_closed_even_with_another_frame_buffered(self):
         publish(self.peer, "control-ready", {})
         self.peer.sendall(wire(b'{"version":1,"purpose":"' + controller.serial.RESPONSE.encode()
@@ -256,6 +344,19 @@ class SerialTests(unittest.TestCase):
             self.gateway.receive_sandbox_ready()
         with self.assertRaisesRegex(controller.GatewayError, "^local_serial_closed$"):
             self.gateway.receive_sandbox_ready()
+
+    def test_relay_exit_after_sandbox_ready_is_a_fixed_failure(self):
+        for previous, operation in (("sandbox-ready", "receive_candidate"), ("plan-sent", "receive_admission_request"),
+                                    ("admission-sent", "receive_ready"), ("ready", "receive_execution")):
+            with self.subTest(previous=previous):
+                gateway = controller.LocalSerial(self.host_read, self.host_write, self.deadline)
+                gateway._stage = previous
+                publish(self.peer, "unproven", {"stage": "management_relay", "error_class": "rejected"})
+                with self.assertRaisesRegex(controller.GatewayError, "^guest_management_relay_failed$") as error:
+                    getattr(gateway, operation)()
+                self.assertEqual(controller.attempt.failure_record(error.exception, "console-command")["reason"],
+                                 "guest_management_relay_failed")
+        self.assert_no_control()
 
     def test_candidate_deadline_is_bounded(self):
         deadline = time.monotonic() + 1
@@ -294,7 +395,7 @@ class SerialTests(unittest.TestCase):
         self.gateway.send_plan(valid_plan, SPEC)
         self.assertEqual(request(self.peer), {"signed_plan": list(valid_plan), "effective_spec": list(SPEC)})
 
-    def run_normal_driver(self, terminal, *, worker_error=None):
+    def run_normal_driver(self, terminal, *, worker_error=None, before_stop=None, outcome=None):
         manifest = signed("qlad.execution-proof.gcp-boot-artifact-manifest.v1")
         references = signed("qlad.execution-proof.gcp-reference-policy-set.v1")
         challenge = signed("qlad.execution-proof.gcp-bootstrap-challenge.v3", 3, challenge_id="fixture")
@@ -372,7 +473,7 @@ class SerialTests(unittest.TestCase):
             return controller.drive(
                 self.gateway, authority, worker_readback, expected=EXPECTED, manifest=manifest,
                 references=references, effective_spec=SPEC, management_key=management,
-                archive_directory=self.archive, deadline=self.deadline,
+                archive_directory=self.archive, deadline=self.deadline, before_stop=before_stop, outcome=outcome,
             )
 
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -409,6 +510,33 @@ class SerialTests(unittest.TestCase):
         self.assertFalse(result["protected_export_available"])
         self.assertFalse(result["execution_verified"])
         self.assertFalse((self.archive / "export.json").exists())
+
+    def test_report_cleanup_archived_before_stop_without_export(self):
+        code = "binding_mismatch_report_cleanup_failed"
+        def terminal():
+            publish(self.peer, "unproven", {"report_cleanup": code})
+            self.assertEqual(request(self.peer), {"stop": True})
+            self.assertEqual(json.loads((self.archive / "result.json").read_bytes())["report_cleanup"], code)
+
+        result = self.run_normal_driver(terminal)
+        self.assertEqual(result["report_cleanup"], code)
+        self.assertTrue(result["transport_completed"])
+        self.assertFalse(result["protected_export_available"])
+        self.assertFalse((self.archive / "export.json").exists())
+
+    def test_report_cleanup_rejects_wrong_phase_and_unknown_class(self):
+        for previous, code, expected in (
+            ("boot-sent", "report_cleanup_failed", "unexpected_phase"),
+            ("ready", "unknown", "public_schema"),
+        ):
+            gateway = controller.LocalSerial(self.host_read, self.host_write, self.deadline)
+            gateway._stage = previous
+            publish(self.peer, "unproven", {"report_cleanup": code})
+            with self.assertRaisesRegex(controller.GatewayError, "^" + expected + "$"):
+                if previous == "ready":
+                    gateway.receive_execution()
+                else:
+                    gateway.receive_bootstrap()
 
     def test_normal_driver_retains_guest_candidate_when_worker_readback_fails(self):
         self.run_normal_driver(None, worker_error=RuntimeError("simulated target disappeared"))
@@ -450,6 +578,76 @@ class SerialTests(unittest.TestCase):
         self.assertEqual(synced, ["export.json", "result.json"])
         self.assertTrue(result["protected_export_available"])
         self.assertFalse(result["execution_verified"])
+
+    def run_with_heartbeat(self, *, failure):
+        with tempfile.TemporaryDirectory() as scratch:
+            stopped = Path(scratch) / "guest-stopped"
+            ready = Path(scratch) / "helper-ready"
+            script = """
+import os, select, sys
+from pathlib import Path
+ready, stop = map(Path, sys.argv[1:3])
+print('ONB17_CAA_HEARTBEAT_BOUND', flush=True)
+print('ONB17_CAA_HEARTBEAT_READY', flush=True)
+ready.touch()
+if sys.argv[3] == "fail":
+    sys.exit(7)
+# Remain active during archival. A tick after guest Stop is a lost health check.
+while not select.select([0], [], [], .01)[0]:
+    if stop.exists():
+        sys.exit(9)
+assert not os.read(0, 1)
+assert not stop.exists()
+ready.with_name("helper-finished").touch()
+"""
+            command = [sys.executable, "-c", script, str(ready), str(stopped), "fail" if failure else "serve"]
+            target = SimpleNamespace(expected=EXPECTED, instance="test-abcdef12")
+
+            def terminal():
+                until = time.monotonic() + 1
+                while not ready.exists() and time.monotonic() < until:
+                    time.sleep(.005)
+                self.assertTrue(ready.exists())
+                publish(self.peer, "export", {"export_json_base64": b64(export_fixture())})
+                self.assertEqual(request(self.peer), {"stop": True})
+                if not failure:
+                    self.assertTrue(ready.with_name("helper-finished").is_file())
+                stopped.touch()
+            with mock.patch.object(run, "worker_command", return_value=command):
+                with run.heartbeat({}, target, self.deadline) as finish:
+
+                    def before_stop():
+                        self.assertTrue((self.archive / "result.json").is_file())
+                        finish()
+                    if failure:
+                        def launch(*, outcome):
+                            return self.run_normal_driver(terminal, before_stop=before_stop, outcome=outcome)
+                        with mock.patch("builtins.print") as report:
+                            with self.assertRaisesRegex(run.kube.AttemptError, "caa_heartbeat_exit"):
+                                run.controller_attempt(launch)
+                        self.assertEqual(json.loads(report.call_args.args[0]), {
+                            "protected_export_available": True, "transport_completed": False,
+                            "retirement": "external"})
+                    else:
+                        self.assertTrue(self.run_normal_driver(terminal, before_stop=before_stop)["transport_completed"])
+                self.assertTrue(stopped.exists())
+                self.assertEqual((self.archive / "export.json").read_bytes(), export_fixture())
+
+    def test_active_ticks_and_orderly_stop(self):
+        self.run_with_heartbeat(failure=False)
+
+    def test_failed_helper_after_ready_is_visible_and_archived_export_is_acknowledged(self):
+        self.run_with_heartbeat(failure=True)
+
+    def test_serial_failure_preserves_concurrent_heartbeat_exit(self):
+        script = ("import sys; print('ONB17_CAA_HEARTBEAT_BOUND', flush=True); "
+                  "print('ONB17_CAA_HEARTBEAT_READY', flush=True); sys.exit(7)")
+        target = SimpleNamespace(expected=EXPECTED, instance="test-abcdef12")
+        with mock.patch.object(run, "worker_command", return_value=[sys.executable, "-c", script]):
+            with self.assertRaisesRegex(controller.AttemptError, "^attempt_deadline$") as failure:
+                with run.heartbeat({}, target, self.deadline):
+                    raise controller.AttemptError("attempt_deadline")
+        self.assertIn("caa_heartbeat_exit", failure.exception.__notes__)
 
     def test_normal_driver_does_not_ack_failed_export_fsync(self):
         fsync = os.fsync

@@ -80,10 +80,15 @@ func boundHeartbeatSocket(podRoot, bundleRoot, uid, pod, prefix string) (string,
 func heartbeat(ctx context.Context, podRoot, bundleRoot, uid, pod, prefix string, output io.Writer) error {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
-	var health pb.HealthService
-	ready := false
+	var client *ttrpc.Client
+	defer func() {
+		if client != nil {
+			client.Close()
+		}
+	}()
+	bound, ready := false, false
 	for {
-		if health == nil {
+		if client == nil {
 			socket, err := boundHeartbeatSocket(podRoot, bundleRoot, uid, pod, prefix)
 			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
@@ -91,18 +96,19 @@ func heartbeat(ctx context.Context, podRoot, bundleRoot, uid, pod, prefix string
 			if socket != "" {
 				conn, err := (&net.Dialer{Timeout: 200 * time.Millisecond}).DialContext(ctx, "unix", socket)
 				if err == nil {
-					client := ttrpc.NewClient(conn)
-					defer client.Close()
-					health = pb.NewHealthClient(client)
-					if _, err := fmt.Fprintln(output, "ONB17_CAA_HEARTBEAT_BOUND"); err != nil {
-						return err
+					client = ttrpc.NewClient(conn)
+					if !bound {
+						if _, err := fmt.Fprintln(output, "ONB17_CAA_HEARTBEAT_BOUND"); err != nil {
+							return err
+						}
+						bound = true
 					}
 				}
 			}
 		}
-		if health != nil {
+		if client != nil {
 			call, cancel := context.WithTimeout(ctx, 700*time.Millisecond)
-			reply, err := health.Check(call, &pb.CheckRequest{})
+			reply, err := pb.NewHealthClient(client).Check(call, &pb.CheckRequest{})
 			cancel()
 			if err == nil && reply.GetStatus() == pb.HealthCheckResponse_SERVING {
 				if !ready {
@@ -113,10 +119,16 @@ func heartbeat(ctx context.Context, podRoot, bundleRoot, uid, pod, prefix string
 				}
 			} else if ready && ctx.Err() == nil {
 				return errors.New("CAA health check stopped responding")
+			} else if !ready && err != nil {
+				client.Close()
+				client = nil
 			}
 		}
 		select {
 		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return ctx.Err()
+			}
 			if ready {
 				return nil
 			}

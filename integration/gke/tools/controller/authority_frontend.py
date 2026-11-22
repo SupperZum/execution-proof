@@ -6,9 +6,18 @@ VM receives the signed plan and task data, not these callbacks or private files.
 """
 from dataclasses import dataclass
 import re
+import time
 
 import attempt_driver as protocol
 import serial_gateway as serial
+
+
+class AuthorityUnavailable(protocol.AttemptError):
+    """No confirmed authority result, or the publication journal is unavailable."""
+
+
+class AuthorityTemporarilyUnavailable(protocol.AttemptError):
+    """The authority reported a transient state or clock failure."""
 
 
 @dataclass(frozen=True)
@@ -57,7 +66,22 @@ class Authority:
         else:
             data = b"" if request is None else protocol.encode({
                 "version": 1, "purpose": "qlad.execution-proof.gcp-authority-request.v1", "request": request})
-        raw = self.execute(family, operation, data, deadline)
+        if experimental or operation != "request":
+            return self._result(self.execute(family, operation, data, deadline), expected_status)
+
+        protocol.require(time.monotonic() < deadline, "authority_deadline")
+        try:
+            result = self._result(self.execute(family, operation, data, deadline), expected_status)
+        except (AuthorityUnavailable, AuthorityTemporarilyUnavailable) as error:
+            if isinstance(error, AuthorityUnavailable) and request["operation"] != "issue":
+                raise
+            protocol.require(time.monotonic() < deadline, "authority_deadline")
+            result = self._result(self.execute(family, operation, data, deadline), expected_status)
+        protocol.require(time.monotonic() < deadline, "authority_deadline")
+        return result
+
+    def _result(self, raw, expected_status):
+        experimental = self.mode == "qualification_experiment"
         response = protocol.public_json(raw, 64 << 10)
         purpose = ("onb17.gcp-qualification-experiment-response.v1" if experimental else
                    "qlad.execution-proof.gcp-authority-response.v1")
@@ -71,6 +95,11 @@ class Authority:
                              and response.get("retire_before") == self.retire_before,
                              "experiment_response_scope")
         result = response.get("result")
+        if not experimental and result in ({"status": "error", "code": "state_busy"},
+                                            {"status": "error", "code": "clock_unavailable"}):
+            raise AuthorityTemporarilyUnavailable(result["code"])
+        if not experimental and result == {"status": "error", "code": "journal_unavailable"}:
+            raise AuthorityUnavailable("journal_unavailable")
         protocol.require(type(result) is dict and result.get("status") == expected_status,
                          "authority_response_status")
         return result
@@ -143,8 +172,25 @@ class Authority:
         else:
             request = {"operation": "redeem", "guest_nonce": guest_nonce,
                        "recorder_request_json": list(recorder_request)}
-        result = self._call("redeem" if self.mode == "qualification_experiment" else "request",
-                            request, "admission", deadline)
+        if self.mode == "normal":
+            try:
+                result = self._call("request", request, "admission", deadline)
+            except AuthorityUnavailable as error:
+                raise protocol.RedeemResponseLost("authority_response_lost") from error
+        else:
+            result = self._call("redeem", request, "admission", deadline)
+        return self._accept_receipt(result)
+
+    def admission_status(self, grant, aggregate, signed_status, deadline):
+        protocol.require(self.mode == "normal" and self.grant == grant and self.aggregate == aggregate
+                         and self.plan is not None and not self.admitted, "authority_order")
+        result = self._call("request", {"operation": "status_policy_aggregate", "grant_id": self._grant_id(),
+                            "aggregate_json": list(aggregate), "recorder_request_json": list(signed_status)},
+                            "policy_status", deadline)
+        protocol.require(time.monotonic() < deadline, "authority_deadline")
+        return self._accept_receipt(result)
+
+    def _accept_receipt(self, result):
         wire = protocol.wire(result, "signed_authorization_json")
         serial._signed_public(wire, "qlad.execution-proof.preparation-admission.v1", 1)
         self.admitted = True

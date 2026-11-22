@@ -2,6 +2,7 @@
 """Drive one stock-CAA Pod or direct TDX qualification using operator-owned inputs."""
 
 import argparse
+import fcntl
 from contextlib import contextmanager
 from hashlib import file_digest, sha384
 import json
@@ -9,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import selectors
 import stat
 import struct
 import subprocess
@@ -45,11 +47,53 @@ def timeout(deadline, cap=30):
     return remaining
 
 
-def run(args, deadline, *, stdin=b"", env=None, pass_fds=(), cap=4 << 20):
-    result = subprocess.run(args, input=stdin, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, env=env, pass_fds=pass_fds,
-                            timeout=timeout(deadline))
-    require(result.returncode == 0 and len(result.stdout) <= cap, "operator_command_failed")
+def _command(args, deadline, *, stdin=b"", env=None, pass_fds=(), cap=4 << 20):
+    seconds = timeout(deadline)
+    until = min(deadline, time.monotonic() + seconds)
+    output = bytearray()
+    pending = memoryview(stdin)
+    with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          env=env, pass_fds=pass_fds, bufsize=0) as process, selectors.DefaultSelector() as io:
+        try:
+            io.register(process.stdout, selectors.EVENT_READ)
+            if pending:
+                os.set_blocking(process.stdin.fileno(), False)
+                io.register(process.stdin, selectors.EVENT_WRITE)
+            else:
+                process.stdin.close()
+            while io.get_map():
+                remaining = until - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(args, seconds)
+                for key, _ in io.select(remaining):
+                    if key.fileobj is process.stdout:
+                        chunk = os.read(key.fd, min(65536, cap - len(output) + 1))
+                        if chunk:
+                            require(len(chunk) <= cap - len(output), "operator_command_failed")
+                            output.extend(chunk)
+                        else:
+                            io.unregister(key.fd)
+                    else:
+                        try:
+                            written = os.write(key.fd, pending[:65536])
+                            pending = pending[written:]
+                        except BrokenPipeError:
+                            pending = pending[:0]
+                        if not pending:
+                            io.unregister(key.fd)
+                            process.stdin.close()
+            status = process.wait(timeout=max(0, until - time.monotonic()))
+            return subprocess.CompletedProcess(args, status, bytes(output))
+        except subprocess.TimeoutExpired:
+            raise subprocess.TimeoutExpired(args, seconds, output=bytes(output)) from None
+        finally:
+            if process.returncode is None:
+                process.kill()
+
+
+def run(args, deadline, **kwargs):
+    result = _command(args, deadline, **kwargs)
+    require(result.returncode == 0, "operator_command_failed")
     return result.stdout
 
 
@@ -79,9 +123,12 @@ def hash384(raw):
     return sha384(raw).hexdigest()
 
 
+def boot_binding_v1(binding):
+    return type(binding) is dict and type(binding.get("version")) is int and binding["version"] == 1
+
+
 def boot_digest(binding):
-    require(binding.keys() == {"version", "purpose", "profile", *BOOT_FIELDS}
-            and binding["version"] == 1
+    require(boot_binding_v1(binding) and binding.keys() == {"version", "purpose", "profile", *BOOT_FIELDS}
             and binding["purpose"] == "qlad.execution-proof.gcp-boot-binding.v1"
             and binding["profile"] == "onb17.gcp-tdx-embedded-pe.v1", "boot_binding")
     def frame(raw):
@@ -111,7 +158,33 @@ def signed_intent_bytes(statement):
         struct.pack(">I", len(value)) + value for value in entries)
 
 
-def binary(pin, args, deadline, stdin=b""):
+def run_authority_request(args, deadline, **kwargs):
+    try:
+        result = _command(args, deadline, **kwargs)
+    except subprocess.TimeoutExpired as error:
+        return interrupted_authority_response(error.stdout)
+    if result.returncode == 1 or result.returncode < 0 or (result.returncode == 0 and not result.stdout):
+        return interrupted_authority_response(result.stdout)
+    require(result.returncode == 0, "operator_command_failed")
+    return result.stdout
+
+
+def interrupted_authority_response(raw):
+    # The CLI emits one JSON line. On interruption it may have written only a prefix.
+    if not raw:
+        raise cloud.frontend.AuthorityUnavailable("authority_response_lost")
+    try:
+        response = kube.attempt.public_json(raw, 64 << 10)
+    except serial.GatewayError as error:
+        if error.code == "invalid_json" and not raw.endswith(b"\n"):
+            raise cloud.frontend.AuthorityUnavailable("authority_response_lost") from None
+        raise
+    require(type(response) is dict and type(response.get("result")) is dict
+            and response["result"].get("status") == "error", "operator_command_failed")
+    return raw
+
+
+def binary(pin, args, deadline, stdin=b"", *, invoke=run):
     location = path(pin, "path")
     serial._hex(pin["sha384"], 48)
     fd = os.open(location, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -122,8 +195,8 @@ def binary(pin, args, deadline, stdin=b""):
                 and 0 < info.st_size <= 128 << 20, "trusted_binary")
         require(file_digest(stream, "sha384").hexdigest() == pin["sha384"],
                 "trusted_binary_pin")
-        return run([f"/proc/self/fd/{fd}", *args], deadline, stdin=stdin, cap=64 << 10,
-                   env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, pass_fds=(fd,))
+        return invoke([f"/proc/self/fd/{fd}", *args], deadline, stdin=stdin, cap=64 << 10,
+                      env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, pass_fds=(fd,))
 
 
 class Clients:
@@ -239,30 +312,72 @@ def check_intent(config, binding, values, image):
     return wire
 
 
+def scheduling_gate(pod, uid, image):
+    spec = pod["spec"]
+    require(pod["metadata"]["uid"] == uid and not pod["metadata"].get("deletionTimestamp")
+            and spec["runtimeClassName"] == "kata-remote" and len(spec["containers"]) == 1
+            and spec["containers"][0]["name"] == "workload"
+            and spec["containers"][0]["image"] == image, "expected_gated_pod")
+    gates = spec.get("schedulingGates", [])
+    if gates == []:
+        return False
+    require(gates == [{"name": GATE}] and spec.get("nodeName") is None, "expected_gated_pod")
+    return True
+
+
+def bind_schedule_receipt(config, expected, gated):
+    receipt = path(config, "pod_receipt")
+    directory = os.open(receipt.parent, os.O_DIRECTORY | os.O_RDONLY)
+    try:
+        # Serialize publishers and keep the receipt complete for concurrent readers.
+        fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if os.path.lexists(receipt):
+            saved = document(config, "pod_receipt")
+            require(saved == expected and type(saved["image_id"]) is int, "scheduled_pod_receipt")
+            return
+        require(gated, "expected_gated_pod")
+        with tempfile.NamedTemporaryFile(dir=receipt.parent, delete=False) as pending:
+            try:
+                pending.write((json.dumps(expected, sort_keys=True) + "\n").encode())
+                pending.flush()
+                os.fsync(pending.fileno())
+                os.replace(pending.name, receipt)
+                os.fsync(directory)
+            finally:
+                Path(pending.name).unlink(missing_ok=True)
+    finally:
+        os.close(directory)
+
+
 def schedule(client, config, binding, values, deadline):
     check_q(config, binding, values, deadline)
-    check_intent(config, binding, values, client.profile["workload_image"])
-    receipt = path(config, "pod_receipt")
+    image = client.profile["workload_image"]
+    check_intent(config, binding, values, image)
     require(config["context"].startswith(f"gke_{client.scope.project}_{client.scope.zone}_"),
             "kube_context_project_zone")
     pod = client.pod(deadline)
     uid = pod["metadata"]["uid"]
-    pod_spec = pod["spec"]
-    require(cloud._matches(cloud._UUID, uid) and pod_spec.get("nodeName") is None
-            and pod_spec.get("schedulingGates") == [{"name": GATE}]
-            and pod_spec["runtimeClassName"] == "kata-remote"
-            and len(pod_spec["containers"]) == 1
-            and pod_spec["containers"][0]["name"] == "workload"
-            and pod_spec["containers"][0]["image"] == client.profile["workload_image"],
-            "expected_gated_pod")
-    write_json(receipt, {"pod_uid": uid, "context": config["context"], "image_id": client.image_id,
-                         "q_sha384": hash384(read(config, "signed_q"))})
+    require(cloud._matches(cloud._UUID, uid), "expected_gated_pod")
+    gated = scheduling_gate(pod, uid, image)
+    receipt = {"pod_uid": uid, "context": config["context"], "image_id": client.image_id,
+               "q_sha384": hash384(read(config, "signed_q"))}
+    bind_schedule_receipt(config, receipt, gated)
     patch = [
         {"op": "test", "path": "/metadata/uid", "value": uid},
         {"op": "test", "path": "/spec/schedulingGates", "value": [{"name": GATE}]},
+        {"op": "test", "path": "/spec/containers/0/image", "value": image},
         {"op": "remove", "path": "/spec/schedulingGates/0"},
     ]
-    client.k(["-n", NAMESPACE, "patch", "pod", POD, "--type=json", "-p", json.dumps(patch)], deadline)
+    if gated:
+        for attempt in range(2):
+            try:
+                client.k(["-n", NAMESPACE, "patch", "pod", POD, "--type=json", "-p", json.dumps(patch)], deadline)
+                break
+            except (cloud.protocol.AttemptError, subprocess.TimeoutExpired):
+                if not scheduling_gate(client.pod(deadline), uid, image):
+                    break
+                if attempt == 1:
+                    raise
     return {"pod_uid": uid, "scheduled": True}
 
 
@@ -291,12 +406,13 @@ def executor(config, *, experimental):
         require(family == ("experiment" if experimental else "normal") and operation in allowed,
                 "authority_operation")
         journal = []
-        if not experimental and operation == "request" and "authority_journal_bucket" in config:
+        if not experimental and "authority_journal_bucket" in config:
             bucket = config["authority_journal_bucket"]
             require(type(bucket) is str and re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket),
                     "authority_journal_bucket")
             journal = ["--journal-bucket", bucket]
-        return binary(config["authority"], [operation, *args, *journal], deadline, raw)
+        invoke = run_authority_request if not experimental and operation == "request" else run
+        return binary(config["authority"], [operation, *args, *journal], deadline, raw, invoke=invoke)
     return execute
 
 
@@ -321,18 +437,35 @@ def heartbeat(config, target, deadline):
                           target.instance.rsplit("-", 1)[1])
     with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                           bufsize=0) as process:
-        try:
-            yield
-        finally:
+        def stop_helper():
             process.stdin.close()
             try:
-                process.wait(timeout=4)
+                return process.wait(timeout=min(4, max(0, deadline - time.monotonic())))
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait()
-        markers = process.stdout.read(512).splitlines()
-        require(b"ONB17_CAA_HEARTBEAT_BOUND" in markers and
-                b"ONB17_CAA_HEARTBEAT_READY" in markers, "caa_heartbeat_receipt")
+                return process.wait()
+
+        def ready_receipt():
+            os.set_blocking(process.stdout.fileno(), False)
+            return process.stdout.read(512) == b"ONB17_CAA_HEARTBEAT_BOUND\nONB17_CAA_HEARTBEAT_READY\n"
+
+        def finish():
+            running = process.poll() is None
+            status = stop_helper()
+            require(running and status == 0, "caa_heartbeat_exit")
+            require(ready_receipt(), "caa_heartbeat_receipt")
+
+        try:
+            yield finish
+            if not process.stdin.closed:
+                finish()
+        except Exception as error:
+            if not process.stdin.closed and stop_helper() != 0 and ready_receipt():
+                error.add_note("caa_heartbeat_exit")
+            raise
+        finally:
+            if not process.stdin.closed:
+                stop_helper()
 
 
 def worker_pin(client, config, target, deadline):
@@ -341,7 +474,7 @@ def worker_pin(client, config, target, deadline):
             and worker["spec"]["providerID"] == config["worker"]["provider_id"], "worker_identity")
 
 
-def launch(client, config, binding, values, deadline):
+def launch(client, config, binding, values, deadline, *, outcome=None):
     check_q(config, binding, values, deadline)
     intent = check_intent(config, binding, values, client.profile["workload_image"])
     receipt = document(config, "pod_receipt")
@@ -353,7 +486,8 @@ def launch(client, config, binding, values, deadline):
             "qualification_instance_reuse")
     issuer = read(config, "issuer_config")
     issuer_settings = json.loads(issuer)
-    require(issuer_settings["boot_binding"] == binding, "authority_boot_binding")
+    issuer_binding = issuer_settings["boot_binding"]
+    require(boot_binding_v1(issuer_binding) and issuer_binding == binding, "authority_boot_binding")
     require(bytes(issuer_settings["tenant_public_key"]) == read(config, "tenant_public_key", 32),
             "authority_tenant_key")
     cloud.validate_issuer_pins(target, issuer, intent, values["effective_spec"])
@@ -379,20 +513,22 @@ def launch(client, config, binding, values, deadline):
         require(cloud._vm_prefix(POD) + result.sandbox_id[:8] == target.instance,
                 "worker_podvm_binding")
         return result
-    with heartbeat(config, target, deadline), serial_config(target, config, deadline) as serial_options, \
+    with heartbeat(config, target, deadline) as finish_heartbeat, serial_config(target, config, deadline) as serial_options, \
             management_key(config) as key:
         with cloud.GceSerial(target, serial_options, read_target) as gateway:
             return kube.drive(gateway, authority, read_worker, expected=expected,
                 manifest=values["manifest"], references=values["references"],
                 effective_spec=values["effective_spec"], management_key=key,
-                archive_directory=path(config, "archive"), deadline=deadline, target_receipt=target.receipt())
+                archive_directory=path(config, "archive"), deadline=deadline, target_receipt=target.receipt(),
+                before_stop=finish_heartbeat, outcome=outcome)
 
 
-def qualify(client, config, binding, values, deadline):
+def qualify(client, config, binding, values, deadline, *, outcome=None):
     intent = check_intent(config, binding, values, client.profile["workload_image"])
     target = client.qualification_target(deadline)
     experiment = read(config, "experiment_config")
-    require(json.loads(experiment)["artifact_expectations"]["boot_binding"] == binding,
+    experiment_binding = json.loads(experiment)["artifact_expectations"]["boot_binding"]
+    require(boot_binding_v1(experiment_binding) and experiment_binding == binding,
             "qualification_boot_binding")
     snapshot = qualification.derive_trust_snapshot_sha384(experiment, values["boot_config"],
         values["producer_core"], values["manifest"], values["references"], read(config, "collateral"))
@@ -413,7 +549,8 @@ def qualify(client, config, binding, values, deadline):
             return qualification_serial.drive(gateway, authority, kata, expected_cid=cid,
                 manifest=values["manifest"], references=values["references"],
                 effective_spec=values["effective_spec"], management_key=key,
-                archive_directory=path(config, "archive"), deadline=deadline, target_receipt=target.receipt())
+                archive_directory=path(config, "archive"), deadline=deadline, target_receipt=target.receipt(),
+                outcome=outcome)
 
 
 @contextmanager
@@ -423,6 +560,18 @@ def management_key(config):
         yield key
     finally:
         key[:] = b"\0" * len(key)
+
+
+def controller_attempt(function, *args):
+    outcome = kube.AttemptOutcome()
+    try:
+        result = function(*args, outcome=outcome)
+    except Exception:
+        print(json.dumps({"protected_export_available": outcome.protected_export_available,
+                          "transport_completed": outcome.transport_completed,
+                          "retirement": "external"}, sort_keys=True), flush=True)
+        raise
+    return result | {"retirement": "external"}
 
 
 def main():
@@ -460,8 +609,11 @@ def main():
                                    profile["workload_image"]), deadline).receipt()
     else:
         binding, values = artifacts(config)
-        function = {"schedule": schedule, "launch": launch, "qualify": qualify}[args.action]
-        result = function(client, config, binding, values, deadline)
+        if args.action == "schedule":
+            result = schedule(client, config, binding, values, deadline)
+        else:
+            function = {"launch": launch, "qualify": qualify}[args.action]
+            result = controller_attempt(function, client, config, binding, values, deadline)
     print(json.dumps(result, sort_keys=True))
     if args.action in ("launch", "qualify") and not result.get("protected_export_available"):
         return 2
@@ -477,4 +629,13 @@ if __name__ == "__main__":
         # files or command output from tools handling credentials.
         reason = str(error) if isinstance(error, (cloud.protocol.AttemptError, serial.GatewayError,
                                                   no_swap_guard.GuardError)) else type(error).__name__
+        if isinstance(error, serial.GatewayError) and error.code in ("guest_bootstrap_failed", "guest_postgrant_failed"):
+            diagnostic = cloud.protocol.failure_record(error, "console-command")
+            if diagnostic.get("guest_stage") in ("bootstrap_collect", "collect"):
+                reason = f"{reason} {diagnostic['guest_stage']}/{diagnostic['error_class']}"
+        if "caa_heartbeat_exit" in getattr(error, "__notes__", ()):
+            reason += " caa_heartbeat_exit"
+        for note in getattr(error, "__notes__", ()):
+            if note.startswith("serial_cleanup: "):
+                reason += " " + note
         sys.exit("execution proof controller stopped: " + reason)

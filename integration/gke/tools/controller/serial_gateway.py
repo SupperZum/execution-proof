@@ -5,6 +5,7 @@ Public protocol bytes are data, never hardware/producer verdicts. The caller own
 crypto appraisal, experimental permission and VM cleanup. One gateway per process
 owns its SSH group, watchdog and adopted descendants until close.
 """
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 import base64
@@ -40,18 +41,39 @@ MAX_TERMINAL = 256
 POSTGRANT_STAGES = frozenset(('grant_verify', 'recorder_init', 'https_init', 'begin',
                              'collect', 'capture', 'challenge', 'decision', 'aggregate'))
 POSTGRANT_ERROR_CLASSES = frozenset(('rejected', 'transport', 'http_status'))
+REPORT_CLEANUP_CLASSES = frozenset((
+    'report_cleanup_failed', 'attester_unavailable_report_cleanup_failed',
+    'binding_mismatch_report_cleanup_failed', 'invalid_evidence_report_cleanup_failed',
+    'too_large_report_cleanup_failed'))
+COLLECTION_ERROR_CLASSES = REPORT_CLEANUP_CLASSES | frozenset(('attester_unavailable', 'binding_mismatch', 'invalid_evidence', 'too_large'))
+STAGING_CLEANUP_CLASSES = tuple(
+    cause + '_cleanup_failed' for cause in (
+        'staging_write_failed', 'staging_too_large', 'staging_archive_rejected',
+        'staging_type_collision', 'staging_file_operation'))
+BUILDER_CLEANUP_CLASSES = tuple(
+    cause + suffix for cause in ('builder', 'builder_cancelled', 'builder_operation', 'builder_child_failed')
+    for suffix in ('_reap_failed', '_scratch_failed', '_reap_and_scratch_failed'))
 READY_ERROR_CLASSES = {
     'admission_input': ('rejected',),
     'credential_request': ('rejected',),
     'credential_http': ('rejected', 'transport', 'http_status'),
     'prepare': ('admission_rejected', 'credential_rejected', 'registry_rejected',
-                'preparation_rejected', 'deadline', 'rejected'),
+                'preparation_rejected', 'deadline', 'rejected',
+                'executable_invalid_limits', 'executable_too_large',
+                'executable_missing_node', 'executable_identity_mismatch',
+                'executable_workspace_mismatch', 'executable_permission_denied',
+                'executable_content_mismatch', 'executable_file_operation',
+                'executable_elf_rejected', 'staging_write_failed', 'builder_child_failed',
+                *STAGING_CLEANUP_CLASSES, *BUILDER_CLEANUP_CLASSES),
     'custody_progress': ('deadline', 'rejected'),
     'kata_ready': ('rejected',),
     'management_relay': ('rejected',),
 }
 TERMINAL_STATUS = frozenset(('ROLE_FAILED', 'ROLE_EXITED_ZERO', 'ROLE_TIMEOUT_OR_WAIT_ERROR'))
+_WATCHDOG_JOIN_SECONDS = 3
+_REAP_SECONDS = 2
 _ACTIVE = threading.Lock()
+_PENDING_REAP = None
 _LIBC = ctypes.CDLL(None, use_errno=True)
 
 
@@ -154,6 +176,45 @@ def _b64_public(value, maximum=(MAX_PUBLIC * 3) // 4):
     return raw
 
 
+def postgrant_diagnostic(stage, error_class):
+    return ((stage in POSTGRANT_STAGES and error_class in POSTGRANT_ERROR_CLASSES)
+            or (stage == 'collect' and error_class in COLLECTION_ERROR_CLASSES))
+
+
+def bootstrap_diagnostic(stage, error_class):
+    return stage == 'bootstrap_collect' and (error_class == 'rejected' or error_class in COLLECTION_ERROR_CLASSES)
+
+
+def report_cleanup_result(publication):
+    if publication == {}:
+        return {}
+    _keys(publication, ['report_cleanup'])
+    code = publication['report_cleanup']
+    _require(type(code) is str and code in REPORT_CLEANUP_CLASSES, 'public_schema')
+    return {'report_cleanup': code}
+
+
+def diagnostic_error(publication, phases, ready_diagnostics):
+    stage, error_class = publication['stage'], publication['error_class']
+    if phases == {'bootstrap'} and bootstrap_diagnostic(stage, error_class):
+        code = 'guest_bootstrap_failed'
+    elif phases == {'policy'} and postgrant_diagnostic(stage, error_class):
+        code = 'guest_postgrant_failed'
+    elif stage == 'management_relay' and error_class == 'rejected' and phases in (
+            {'sandbox-candidate'}, {'admission_request'}, {'ready'}, {'export', 'unproven'}):
+        code = 'guest_management_relay_failed'
+    elif stage == 'sandbox_lifetime' and error_class == 'rejected' and phases == {'admission_request'}:
+        code = 'guest_sandbox_lifetime_failed'
+    elif ready_diagnostics and error_class in READY_ERROR_CLASSES.get(stage, ()):
+        code = 'guest_ready_failed'
+    else:
+        raise GatewayError('unexpected_phase')
+    error = GatewayError(code)
+    error.guest_stage = stage
+    error.error_class = error_class
+    return error
+
+
 def public_frame(raw, *, ready_diagnostics=False):
     """Strict version, purpose, phase and field shape; no request/purpose injection."""
     _require(0 < len(raw) <= MAX_PUBLIC, 'public_frame_bound')
@@ -166,11 +227,14 @@ def public_frame(raw, *, ready_diagnostics=False):
     _no_secret(value)
     if phase in ('control-ready', 'ready') or (phase == 'unproven' and p == {}):
         _keys(p, [])
+    elif phase == 'unproven' and isinstance(p, dict) and 'report_cleanup' in p:
+        report_cleanup_result(p)
     elif phase == 'unproven':
         _keys(p, ['stage', 'error_class'])
         stage, error_class = p['stage'], p['error_class']
         _require(type(stage) is str and type(error_class) is str
-                 and ((stage in POSTGRANT_STAGES and error_class in POSTGRANT_ERROR_CLASSES)
+                 and (postgrant_diagnostic(stage, error_class) or bootstrap_diagnostic(stage, error_class)
+                      or (stage in ('management_relay', 'sandbox_lifetime') and error_class == 'rejected')
                       or (ready_diagnostics and error_class in READY_ERROR_CLASSES.get(stage, ()))),
                  'public_schema')
     elif phase == 'bootstrap':
@@ -395,6 +459,8 @@ class SerialGateway:
         self._thread = None
         self._end = threading.Event()
         self._lock = threading.Lock()
+        self._kill_sent = False
+        self._reaped = False
         self._buffer = bytearray()
         self._stderr = 0
         self._received = 0
@@ -409,10 +475,14 @@ class SerialGateway:
         self._eof = False
 
     def __enter__(self):
+        global _PENDING_REAP
         command = ssh_command(self.config)
         _require(_ACTIVE.acquire(blocking=False), 'gateway_already_active')
         self._active = True
         try:
+            if _PENDING_REAP is not None:
+                _PENDING_REAP._kill_reap()
+                _PENDING_REAP = None
             old = ctypes.c_int()
             _require(_LIBC.prctl(37, ctypes.byref(old), 0, 0, 0) == 0, 'subreaper')
             self._subreaper = old.value
@@ -433,54 +503,85 @@ class SerialGateway:
         if not self._end.wait(max(0, self.config.absolute_deadline - time.monotonic())):
             self._failure = 'absolute_deadline'
             try:
-                self._kill_reap()
-            except GatewayError:
-                self._failure = 'descendant_reap_timeout'
+                self._kill_group(time.monotonic() + _REAP_SECONDS)
+            except (GatewayError, OSError):
+                self._failure = 'ssh_kill_failed'
 
-    def _kill_reap(self):
-        with self._lock:
-            child = self._child
-            if child is None or self._exit is not None:
+    def _kill_group(self, until):
+        # Only the foreground owner waits. Once signalled, the watchdog can
+        # never signal this group again, even after its PID has been reused.
+        _require(self._lock.acquire(timeout=max(0, until - time.monotonic())), 'ssh_kill_timeout')
+        try:
+            if self._child is None or self._kill_sent:
                 return
-            # The group leader remains unreaped until after killpg, so its PID
-            # cannot be reused as an unrelated process-group identifier.
             try:
-                os.killpg(child.pid, signal.SIGKILL)
+                os.killpg(self._child.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            self._exit = child.wait()
-            until = time.monotonic() + 2
-            while True:
-                try:
-                    pid, _ = os.waitpid(-child.pid, os.WNOHANG)
-                except ChildProcessError:
-                    break
-                if not pid:
-                    _require(time.monotonic() < until, 'descendant_reap_timeout')
-                    time.sleep(.01)
+            self._kill_sent = True
+        finally:
+            self._lock.release()
+
+    def _kill_reap(self):
+        if self._child is None or self._reaped:
+            return
+        until = time.monotonic() + _REAP_SECONDS
+        self._kill_group(until)
+        if self._exit is None:
+            try:
+                self._exit = self._child.wait(timeout=max(0, until - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                raise GatewayError('child_reap_timeout') from None
+        while True:
+            try:
+                pid, _ = os.waitpid(-self._child.pid, os.WNOHANG)
+            except ChildProcessError:
+                self._reaped = True
+                return
+            _require(time.monotonic() < until, 'descendant_reap_timeout')
+            if not pid:
+                time.sleep(.01)
 
     def close(self):
+        global _PENDING_REAP
+        if not self._active:
+            return
         self._end.set()
-        if self._thread is not None and self._thread is not threading.current_thread():
-            self._thread.join(timeout=3)
-            _require(not self._thread.is_alive(), 'watchdog_join_timeout')
         try:
-            self._kill_reap()
+            with ExitStack() as cleanup:
+                if self._child is not None:
+                    for stream in (self._child.stdin, self._child.stdout, self._child.stderr):
+                        cleanup.callback(stream.close)
+                cleanup.callback(self._kill_reap)
+                if self._thread is not None and self._thread.ident is not None:
+                    try:
+                        self._thread.join(timeout=_WATCHDOG_JOIN_SECONDS)
+                    except RuntimeError:
+                        raise GatewayError('watchdog_join_failed') from None
+                    _require(not self._thread.is_alive(), 'watchdog_join_timeout')
         finally:
-            if self._child is not None:
-                for stream in (self._child.stdin, self._child.stdout, self._child.stderr):
-                    stream.close()
+            # Keep the original child handle across a bounded wait failure.
+            # The next owner drains it before starting another SSH group.
+            if self._child is not None and not self._reaped:
+                _PENDING_REAP = self
             self._buffer[:] = b'\0' * len(self._buffer)
             self._buffer.clear()
-            if self._subreaper is not None:
-                _LIBC.prctl(36, self._subreaper, 0, 0, 0)
-                self._subreaper = None
-            if self._active:
+            try:
+                if self._subreaper is not None:
+                    _require(_LIBC.prctl(36, self._subreaper, 0, 0, 0) == 0, 'subreaper')
+                    self._subreaper = None
+            finally:
                 self._active = False
                 _ACTIVE.release()
 
-    def __exit__(self, *_):
-        self.close()
+    def __exit__(self, exc_type, exc, traceback):
+        try:
+            self.close()
+        except Exception as cleanup_error:
+            if exc is None:
+                raise
+            code = cleanup_error.code if isinstance(cleanup_error, GatewayError) else type(cleanup_error).__name__
+            exc.add_note('serial_cleanup: ' + code)
 
     def _deadline(self):
         return min(self.config.absolute_deadline, time.monotonic() + self.config.phase_seconds)
@@ -520,10 +621,10 @@ class SerialGateway:
         del self._buffer[:size]
         return value
 
-    def _public(self, phases):
+    def _public(self, phases, *, deadline=float("inf")):
         try:
             started = time.monotonic()
-            header_until = min(self.config.absolute_deadline, started + self.config.phase_seconds)
+            header_until = min(deadline, self.config.absolute_deadline, started + self.config.phase_seconds)
             prefix = self._exact(4, header_until)
             if prefix != PUBLIC_MAGIC:
                 self._terminal(prefix, header_until)
@@ -531,21 +632,17 @@ class SerialGateway:
             wire_size, plain_size = struct.unpack('>II', self._exact(8, header_until))
             seconds = public_wire_seconds(wire_size)
             _require(0 < plain_size <= MAX_PUBLIC, 'public_frame_bound')
-            until = min(self.config.absolute_deadline, started + seconds)
+            until = min(deadline, self.config.absolute_deadline, started + seconds)
             raw = decode_public_wire(self._exact(wire_size, until), plain_size)
             ready_diagnostics = self._stage == 'admission-sent' and phases == {'ready'}
             value = public_frame(raw, ready_diagnostics=ready_diagnostics)
             _require(time.monotonic() < until, 'phase_deadline')
-            if value['phase'] == 'unproven' and value['publication']:
-                diagnostic = value['publication']
-                stage = diagnostic['stage']
-                ready_failure = ready_diagnostics and stage in READY_ERROR_CLASSES
-                _require(ready_failure or phases == {'policy'}, 'unexpected_phase')
+            if value['phase'] == 'unproven' and 'report_cleanup' in value['publication']:
+                _require(phases == {'export', 'unproven'}, 'unexpected_phase')
+            elif value['phase'] == 'unproven' and value['publication']:
+                error = diagnostic_error(value['publication'], phases, ready_diagnostics)
                 self._frames += 1
                 self._stage = 'unproven'
-                error = GatewayError('guest_ready_failed' if ready_failure else 'guest_postgrant_failed')
-                error.guest_stage = stage
-                error.error_class = diagnostic['error_class']
                 raise error
             _require(value['phase'] in phases, 'unexpected_phase')
             self._frames += 1
@@ -598,17 +695,24 @@ class SerialGateway:
             break
         self._public({'control-ready'})
 
-    def _write(self, raw):
+    def _control_writable(self, until):
+        writable = self._io(until, writable=True)
+        # The same poll may have read a response while stdin became writable.
+        _require(not self._buffer, 'unsolicited_serial_output')
+        _require(time.monotonic() < until, 'phase_deadline')
+        return writable
+
+    def _write(self, raw, *, deadline=float("inf")):
         _require(len(raw) <= MAX_INPUT, 'control_bound')
         _require(not self._buffer, 'unsolicited_serial_output')
-        until = self._deadline()
+        until = min(deadline, self._deadline())
         packet = bytearray(struct.pack('>I', len(raw)))
         packet.extend(raw)
         view = memoryview(packet)
         offset = 0
         try:
             while offset < len(packet):
-                if self._io(until, writable=True):
+                if self._control_writable(until):
                     try:
                         count = os.write(self._child.stdin.fileno(), view[offset:offset + 65536])
                     except BlockingIOError:
@@ -618,14 +722,17 @@ class SerialGateway:
                     _require(count > 0, 'ssh_write')
                     offset += count
                     self._sent += count
+        except GatewayError as error:
+            self._failure = self._failure or error.code
+            raise
         finally:
             view.release()
             packet[:] = b'\0' * len(packet)
 
-    def _control(self, request):
+    def _control(self, request, *, deadline=float("inf")):
         raw = json.dumps({'version': 1, 'purpose': CONTROL, 'request': request},
                          separators=(',', ':'), ensure_ascii=True).encode('ascii')
-        self._write(raw)
+        self._write(raw, deadline=deadline)
 
     def send_boot(self, manifest, references, challenge, management_key):
         _require(self._stage == 'control-ready', 'operation_order')
@@ -636,15 +743,12 @@ class SerialGateway:
         public = json.dumps({'version': 1, 'purpose': CONTROL, 'request': {
             'signed_manifest': list(manifest), 'signed_references': list(references),
             'signed_bootstrap_challenge': list(challenge)}}, separators=(',', ':')).encode('ascii')
-        secret = bytearray(b'"')
-        for byte in management_key:
-            secret.extend(b'\\n' if byte == 10 else bytes([byte]))
-        secret.extend(b'"')
+        secret = escaped_pem(management_key)
         raw = bytearray(public[:-2])
-        raw.extend(b',"management_tls_private_key_pem":')
-        raw.extend(secret)
-        raw.extend(b'}}')
         try:
+            raw.extend(b',"management_tls_private_key_pem":"')
+            raw.extend(secret)
+            raw.extend(b'"}}')
             self._write(raw)
             self._stage = 'boot-sent'
         finally:
@@ -676,6 +780,11 @@ class SerialGateway:
     def receive_admission_request(self):
         _require(self._stage == 'plan-sent', 'operation_order')
         return self._public({'admission_request'})
+
+    def request_admission_status(self, deadline):
+        _require(self._stage == 'admission_request', 'operation_order')
+        self._control({'request_status': True}, deadline=deadline)
+        return self._public({'admission_request'}, deadline=deadline)
 
     def send_admission(self, signed_authorization):
         _require(self._stage == 'admission_request', 'operation_order')
@@ -723,6 +832,19 @@ def _der(value, offset):
         offset += width
     _require(offset + size <= len(value), 'management_key_format')
     return tag, value[offset:offset + size], offset + size
+
+
+def escaped_pem(value):
+    """Encode the only JSON escapes in the validated PEM alphabet."""
+    escaped = bytearray()
+    for byte in value:
+        if byte == 13:
+            escaped.extend(b'\\r')
+        elif byte == 10:
+            escaped.extend(b'\\n')
+        else:
+            escaped.append(byte)
+    return escaped
 
 
 def _management_key(value):

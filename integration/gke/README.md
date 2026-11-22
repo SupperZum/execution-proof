@@ -26,24 +26,28 @@ CAA_SRC="$WORKSPACE/cloud-api-adaptor"
 
 YQ_VERSION=$(awk '$1 == "YQ_VERSION" { print $3; exit }' "$CAA_SRC/src/cloud-api-adaptor/Makefile.defaults")
 test -n "$YQ_VERSION"
-docker buildx build --builder "$BUILDX_BUILDER" --platform linux/amd64 \
+caa_revision=$(git -C "$CAA_SRC" rev-parse HEAD)
+docker buildx build --metadata-file build/caa-buildx.json --builder "$BUILDX_BUILDER" --platform linux/amd64 \
   --provenance=false --sbom=false \
   --build-arg BUILD_TYPE=release --build-arg RELEASE_BUILD=true \
   --build-arg "YQ_VERSION=$YQ_VERSION" --build-arg VERSION=stock \
-  --build-arg "COMMIT=$(git -C "$CAA_SRC" rev-parse HEAD)" \
+  --build-arg "COMMIT=$caa_revision" \
   -f "$CAA_SRC/src/cloud-api-adaptor/Dockerfile" \
   --output "type=oci,name=localhost/execution-proof/caa:stock,dest=$GKE_DIR/build/caa-linux-amd64.oci.tar" \
   "$CAA_SRC/src"
-sha256sum build/caa-linux-amd64.oci.tar
+archive_sha=$(sha256sum < build/caa-linux-amd64.oci.tar)
+jq -e --arg revision "$caa_revision" --arg archive "${archive_sha%% *}" \
+  '{source_revision: $revision, archive_sha256: $archive,
+    manifest_digest: (."containerimage.digest" | select(test("^sha256:[a-f0-9]{64}$")))}' \
+  build/caa-buildx.json > build/caa-build-receipt.json
 cp deployment.example.json deployment.json
 # Fill deployment.json with the values from your GCP and registry environment.
 python3 -B tools/render.py deployment.json rendered
 ```
 
 The chart downloader checks the archive digests in `charts.sha256`.
-The renderer verifies them again and derives the CAA manifest digest from
-the local OCI archive. Compare the archive checksum after transferring it
-to the worker.
+The renderer checks the archive SHA-256 and OCI manifest digest against the
+receipt generated from the build. Retain that receipt with the deployment profile.
 
 Use a separate kubeconfig and check the context before applying YAML. Set
 `KUBECONFIG`, `CONTEXT`, `PROJECT`, `ZONE`, `CLUSTER`, and `NODE` for
@@ -80,19 +84,13 @@ Run the readback again. Supply the encrypted workload registry CA through the
 worker's containerd registry configuration and check that it is also trusted
 by the active image service.
 
-Copy `build/caa-linux-amd64.oci.tar` and `rendered/caa-image.json` to the
-same worker. Verify the archive checksum, then import the OCI image and
-give it the reference selected by the manifests:
+Copy the OCI archive, its independently retained build receipt, the rendered
+`caa-image.json` and `worker/import-caa.sh` to the worker. The script verifies
+both pins before import and reads back the digest of the containerd image
+reference used by the DaemonSet.
 
 ```bash
-caa_ref=$(jq -er .reference caa-image.json)
-caa_digest=$(jq -er .digest caa-image.json)
-sudo ctr --namespace k8s.io images import --digests caa-linux-amd64.oci.tar
-if ! sudo ctr --namespace k8s.io images ls -q | grep -Fxq "$caa_ref@$caa_digest"; then
-  sudo ctr --namespace k8s.io images tag "$caa_digest" "$caa_ref@$caa_digest"
-fi
-sudo ctr --namespace k8s.io images ls | awk -v ref="$caa_ref@$caa_digest" \
-  -v digest="$caa_digest" '$1 == ref && $3 == digest { found = 1 } END { exit !found }'
+sudo bash import-caa.sh caa-linux-amd64.oci.tar caa-build-receipt.json caa-image.json
 ```
 
 Create `caa-adc` and `caa-relay-tls` in `execution-proof-runtime`. Prepare
@@ -189,7 +187,9 @@ gcp-execution-proof-verifier \
 For a deployment that requires a Cloud Storage publication journal, build the
 GCP verifier with `--features gcp-journal` and pass `--journal-bucket BUCKET`.
 Set `authority_journal_bucket` in the trusted operator configuration to pass the
-corresponding flag to Authority requests. Keep these settings in the relying
+same bucket to Authority initialization and requests. New stores record the
+journal selection and reject a different bucket or mode on reopen. Schema v4
+has no journal selection. The operator rejects those stores and preserves their contents. Keep these settings in the relying
 party and Authority deployment. Use a new journal with new attempts, or a
 journal that already contains the authoritative history for those attempts.
 Authority and verifier need read and conditional-create access through their

@@ -190,6 +190,14 @@ impl Fixture {
         }
     }
     fn run(&self, command: &str, request: Option<&[u8]>) -> Output {
+        self.run_with_bucket(command, request, None)
+    }
+    fn run_with_bucket(
+        &self,
+        command: &str,
+        request: Option<&[u8]>,
+        bucket: Option<&str>,
+    ) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_gcp-authority"))
             .env_clear()
             .arg(command)
@@ -204,6 +212,11 @@ impl Fixture {
             .arg("--collateral")
             .arg(self.dir.join("collateral.json"))
             .args(["--capacity", "8"])
+            .args(
+                bucket
+                    .into_iter()
+                    .flat_map(|name| ["--journal-bucket", name]),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -315,5 +328,78 @@ fn actual_cli_private_input_is_not_logged_on_permission_or_key_error() {
         assert_eq!(value(&result)["result"]["status"], "error");
         assert!(!result.stdout.windows(sentinel.len()).any(|s| s == sentinel));
         assert!(!f.dir.join("issuer.sqlite").exists());
+    }
+}
+
+#[test]
+fn actual_cli_historical_status_authenticates_after_worker_loss() {
+    let mut f = Fixture::new();
+    f.config.pregrant_worker_path = f.dir.join("worker");
+    fs::copy("/bin/true", &f.config.pregrant_worker_path).unwrap();
+    write(
+        &f.dir.join("config.json"),
+        &serde_json::to_vec(&f.config).unwrap(),
+    );
+    assert!(f.run("init", None).status.success());
+    fs::remove_file(&f.config.pregrant_worker_path).unwrap();
+    let request = serde_json::json!({"version":1,"purpose":REQUEST_PURPOSE,"request":{
+        "operation":"status_policy_aggregate","grant_id":"missing","aggregate_json":[],"recorder_request_json":[]}});
+    let status = f.run("request", Some(&serde_json::to_vec(&request).unwrap()));
+    assert!(!status.status.success());
+    assert_eq!(value(&status)["result"]["code"], "state_rejected");
+    assert_eq!(
+        value(&f.run("request", Some(&f.begin())))["result"]["code"],
+        "hardware_unavailable"
+    );
+}
+
+#[test]
+fn deployment_journal_selection_survives_restart_and_is_checked_before_network() {
+    for selected in [None, Some("first-bucket")] {
+        let f = Fixture::new();
+        assert!(f.run_with_bucket("init", None, selected).status.success());
+        let conn = rusqlite::Connection::open(f.dir.join("issuer.sqlite")).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT bucket FROM gcp_journal", [], |row| row
+                .get::<_, Option<String>>(0))
+                .unwrap()
+                .as_deref(),
+            selected
+        );
+        for other in [None, Some("first-bucket"), Some("different-bucket")] {
+            if other == selected {
+                continue;
+            }
+            let mismatch = f.run_with_bucket("request", Some(&f.begin()), other);
+            assert_eq!(value(&mismatch)["result"]["code"], "state_rejected");
+        }
+        for (input, code) in [(b"{".as_slice(), "request_malformed"), (br#"{"version":2,"purpose":"wrong","request":{"operation":"begin","signed_intent_json":[]}}"#, "request_domain")] {
+            let rejected = f.run_with_bucket("request", Some(input), Some("first-bucket"));
+            assert_eq!(value(&rejected)["result"]["code"], code);
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM challenges", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn legacy_gcp_store_without_journal_identity_is_preserved_on_reopen() {
+    let f = Fixture::new();
+    assert!(f.run("init", None).status.success());
+    let path = f.dir.join("issuer.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE gcp_journal; PRAGMA user_version=4")
+            .unwrap();
+    }
+    let original = fs::read(&path).unwrap();
+    for bucket in [None, Some("required-bucket")] {
+        let response = f.run_with_bucket("request", Some(&f.begin()), bucket);
+        assert_eq!(value(&response)["result"]["code"], "state_rejected");
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 }

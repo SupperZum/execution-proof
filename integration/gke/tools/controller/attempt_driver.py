@@ -19,6 +19,22 @@ class AttemptError(Exception):
     pass
 
 
+class RedeemResponseLost(AttemptError):
+    """The pending guest may already have a committed admission."""
+
+
+def admit_pending(authority, gateway, grant, aggregate, request, deadline):
+    nonce = request["guest_nonce"]
+    try:
+        return authority.admit(grant, aggregate, nonce, wire(request, "recorder_request_json"), deadline)
+    except RedeemResponseLost:
+        require(time.monotonic() < deadline, "authority_deadline")
+        status = gateway.request_admission_status(deadline)
+        require(status["guest_nonce"] == nonce, "authority_order")
+        require(time.monotonic() < deadline, "authority_deadline")
+        return authority.admission_status(grant, aggregate, wire(status, "recorder_request_json"), deadline)
+
+
 PHASES=frozenset(('authority-bootstrap','wait-control-ready','send-boot','start-private-services',
     'receive-bootstrap','bootstrap-received','authority-issue','before-grant','send-grant','receive-policy',
     'authority-plan','before-plan','send-plan','receive-admission-request','authority-admit','before-admission',
@@ -29,7 +45,7 @@ SERIAL_REASONS=frozenset(('bootstrap_domain','control_bound','deadline','descend
     'nonfinite_json','operation_order','operator_directory','operator_file','operator_file_name','phase_deadline',
     'public_base64','public_bytes','public_depth','public_domain','public_frame_bound','public_hex',
     'public_identifier','public_integer','public_phase','public_schema','public_wire_magic','public_wire_bound',
-    'public_compression','guest_terminated','guest_postgrant_failed','guest_ready_failed',
+    'public_compression','guest_terminated','guest_management_relay_failed','guest_sandbox_lifetime_failed','guest_bootstrap_failed','guest_postgrant_failed','guest_ready_failed',
     'secret_in_public_output','serial_buffer_bound',
     'serial_ssh_user','shutdown_output_bound','signed_object_bound','signed_object_domain','spec_bound','ssh_closed',
     'ssh_eof','ssh_io','ssh_key_format','ssh_write','startup_bound','startup_marker','startup_rejected','stderr_bound',
@@ -53,11 +69,13 @@ def failure_record(error,phase):
     record={'schema':'onb17.public-attempt-failure.v1','phase':phase if phase in PHASES else 'UNCLASSIFIED_PHASE',
             'error_family':family,'reason':reason,'raw_error_retained':False,'raw_serial_retained':False,
             'producer_qualified':False,'execution_verified':False}
-    if family=='SERIAL_GATEWAY' and reason=='guest_postgrant_failed':
+    if family=='SERIAL_GATEWAY' and reason in ('guest_bootstrap_failed','guest_postgrant_failed'):
         stage,classification=error.guest_stage,error.error_class
-        if (type(stage) is str and stage in serial.POSTGRANT_STAGES
-                and type(classification) is str and classification in serial.POSTGRANT_ERROR_CLASSES):
-            record.update(guest_stage=stage,error_class=classification)
+        if type(stage) is str and type(classification) is str:
+            if reason=='guest_bootstrap_failed' and phase in ('receive-bootstrap','console-command') and serial.bootstrap_diagnostic(stage,classification):
+                record.update(guest_stage=stage,error_class=classification)
+            elif reason=='guest_postgrant_failed' and serial.postgrant_diagnostic(stage,classification):
+                record.update(guest_stage=stage,error_class=classification)
     if family=='SERIAL_GATEWAY' and reason=='guest_ready_failed' and phase in ('receive-ready','console-command'):
         stage,classification=error.guest_stage,error.error_class
         if type(stage) is str and type(classification) is str and classification in serial.READY_ERROR_CLASSES.get(stage, ()):
@@ -102,7 +120,7 @@ class PublicArchive:
         # JSON escaped PEM and DER/base64 body before retaining public material.
         lines = management_key.splitlines()
         body = b"".join(lines[1:-1])
-        self.patterns = [management_key, management_key.replace(b"\n", b"\\n"), body]
+        self.patterns = [management_key, serial.escaped_pem(management_key), body]
         self.total = 0
         self.count = 0
 
@@ -238,8 +256,7 @@ def drive(gateway, authority, controller, *, manifest, references, effective_spe
         archive.put("admission-request.json", encode(request))
         live()
         checkpoint('authority-admit')
-        authorization = authority.admit(grant, aggregate, request["guest_nonce"],
-                                        wire(request, "recorder_request_json"), admission_deadline)
+        authorization = admit_pending(authority, gateway, grant, aggregate, request, admission_deadline)
         serial._signed_public(authorization, "qlad.execution-proof.preparation-admission.v1", 1)
         archive.put("authorization.json", authorization)
         if phase_hooks is not None:
@@ -272,6 +289,8 @@ def drive(gateway, authority, controller, *, manifest, references, effective_spe
                    "producer_qualified": False, "execution_verified": False,
                    "kubernetes_pods_accepted": False,
                    "qualification_experiment": mode == "qualification_experiment"}
+        if publication_phase == "unproven":
+            summary.update(serial.report_cleanup_result(publication))
         archive.put("result.json", encode(summary))
         checkpoint('complete')
         return summary

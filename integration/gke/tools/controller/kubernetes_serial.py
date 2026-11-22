@@ -15,11 +15,18 @@ from types import SimpleNamespace
 
 import serial_gateway as serial
 import attempt_driver as attempt
+from authority_frontend import AuthorityUnavailable
 
 
 GatewayError = serial.GatewayError
 AttemptError = attempt.AttemptError
 _PLAN_PURPOSE = "qlad.execution-proof.gcp-attempt-plan.v1"
+
+
+@dataclass
+class AttemptOutcome:
+    protected_export_available: bool = False
+    transport_completed: bool = False
 
 
 def _deadline_is_bounded(deadline):
@@ -62,6 +69,9 @@ def _publication(raw, phases):
         type(value["version"]) is int and value["version"] == 1
         and value["purpose"] == serial.RESPONSE, "public_domain"
     )
+    if phases == {"sandbox-candidate"} and value["phase"] == "unproven":
+        serial._keys(value["publication"], ["stage", "error_class"])
+        raise serial.diagnostic_error(value["publication"], phases, False)
     serial._require(type(value["phase"]) is str and value["phase"] in phases, "unexpected_phase")
     return value
 
@@ -73,11 +83,13 @@ class LocalSerial:
     _exact = serial.SerialGateway._exact
     _terminal = serial.SerialGateway._terminal
     _control = serial.SerialGateway._control
+    _control_writable = serial.SerialGateway._control_writable
     wait_control_ready = serial.SerialGateway.wait_control_ready
     receive_bootstrap = serial.SerialGateway.receive_bootstrap
     send_grant = serial.SerialGateway.send_grant
     receive_policy = serial.SerialGateway.receive_policy
     receive_admission_request = serial.SerialGateway.receive_admission_request
+    request_admission_status = serial.SerialGateway.request_admission_status
     send_admission = serial.SerialGateway.send_admission
     receive_ready = serial.SerialGateway.receive_ready
     receive_execution = serial.SerialGateway.receive_execution
@@ -122,20 +134,18 @@ class LocalSerial:
         except (OSError, ValueError):
             raise GatewayError("local_serial_io") from None
 
-    def _write(self, raw):
+    def _write(self, raw, *, deadline=float("inf")):
         serial._require(0 < len(raw) <= serial.MAX_INPUT, "control_bound")
         serial._require(not self._buffer, "unsolicited_serial_output")
-        until = self._deadline()
+        until = min(deadline, self._deadline())
         packet = bytearray(struct.pack(">I", len(raw)))
         packet.extend(raw)
         try:
             with memoryview(packet) as view:
                 offset = 0
                 while offset < len(packet):
-                    if not self._io(until, writable=True):
+                    if not self._control_writable(until):
                         continue
-                    serial._require(not self._buffer, "unsolicited_serial_output")
-                    serial._require(time.monotonic() < until, "phase_deadline")
                     try:
                         count = os.write(self._write_fd, view[offset:offset + 65536])
                     except BlockingIOError:
@@ -151,30 +161,27 @@ class LocalSerial:
         finally:
             packet[:] = b"\0" * len(packet)
 
-    def _public(self, phases):
+    def _public(self, phases, *, deadline=float("inf")):
         serial._require(self._failure is None, "local_serial_closed")
         try:
             started = time.monotonic()
-            header_until = min(self.config.absolute_deadline, started + self.config.phase_seconds)
+            header_until = min(deadline, self.config.absolute_deadline, started + self.config.phase_seconds)
             prefix = self._exact(4, header_until)
             if prefix != serial.PUBLIC_MAGIC:
                 self._terminal(prefix, header_until)
                 raise GatewayError("public_wire_magic")
             wire_size, plain_size = struct.unpack(">II", self._exact(8, header_until))
-            until = min(self.config.absolute_deadline, started + serial.public_wire_seconds(wire_size))
+            until = min(deadline, self.config.absolute_deadline, started + serial.public_wire_seconds(wire_size))
             serial._require(0 < plain_size <= serial.MAX_PUBLIC, "public_frame_bound")
             raw = serial.decode_public_wire(self._exact(wire_size, until), plain_size)
             ready_diagnostics = self._stage == "admission-sent" and phases == {"ready"}
             value = self._decode_public(raw, phases, ready_diagnostics)
             serial._require(time.monotonic() < until, "phase_deadline")
-            if value["phase"] == "unproven" and value["publication"]:
-                diagnostic = value["publication"]
-                ready_failure = ready_diagnostics and diagnostic["stage"] in serial.READY_ERROR_CLASSES
-                serial._require(ready_failure or phases == {"policy"}, "unexpected_phase")
+            if value["phase"] == "unproven" and "report_cleanup" in value["publication"]:
+                serial._require(phases == {"export", "unproven"}, "unexpected_phase")
+            elif value["phase"] == "unproven" and value["publication"]:
+                error = serial.diagnostic_error(value["publication"], phases, ready_diagnostics)
                 self._stage = "unproven"
-                error = GatewayError("guest_ready_failed" if ready_failure else "guest_postgrant_failed")
-                error.guest_stage = diagnostic["stage"]
-                error.error_class = diagnostic["error_class"]
                 raise error
             serial._require(value["phase"] in phases, "unexpected_phase")
             self._stage = value["phase"]
@@ -427,7 +434,7 @@ def _archive_local_record(archive, raw):
 
 
 def drive(gateway, authority, read_worker, *, expected, manifest, references, effective_spec,
-          management_key, archive_directory, deadline, target_receipt=None):
+          management_key, archive_directory, deadline, target_receipt=None, before_stop=None, outcome=None):
     """Run the GCP-format protocol over the supplied transport without a cloud client.
 
     The trusted authority supplies signed inputs. The worker callback selects a
@@ -441,6 +448,8 @@ def drive(gateway, authority, read_worker, *, expected, manifest, references, ef
     serial._signed_public(manifest, "qlad.execution-proof.gcp-boot-artifact-manifest.v1", 1)
     serial._signed_public(references, "qlad.execution-proof.gcp-reference-policy-set.v1", 1)
     attempt.public_json(effective_spec, 256 << 10)
+    if outcome is None:
+        outcome = AttemptOutcome()
     archive = attempt.PublicArchive(archive_directory, management_key)
 
     def live():
@@ -497,7 +506,14 @@ def drive(gateway, authority, read_worker, *, expected, manifest, references, ef
             receipt["target"] = target_receipt
         archive.put("controller.json", attempt.encode(receipt))
         live()
-        plan = authority.startup_plan(grant, aggregate, cid, deadline)
+        try:
+            plan = authority.startup_plan(grant, aggregate, cid, deadline)
+        except AuthorityUnavailable:
+            live()
+            attempt.require(read_worker(deadline) == readback, "worker_selection_changed")
+            live()
+            plan = authority.startup_plan(grant, aggregate, cid, deadline)
+        live()
         _plan_binding(plan, effective_spec, cid)
         archive.put("plan.json", plan)
         live()
@@ -506,9 +522,7 @@ def drive(gateway, authority, read_worker, *, expected, manifest, references, ef
         request = gateway.receive_admission_request()
         archive.put("admission-request.json", attempt.encode(request))
         live()
-        authorization = authority.admit(
-            grant, aggregate, request["guest_nonce"], attempt.wire(request, "recorder_request_json"), deadline
-        )
+        authorization = attempt.admit_pending(authority, gateway, grant, aggregate, request, deadline)
         serial._signed_public(authorization, "qlad.execution-proof.preparation-admission.v1", 1)
         archive.put("authorization.json", authorization)
         live()
@@ -520,21 +534,27 @@ def drive(gateway, authority, read_worker, *, expected, manifest, references, ef
         attempt.require(phase in ("export", "unproven"), "unexpected_execution_phase")
         if phase == "export":
             archive.put("export.json", _protected_export(publication, cid))
-        else:
-            serial._keys(publication, [])
+            outcome.protected_export_available = True
         result = {
             "phase": phase,
             "container_id": cid,
-            "protected_export_available": phase == "export",
+            "protected_export_available": outcome.protected_export_available,
             "hardware_verified": False,
             "producer_qualified": False,
             "execution_verified": False,
         }
         # Early sandbox treats Stop as the archive acknowledgement. Retain
         # both the original export and the terminal receipt before sending it.
+        if phase == "unproven":
+            result.update(serial.report_cleanup_result(publication))
         archive.put("result.json", attempt.encode(result))
         live()
-        gateway.send_stop()
+        try:
+            if before_stop is not None:
+                before_stop()
+        finally:
+            gateway.send_stop()
+        outcome.transport_completed = True
         return result | {"transport_completed": True}
     finally:
         archive.close()
