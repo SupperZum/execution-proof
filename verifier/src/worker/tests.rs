@@ -9,6 +9,28 @@ fn pinned(path: &str) -> TrustedWorker {
 }
 
 #[test]
+fn worker_fifo_is_rejected_without_a_writer() {
+    let path = std::env::temp_dir().join(format!("onb17-worker-fifo-{}", std::process::id()));
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let error = TrustedWorker::open(&path, &"00".repeat(48)).err();
+            send.send(error).unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        // Release a regressed blocking open so the test can finish and report it.
+        let _release = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result, Ok(Some(WorkerError::InvalidBinary)));
+    });
+}
+#[test]
 fn incorrect_worker_commitment_cannot_execute() {
     let path = std::fs::canonicalize("/bin/cat").unwrap();
     assert_eq!(

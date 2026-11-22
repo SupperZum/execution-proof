@@ -2,6 +2,7 @@
 //! response constructor below is never a production TDX verification backend.
 use super::*;
 mod artifact_fixture;
+mod capsule_root;
 use crate::schema::*;
 use crate::{gcp_worker_protocol::GcpHardwareFacts, hash};
 use execution_proof_contract::{
@@ -631,7 +632,7 @@ fn software_graph_binds_both_captures_and_requires_two_checked_results() {
     let graph = verify_gcp_graph(pack, &trust, &challenge).unwrap();
     let (before, after) = fake_responses(&graph);
     assert_eq!(
-        graph.apply(before, after).unwrap().status(),
+        graph.apply(Ok(before), Ok(after)).unwrap().status(),
         "verified_exec"
     );
     for status in [GcpHardwareStatus::Invalid, GcpHardwareStatus::Unproven] {
@@ -652,8 +653,51 @@ fn software_graph_binds_both_captures_and_requires_two_checked_results() {
                     GcpHardwareResponse::new(&graph.execution, status, "software_failure", None)
                         .unwrap();
             }
-            assert!(graph.apply(before, after).is_err());
+            assert!(graph.apply(Ok(before), Ok(after)).is_err());
         }
+    }
+}
+#[test]
+fn mixed_worker_outcomes_preserve_definitive_rejections() {
+    use GcpHardwareStatus::{Invalid, Unproven};
+    let limit = VerificationError::BackendUnavailable("gcp_pinned_worker_deadline");
+    let unavailable = VerificationError::BackendUnavailable("gcp_tdx_verification_unavailable");
+    let expired = VerificationError::BackendUnavailable("tdx_collateral_expired");
+    let rejected = VerificationError::Invalid("tdx_quote_rejected");
+    for (boot, exec, expected) in [
+        (Ok((Invalid, "tdx_quote_rejected")), Err(limit), rejected),
+        (Err(limit), Ok((Invalid, "tdx_quote_rejected")), rejected),
+        (
+            Ok((Unproven, "tdx_collateral_expired")),
+            Ok((Invalid, "tdx_quote_rejected")),
+            rejected,
+        ),
+        (
+            Ok((Invalid, "tdx_quote_rejected")),
+            Ok((Unproven, "tdx_verification_failed")),
+            rejected,
+        ),
+        (
+            Ok((Unproven, "tdx_collateral_expired")),
+            Err(limit),
+            expired,
+        ),
+        (
+            Ok((Unproven, "tdx_verification_failed")),
+            Err(limit),
+            unavailable,
+        ),
+        (Err(limit), Ok((Unproven, "tdx_collateral_expired")), limit),
+    ] {
+        let (pack, trust, challenge) = fixture();
+        let graph = verify_gcp_graph(pack, &trust, &challenge).unwrap();
+        let boot = boot.and_then(|(status, reason)| {
+            GcpBootstrapHistoryResponse::new(&graph.bootstrap, status, reason, None)
+        });
+        let exec = exec.and_then(|(status, reason)| {
+            GcpHardwareResponse::new(&graph.execution, status, reason, None)
+        });
+        assert_eq!(graph.apply(boot, exec).unwrap_err(), expected);
     }
 }
 #[test]
@@ -805,7 +849,7 @@ fn mismatched_or_stale_worker_public_summaries_do_not_pass() {
             3 => before.facts.as_mut().unwrap().evaluation_time_unix_seconds = 1,
             _ => after.facts.as_mut().unwrap().event_count += 1,
         }
-        assert!(graph.apply(before, after).is_err());
+        assert!(graph.apply(Ok(before), Ok(after)).is_err());
     }
 }
 
@@ -864,4 +908,28 @@ fn protected_gcp_export_bridge_is_bounded_and_never_accepts_legacy_exports() {
         many.validate(),
         Err(VerificationError::ResourceLimit("gcp_object_count"))
     ));
+}
+
+#[test]
+fn independent_challenge_foreign_preparation_and_mount_have_distinct_rejections() {
+    let (pack, trust, mut challenge) = fixture();
+    challenge.nonce = "ef".repeat(32);
+    assert_eq!(
+        verify_gcp_graph(pack, &trust, &challenge).err(),
+        Some(VerificationError::Invalid("gcp_challenge_mismatch"))
+    );
+    let (mut pack, trust, challenge) = fixture();
+    let mut record = ExecutionRecord::decode(&pack.execution.record).unwrap();
+    record.mount_id += 1;
+    pack.execution.record = record.encode().unwrap();
+    assert_eq!(
+        verify_gcp_graph(pack, &trust, &challenge).err(),
+        Some(VerificationError::Invalid("startup_mount_binding"))
+    );
+    let (mut pack, trust, challenge) = fixture();
+    pack.execution.preparation = fixture().0.execution.preparation;
+    assert_eq!(
+        verify_gcp_graph(pack, &trust, &challenge).err(),
+        Some(VerificationError::Invalid("gcp_custody_object_rejected"))
+    );
 }

@@ -1,3 +1,4 @@
+mod cli_output;
 use execution_proof_contract::execution_quote::QuoteChallenge;
 use execution_proof_verifier::{
     schema::{MAX_PACK_BYTES, MAX_TRUST_BYTES},
@@ -12,46 +13,7 @@ use std::{
 extern "C" fn resource_limit(_: libc::c_int) {
     // Only async-signal-safe operations run here; no allocation or locks.
     const RESULT: &[u8] = b"{\"version\":1,\"status\":\"unproven\",\"reason\":\"verifier_resource_limit\",\"claim\":\"exec_committed\",\"event_id\":null,\"record_sha384\":null,\"identity_scope\":\"authorized_workload_attempt\",\"time_semantics\":\"current_collateral_evaluation_of_historical_authorization\",\"evaluation_time_unix_seconds\":null}\n";
-    unsafe {
-        execution_proof_verifier::worker::abort_active_worker();
-        let flags = libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-        libc::write(libc::STDOUT_FILENO, RESULT.as_ptr().cast(), RESULT.len());
-        libc::_exit(2);
-    }
-}
-
-fn limits() -> Result<(), VerificationError> {
-    // These process limits are operational watchdogs, not trusted exec time.
-    unsafe {
-        let mut action = std::mem::zeroed::<libc::sigaction>();
-        action.sa_sigaction = resource_limit as *const () as usize;
-        libc::sigemptyset(&mut action.sa_mask);
-        libc::sigaddset(&mut action.sa_mask, libc::SIGALRM);
-        libc::sigaddset(&mut action.sa_mask, libc::SIGXCPU);
-        if libc::sigaction(libc::SIGALRM, &action, std::ptr::null_mut()) != 0
-            || libc::sigaction(libc::SIGXCPU, &action, std::ptr::null_mut()) != 0
-        {
-            return Err(VerificationError::BackendUnavailable("watchdog_install"));
-        }
-        let cpu = libc::rlimit {
-            rlim_cur: 10,
-            rlim_max: 11,
-        };
-        let address_space = libc::rlimit {
-            rlim_cur: 512 << 20,
-            rlim_max: 512 << 20,
-        };
-        if libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0
-            || libc::setrlimit(libc::RLIMIT_AS, &address_space) != 0
-        {
-            return Err(VerificationError::BackendUnavailable("process_limits"));
-        }
-        libc::alarm(30);
-    }
-    Ok(())
+    cli_output::watchdog(RESULT);
 }
 
 fn read(path: &Path, limit: usize) -> Result<Vec<u8>, VerificationError> {
@@ -125,24 +87,9 @@ fn run() -> Result<execution_proof_verifier::VerificationVerdict, VerificationEr
 }
 
 fn main() {
-    let verdict = match limits().and_then(|_| run()) {
+    let verdict = match cli_output::limits(resource_limit).and_then(|_| run()) {
         Ok(value) => value,
         Err(error) => error.verdict(),
     };
-    let status = verdict.status();
-    match serde_json::to_string(&verdict) {
-        Ok(encoded) => println!("{encoded}"),
-        Err(_) => {
-            eprintln!("verdict_serialization_failed");
-            std::process::exit(3);
-        }
-    }
-    unsafe {
-        libc::alarm(0);
-    }
-    std::process::exit(match status {
-        "verified_exec" => 0,
-        "invalid" => 1,
-        _ => 2,
-    });
+    cli_output::finish(verdict)
 }

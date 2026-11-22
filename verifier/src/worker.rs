@@ -137,7 +137,7 @@ impl TrustedWorker {
         }
         let mut source = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|_| WorkerError::InvalidBinary)?;
         let metadata = source.metadata().map_err(|_| WorkerError::Io)?;

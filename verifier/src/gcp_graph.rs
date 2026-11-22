@@ -375,33 +375,61 @@ pub fn verify_gcp_graph(
         execution,
     })
 }
+fn checked_facts<T>(
+    status: GcpHardwareStatus,
+    reason: &str,
+    facts: Option<T>,
+    missing: &'static str,
+) -> Result<T, VerificationError> {
+    match (status, reason) {
+        (GcpHardwareStatus::Checked, _) => facts.ok_or(VerificationError::Invalid(missing)),
+        (GcpHardwareStatus::Invalid, "tdx_quote_rejected") => {
+            Err(VerificationError::Invalid("tdx_quote_rejected"))
+        }
+        (GcpHardwareStatus::Invalid, _) => {
+            Err(VerificationError::Invalid("gcp_tdx_verification_failed"))
+        }
+        (GcpHardwareStatus::Unproven, "tdx_collateral_expired") => Err(
+            VerificationError::BackendUnavailable("tdx_collateral_expired"),
+        ),
+        (GcpHardwareStatus::Unproven, _) => Err(VerificationError::BackendUnavailable(
+            "gcp_tdx_verification_unavailable",
+        )),
+    }
+}
+
 impl ValidatedGcpGraph {
     fn apply(
         self,
-        bootstrap: GcpBootstrapHistoryResponse,
-        execution: GcpHardwareResponse,
+        bootstrap: Result<GcpBootstrapHistoryResponse, VerificationError>,
+        execution: Result<GcpHardwareResponse, VerificationError>,
     ) -> Result<VerificationVerdict, VerificationError> {
-        bootstrap.check_request(&self.bootstrap)?;
-        execution.check_request(&self.execution)?;
-        for status in [bootstrap.status, execution.status] {
-            match status {
-                GcpHardwareStatus::Invalid => {
-                    return Err(VerificationError::Invalid("gcp_tdx_verification_failed"))
-                }
-                GcpHardwareStatus::Unproven => {
-                    return Err(VerificationError::BackendUnavailable(
-                        "gcp_tdx_verification_unavailable",
-                    ))
-                }
-                GcpHardwareStatus::Checked => (),
-            }
-        }
-        let before = bootstrap
-            .facts
-            .ok_or(VerificationError::Invalid("gcp_bootstrap_facts_missing"))?;
-        let after = execution
-            .facts
-            .ok_or(VerificationError::Invalid("gcp_execution_facts_missing"))?;
+        let before = bootstrap.and_then(|response| {
+            response.check_request(&self.bootstrap)?;
+            checked_facts(
+                response.status,
+                &response.reason,
+                response.facts,
+                "gcp_bootstrap_facts_missing",
+            )
+        });
+        let after = execution.and_then(|response| {
+            response.check_request(&self.execution)?;
+            checked_facts(
+                response.status,
+                &response.reason,
+                response.facts,
+                "gcp_execution_facts_missing",
+            )
+        });
+        // A definitive rejection wins over an unavailable phase. On ties,
+        // report the bootstrap phase first.
+        let (before, after) = match (before, after) {
+            (Err(e @ VerificationError::Invalid(_)), _)
+            | (_, Err(e @ VerificationError::Invalid(_))) => return Err(e),
+            (Err(e), _) | (_, Err(e)) => return Err(e),
+            (Ok(before), Ok(after)) => (before, after),
+        };
         // A worker summary from a different target/evaluation must not substitute
         // for either exact quote. Each worker already repeated all raw predicates.
         require(
@@ -460,9 +488,8 @@ pub fn verify_gcp_with_workers(
     };
     let bootstrap =
         crate::worker::run_gcp_bootstrap_history_worker(&graph.bootstrap, bootstrap_worker)
-            .map_err(map)?;
-    let execution =
-        crate::worker::run_gcp_worker(&graph.execution, execution_worker).map_err(map)?;
+            .map_err(map);
+    let execution = crate::worker::run_gcp_worker(&graph.execution, execution_worker).map_err(map);
     graph.apply(bootstrap, execution)
 }
 
