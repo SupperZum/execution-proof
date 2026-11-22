@@ -46,6 +46,12 @@ and the QVL library required by the build recipe. Provide its linker aliases
 in the same directory. The build uses the Cargo cache selected by `CARGO_HOME`
 and creates no network requests.
 
+The worker receipt records the Cargo dependency and feature selection for each
+worker build, hashes the local crates in those graphs, and identifies the build
+tools, SDK headers and QVL input. Packaging recomputes this manifest from the
+same checkouts and toolchain before creating the runtime directory. Rebuild the
+workers if an input changed or the receipt predates this manifest.
+
 ```sh
 python3 build-workers.py --cargo "$(rustup which cargo)" \
   --sgx-sdk "$SGX_SDK" --qvl-library "$QVL_LIBRARY" --output worker-build

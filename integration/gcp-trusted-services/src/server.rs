@@ -1,22 +1,16 @@
 use crate::{
     archive::{Archive, DeliveryScope},
     gcp_launch_credential::{LaunchCredentialConfig, LaunchCredentialService},
-    gcp_launch_http::{self, LaunchHttpBackend, LaunchHttpService, ResourceDecisionResponse},
+    gcp_launch_http::{self, LaunchHttpBackend, LaunchHttpService},
     gcp_launch_resource::{LaunchResourceConfig, LaunchResourceService},
     gcp_launch_session::{FreshLaunchSessions, SessionClock, SessionConfig, SessionError},
     plugins::resource::{RepositoryConfig, ResourceStorage, RESOURCE_STORAGE_NAMESPACE},
 };
-use actix_web::{
-    body::to_bytes_limited,
-    dev::{Service, ServiceResponse},
-    web, App, HttpResponse, HttpServer,
-};
+use actix_web::{dev::Service, web, App, HttpServer};
 use anyhow::{ensure, Result};
-use base64::{engine::general_purpose::STANDARD, Engine};
 use execution_proof_contract::{
-    gcp_boot_binding::GcpBootBindingV1,
-    gcp_policy_receipt::{GcpLaunchPolicyAggregateV2, POLICY_AGGREGATE_PROFILE},
-    GrantExpectations, Signed,
+    gcp_boot_binding::GcpBootBindingV1, gcp_policy_receipt::POLICY_AGGREGATE_PROFILE,
+    GrantExpectations,
 };
 use execution_proof_verifier::{
     gcp_boot_evidence::GcpBootEvidencePolicy, gcp_tdx_policy::GcpTdxModulePolicyV1,
@@ -405,9 +399,11 @@ fn framed_credential(file: std::fs::File, timeout: Duration) -> Result<Zeroizing
 struct Clock;
 impl SessionClock for Clock {
     fn now_unix_seconds(&self) -> std::result::Result<u64, SessionError> {
+        self.now_since_epoch().map(|time| time.as_secs())
+    }
+    fn now_since_epoch(&self) -> std::result::Result<std::time::Duration, SessionError> {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|t| t.as_secs())
             .map_err(|_| SessionError::ClockUnavailable)
     }
 }
@@ -634,13 +630,6 @@ pub async fn serve(inputs: PublicInputs, credential: Zeroizing<Vec<u8>>) -> Resu
             .app_data(service.clone())
             .configure(gcp_launch_http::configure)
             .wrap_fn(move |request, server| {
-                let needs_archive = request.path()
-                    == format!("{}/resource-decision", gcp_launch_http::LAUNCH_HTTP_PREFIX);
-                let needs_delivery = request.path()
-                    == format!(
-                        "{}/credential-delivery",
-                        gcp_launch_http::LAUNCH_HTTP_PREFIX
-                    );
                 let permit = permits.clone().try_acquire_owned();
                 let future = permit.as_ref().ok().map(|_| server.call(request));
                 let resource = resource.clone();
@@ -659,55 +648,13 @@ pub async fn serve(inputs: PublicInputs, credential: Zeroizing<Vec<u8>>) -> Resu
                             )
                         })?
                         .await?;
-                    if !(needs_archive || needs_delivery)
-                        || response.status() != actix_web::http::StatusCode::OK
-                    {
-                        return Ok(response.map_into_boxed_body());
-                    }
-                    let (request, response) = response.into_parts();
-                    let status = response.status();
-                    let bytes = to_bytes_limited(response.into_body(), 128 << 10)
-                        .await
-                        .map_err(|_| {
-                            actix_web::error::ErrorServiceUnavailable("policy response bound")
-                        })?
-                        .map_err(|_| {
-                            actix_web::error::ErrorServiceUnavailable("policy response unavailable")
-                        })?;
-                    let committed = (|| -> Result<()> {
-                        if needs_delivery {
-                            return archive.store_delivery_response(&bytes, &delivery_scope);
-                        }
-                        let response: ResourceDecisionResponse = serde_json::from_slice(&bytes)?;
-                        let wire = STANDARD.decode(
-                            response
-                                .signed_aggregate_b64
-                                .ok_or_else(|| anyhow::anyhow!("aggregate unavailable"))?,
-                        )?;
-                        ensure!(wire.len() <= 32 << 10, "aggregate bound");
-                        let aggregate: Signed<GcpLaunchPolicyAggregateV2> =
-                            serde_json::from_slice(&wire)?;
-                        let digest = aggregate.statement.digest_sha384()?;
-                        let snapshot = resource
-                            .export_policy_capture(&aggregate.statement.session_id, &digest)?;
-                        ensure!(
-                            snapshot.signed_aggregate_json() == wire,
-                            "archive service identity mismatch"
-                        );
-                        archive.store(&snapshot)
-                    })();
-                    committed.map_err(|_| {
-                        actix_web::error::ErrorServiceUnavailable(
-                            "original policy archive unavailable",
-                        )
-                    })?;
-                    Ok(ServiceResponse::new(
-                        request,
-                        HttpResponse::build(status)
-                            .content_type("application/json")
-                            .body(bytes),
+                    crate::archive_http::commit_response(
+                        response,
+                        &resource,
+                        &archive,
+                        &delivery_scope,
                     )
-                    .map_into_boxed_body())
+                    .await
                 }
             })
     })

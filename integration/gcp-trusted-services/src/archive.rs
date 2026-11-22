@@ -443,4 +443,5 @@ fn verify_signature(key: &[u8; 32], bytes: &[u8], encoded: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "archive/tests.rs"]
 mod tests;

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build the GNU authority and verifier workers for the private runtime."""
-import argparse, hashlib, json, os, signal, subprocess, time
+import argparse, hashlib, json, os, re, shutil, signal, subprocess, time
 from pathlib import Path
 
 HERE=Path(__file__).resolve().parent
@@ -13,17 +13,86 @@ TDX_WORKERS = ('gcp-tdx-pregrant-verifier', 'gcp-tdx-hardware-verifier',
                'gcp-tdx-bootstrap-history-verifier')
 ARTIFACT_NAMES = {'gcp-authority', 'gcp-execution-proof-verifier', *TDX_WORKERS}
 
+BUILD_SCHEMA = 'onb17.trusted-service-actual-worker-build.v2'
+
+
 def sha(path):
-    with path.open('rb')as f:return hashlib.file_digest(f,'sha384').hexdigest()
-def sources():
-    paths=[]
-    for root in [
-        EPP / 'contract', EPP / 'verifier', EPP / 'issuer', EPP / 'handoff', EPP / 'gcp-journal',
-        TRUSTEE / 'deps/verifier', TRUSTEE / 'deps/eventlog',
-    ]:
-        paths.extend(root.rglob('*.rs'));paths.append(root/'Cargo.toml')
-    paths += [EPP/'Cargo.toml',EPP/'Cargo.lock',TRUSTEE/'Cargo.toml',TRUSTEE/'Cargo.lock',Path(__file__)]
-    return {str(p):sha(p)for p in sorted(set(paths))}
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha384').hexdigest()
+
+
+def worker_plans():
+    yield EPP, 'execution-proof-issuer', 'gcp', ('gcp-authority',)
+    yield EPP, 'execution-proof-verifier', 'gcp-journal', ('gcp-execution-proof-verifier',)
+    yield TRUSTEE, 'verifier', 'execution-quote-worker-tdx', TDX_WORKERS
+
+
+def selection(package, features):
+    return ['--offline', '--locked', '--target', GNU, '-p', package,
+            '--no-default-features', '--features', features]
+
+
+def files_under(root, target, ancestors=frozenset()):
+    directory = root.resolve(strict=True)
+    if directory == target:
+        return
+    if directory in ancestors:
+        raise ValueError(f'directory cycle in worker inputs: {root}')
+    for entry in root.iterdir():
+        if entry.name == '.git':
+            continue
+        if entry.is_dir():
+            yield from files_under(entry, target, ancestors | {directory})
+        else:
+            yield entry
+
+
+def sources(cargo, env):
+    """Resolve local crates with the same Cargo selection as the worker build."""
+    target = Path(env['CARGO_TARGET_DIR'])
+    paths = {Path(__file__).resolve(), cargo}
+    roots = set()
+    graphs = {}
+    config_dirs = {Path(env['CARGO_HOME'])}
+    for cwd, package, features, bins in worker_plans():
+        flags = selection(package, features)
+        command = [str(cargo), 'tree', *flags, '--edges', 'normal,build',
+                   '--color', 'never', '--prefix', 'none', '--format', '{p}\t{f}']
+        tree = subprocess.check_output(command, cwd=cwd, env=env, text=True, timeout=60)
+        rows = sorted({row.removesuffix(' (*)') for row in tree.splitlines() if row})
+        graphs[package] = {'selection': flags, 'bins': sorted(bins), 'packages': rows}
+        for row in rows:
+            identity, _ = row.split('\t', 1)
+            local = re.search(r' \((/.*)\)$', identity)
+            if local:
+                roots.add(Path(local[1]))
+        paths.update((cwd / 'Cargo.toml', cwd / 'Cargo.lock'))
+        config_dirs.update(parent / '.cargo' for parent in (cwd, *cwd.parents))
+    for root in roots:
+        paths.update(files_under(root, target))
+    for directory in config_dirs:
+        paths.update(p for p in (directory / 'config', directory / 'config.toml') if p.is_file())
+
+    rustc = Path(env['RUSTC'])
+    rust_version = subprocess.check_output([rustc, '-vV'], env=env, text=True, timeout=15)
+    sysroot = Path(subprocess.check_output([rustc, '--print', 'sysroot'], env=env,
+                                          text=True, timeout=15).strip())
+    paths.add(rustc)
+    paths.update((sysroot / 'lib').glob('*.so*'))
+    rust_target = sysroot / 'lib/rustlib' / GNU
+    paths.update(files_under(rust_target / 'lib', target))
+    if (rust_target / 'bin').is_dir():
+        paths.update(files_under(rust_target / 'bin', target))
+    for name in ('cc', 'c++', 'ar', 'as', 'ld', 'clang', 'pkg-config'):
+        executable = shutil.which(name, path=env['PATH'])
+        if executable:
+            paths.add(Path(executable))
+    paths.update(files_under(Path(env['SGX_SDK']) / 'include', target))
+    paths.add(Path(env['LIBRARY_PATH']) / 'libsgx_dcap_quoteverify.so')
+    return {'graphs': graphs, 'rustc_version': rust_version, 'environment': env,
+            'files': {str(p): sha(p) for p in sorted(paths)}}
+
+
 def owned(command,cwd,env,log,seconds=1800):
     child=None;start=time.monotonic();observed=None
     try:
@@ -65,6 +134,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     env = {
         'PATH': str(cargo.parent) + ':/usr/bin:/bin',
+        'RUSTC': str(cargo.with_name('rustc').resolve(strict=True)),
         'CARGO_HOME': str(Path(os.environ.get('CARGO_HOME', Path.home() / '.cargo')).resolve()),
         'CARGO_TARGET_DIR': str(target),
         'SGX_SDK': str(sdk),
@@ -73,33 +143,26 @@ def main():
         'LC_ALL': 'C',
         'TZ': 'UTC',
     }
-    before = sources()
+    before = sources(cargo, env)
     checks = []
-    plans = [
-        (EPP, ['build', '-p', 'execution-proof-issuer', '--no-default-features',
-               '--features', 'gcp', '--bin', 'gcp-authority'], 'gcp-authority'),
-        (EPP, ['build', '-p', 'execution-proof-verifier', '--no-default-features',
-               '--features', 'gcp-journal', '--bin', 'gcp-execution-proof-verifier'], 'gcp-execution-proof-verifier'),
-    ]
-    plans.extend((TRUSTEE, ['rustc', '-p', 'verifier', '--no-default-features',
-                           '--features', 'execution-quote-worker-tdx', '--bin', name], name)
-                 for name in TDX_WORKERS)
-    for cwd, flags, name in plans:
-        command = [str(cargo), *flags, '--offline', '--locked', '--target', GNU]
-        if flags[0] == 'rustc':
-            command.extend(['--', '-C', 'link-arg=-Wl,-rpath,' + PREFIX])
-        duration = owned(command, cwd, env, out / (name + '.log'))
-        artifact = target / GNU / 'debug' / name
-        checks.append({
-            'name': name, 'command': command, 'cwd': str(cwd), 'exit': 0, 'seconds': duration,
-            'artifact': {'path': str(artifact), 'sha384': sha(artifact), 'bytes': artifact.stat().st_size},
-        })
-        print(json.dumps({'built': name, 'seconds': duration}), flush=True)
-    after = sources()
+    for cwd, package, features, bins in worker_plans():
+        for name in bins:
+            verb = 'rustc' if name in TDX_WORKERS else 'build'
+            command = [str(cargo), verb, *selection(package, features), '--bin', name]
+            if verb == 'rustc':
+                command.extend(['--', '-C', 'link-arg=-Wl,-rpath,' + PREFIX])
+            duration = owned(command, cwd, env, out / (name + '.log'))
+            artifact = target / GNU / 'debug' / name
+            checks.append({
+                'name': name, 'command': command, 'cwd': str(cwd), 'exit': 0, 'seconds': duration,
+                'artifact': {'path': str(artifact), 'sha384': sha(artifact), 'bytes': artifact.stat().st_size},
+            })
+            print(json.dumps({'built': name, 'seconds': duration}), flush=True)
+    after = sources(cargo, env)
     if before != after or sha(qvl) != QVL_SHA384:
         raise ValueError('source or QVL library changed during the build')
     receipt = {
-        'schema': 'onb17.trusted-service-actual-worker-build.v1',
+        'schema': BUILD_SCHEMA,
         'cargo': str(cargo),
         'qvl_library': {'path': str(qvl), 'sha384': QVL_SHA384},
         'environment': env,

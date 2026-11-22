@@ -13,6 +13,7 @@ mod as_policy;
 mod kbs_policy;
 pub mod launch_policy {
     pub use super::as_policy::*;
+    pub(crate) use super::kbs_policy::{evaluate_kbs_policy_detailed, KbsEvaluationError};
     pub use super::kbs_policy::{evaluate_kbs_policy, KbsPolicyError, KbsPolicyFacts};
 }
 #[path = "../../../../trustee-launch-dev/kbs/src/gcp_launch_credential.rs"]
@@ -60,6 +61,7 @@ pub mod prometheus {
         LazyLock::new(|| counter("onb17_resource_deletes"));
 }
 pub mod archive;
+mod archive_http;
 #[cfg(test)]
 mod policy_tests;
 pub mod server;

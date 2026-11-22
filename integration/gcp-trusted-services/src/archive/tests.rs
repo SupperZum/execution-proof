@@ -7,6 +7,11 @@ use execution_proof_contract::{
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::os::unix::fs::PermissionsExt;
+impl Archive {
+    pub(crate) fn swap_sync_directory(&mut self, file: File) -> File {
+        std::mem::replace(&mut self.directory, file)
+    }
+}
 fn delivery_fixture() -> (tempfile::TempDir, Archive, DeliveryScope, Vec<u8>, Vec<u8>) {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -139,7 +144,7 @@ fn delivery_archives_only_original_signed_public_receipt_and_preserves_policy_bo
 #[test]
 fn delivery_retry_requires_directory_sync_after_rename() {
     let (root, mut archive, scope, response, receipt) = delivery_fixture();
-    let directory = std::mem::replace(&mut archive.directory, File::open("/dev/null").unwrap());
+    let directory = archive.swap_sync_directory(File::open("/dev/null").unwrap());
 
     // The rename is visible, but syncing the stand-in directory FD fails.
     assert!(archive.store_delivery_response(&response, &scope).is_err());
@@ -159,7 +164,7 @@ fn delivery_retry_requires_directory_sync_after_rename() {
     );
     assert!(archive.store_delivery_response(&response, &scope).is_err());
 
-    archive.directory = directory;
+    archive.swap_sync_directory(directory);
     archive.store_delivery_response(&response, &scope).unwrap();
     assert_eq!(std::fs::read(path).unwrap(), raw);
 }

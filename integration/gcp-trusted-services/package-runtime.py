@@ -88,24 +88,25 @@ def main():
         parser.error('provide both journal network options')
     network = journal_network(a.journal_ca_bundle, a.journal_dns_server)
     selected_hosts = hosts(a.hosts_file)
-    out = a.output.resolve()
-    out.mkdir(parents=True, exist_ok=False)
-    root = out / 'rootfs'
-    for name in ['opt/onb17/trusted/bin','opt/onb17/trusted/lib','lib/x86_64-linux-gnu','lib64','etc','proc','dev','run','tmp']:(root/name).mkdir(parents=True,exist_ok=True)
-    (root/'run').chmod(0o700);(root/'tmp').chmod(0o700)
     spec=importlib.util.spec_from_file_location('worker_recipe',HERE/'build-workers.py');mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
     previous=json.loads((a.workers_build/'build.json').read_text())
-    if previous['schema'] != 'onb17.trusted-service-actual-worker-build.v1':
-        raise ValueError('worker build receipt schema')
-    if previous['source_after'] != mod.sources():
-        raise ValueError('worker source changed since build')
+    if previous['schema'] != mod.BUILD_SCHEMA:
+        raise ValueError('worker input manifest required; rebuild workers with the current recipe')
+    cargo = Path(previous['cargo']).resolve(strict=True)
+    inputs = mod.sources(cargo, previous['environment'])
+    if previous['source_before'] != inputs or previous['source_after'] != inputs:
+        raise ValueError('worker inputs changed since build')
     checks = previous['checks']
     if len(checks) != len(mod.ARTIFACT_NAMES) or {item['name'] for item in checks} != mod.ARTIFACT_NAMES:
         raise ValueError('worker build receipt is incomplete')
     qvl = Path(previous['qvl_library']['path']).resolve(strict=True)
     if sha(qvl) != previous['qvl_library']['sha384'] or sha(qvl) != mod.QVL_SHA384:
         raise ValueError('QVL library does not match the build')
-    cargo = Path(previous['cargo']).resolve(strict=True)
+    out = a.output.resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    root = out / 'rootfs'
+    for name in ['opt/onb17/trusted/bin','opt/onb17/trusted/lib','lib/x86_64-linux-gnu','lib64','etc','proc','dev','run','tmp']:(root/name).mkdir(parents=True,exist_ok=True)
+    (root/'run').chmod(0o700);(root/'tmp').chmod(0o700)
     before=inventory();env=previous['environment']
     target = Path(env['CARGO_TARGET_DIR']).resolve(strict=True) / GNU / 'debug'
     command=[str(cargo),'rustc','--offline','--locked','--target',GNU,'--features','server','--bin','gcp-trusted-kbs','--','-C','link-arg=-Wl,-rpath,/opt/onb17/trusted/lib']
