@@ -11,7 +11,7 @@ use execution_proof_contract::{
     gcp_policy_receipt::{
         POLICY_AGGREGATE_PROFILE, POLICY_AGGREGATE_PURPOSE, POLICY_AGGREGATE_VERSION,
     },
-    policy_receipt::{PolicyCommitments, ResourcePolicyRequest},
+    policy_receipt::PolicyCommitments,
 };
 use execution_proof_verifier::{
     gcp_boot_evidence::{GcpInstanceIdentity, QuotePaddingPolicy},
@@ -261,7 +261,7 @@ impl Fixture {
     fn aggregate(&self) -> Vec<u8> {
         let grant = self.app.grant(&self.state()).unwrap();
         let p = &self.app.config.policy;
-        let a = GcpLaunchPolicyAggregateV2 {
+        let mut a = GcpLaunchPolicyAggregateV2 {
             version: POLICY_AGGREGATE_VERSION,
             purpose: POLICY_AGGREGATE_PURPOSE.into(),
             audience: self.app.c.aggregate_audience.clone(),
@@ -295,6 +295,7 @@ impl Fixture {
                 data_sha384: None,
             },
         };
+        a.kbs_evaluation.data_sha384 = Some(kbs_data_sha384(&a.request).unwrap());
         signed(&self.kbs, a.clone(), &a.signing_bytes().unwrap()).unwrap()
     }
     fn redemption(&self, nonce: &str) -> Vec<u8> {
@@ -462,6 +463,43 @@ fn only_signed_pinned_policy_aggregate_can_create_one_plan() {
             aggregate_json: wire
         })
         .is_err());
+}
+#[test]
+fn startup_plan_requires_the_digest_for_its_signed_kbs_request() {
+    let f = Fixture::new();
+    f.software_issued();
+    let wire = f.aggregate();
+    let valid: Signed<GcpLaunchPolicyAggregateV2> = decode(&wire).unwrap();
+    let mut other_request = valid.statement.request.clone();
+    other_request.request_nonce = "another-resource-nonce".into();
+    let wrong_nonce_digest = kbs_data_sha384(&other_request).unwrap();
+    let grant = f.app.grant(&f.state()).unwrap();
+    for (case, digest) in [
+        ("missing", None),
+        ("changed", Some("00".repeat(48))),
+        ("other nonce", Some(wrong_nonce_digest)),
+    ] {
+        let mut statement = valid.statement.clone();
+        statement.kbs_evaluation.data_sha384 = digest;
+        let bad = signed(&f.kbs, statement.clone(), &statement.signing_bytes().unwrap()).unwrap();
+        verify_policy_aggregate(
+            &bad,
+            &grant,
+            &GcpAggregateExpectations {
+                kbs_proof_public_key: f.app.c.roots.kbs_proof_public_key,
+                boot_binding: f.app.config.artifact_expectations.boot_binding.clone(),
+                expected: statement,
+            },
+        )
+        .expect("negative fixture must pass signature and grant checks");
+        assert!(
+            f.app.request(Request::StartupPlan { aggregate_json: bad }).is_err(),
+            "{case} digest unexpectedly accepted"
+        );
+        assert!(f.state().signed_plan.is_none());
+    }
+    let out = f.app.request(Request::StartupPlan { aggregate_json: wire }).unwrap();
+    assert_eq!(out["result"]["status"], "startup_plan");
 }
 #[test]
 fn nonce_pop_one_use_and_historical_exact_retry_preserve_original_window() {

@@ -24,6 +24,7 @@ use execution_proof_contract::{
     },
     gcp_session::GcpLaunchEvidenceV2,
     gcp_startup::{GcpAttemptPlanV1, PLAN_PURPOSE},
+    policy_receipt::ResourcePolicyRequest,
     verify_launch_grant_historical, GrantExpectations, LaunchBinding, LaunchGrant, Signed,
     ValidityWindow, VerifiedLaunchGrant, GRANT_PURPOSE, VERSION,
 };
@@ -80,6 +81,18 @@ fn hex(bytes: &[u8]) -> String {
 }
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     checked(serde_json::to_vec(value))
+}
+fn kbs_data_sha384(request: &ResourcePolicyRequest) -> Result<String> {
+    // Match the JSON bytes Trustee supplies to the GCP resource policy.
+    let data = serde_json::json!({
+        "method": request.method,
+        "plugin": request.plugin,
+        "resource-path": request.resource_path,
+        "workflow-id": request.workflow_id,
+        "request_nonce": request.request_nonce,
+        "query": {},
+    });
+    Ok(hash(&encode(&data)?))
 }
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     checked(serde_json::from_slice(bytes))
@@ -597,11 +610,10 @@ impl Experiment {
                 && e.as_evaluation.data_sha384 == p.as_data_sha384
                 && e.kbs_evaluation.policy_id == p.kbs_policy_id
                 && e.kbs_evaluation.policy_sha384 == p.kbs_policy_sha384
-                && e.kbs_evaluation.data_sha384.is_none()
                 && e.request.resource_path == self.c.resource_path
                 && e.request.workflow_id == self.c.workflow_id,
         )?;
-        checked(verify_policy_aggregate(
+        let verified = checked(verify_policy_aggregate(
             wire,
             grant,
             &GcpAggregateExpectations {
@@ -609,7 +621,11 @@ impl Experiment {
                 boot_binding: self.config.artifact_expectations.boot_binding.clone(),
                 expected: a.statement,
             },
-        ))
+        ))?;
+        let statement = verified.statement();
+        let expected_data = kbs_data_sha384(&statement.request)?;
+        require(statement.kbs_evaluation.data_sha384.as_deref() == Some(expected_data.as_str()))?;
+        Ok(verified)
     }
     fn plan(&self, state: &mut State, wire: Vec<u8>) -> Result<serde_json::Value> {
         require(state.signed_plan.is_none() && state.aggregate.is_none())?;
