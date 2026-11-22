@@ -1,5 +1,6 @@
 import hashlib
 import json
+import runpy
 from pathlib import Path
 import subprocess
 import sys
@@ -15,6 +16,8 @@ LIBSECCOMP = "/lib/x86_64-linux-gnu/libseccomp.so.2"
 LOADER = "/lib64/ld-linux-x86-64.so.2"
 CONFIG = "onb17/boot/config.json"
 CORE = "onb17/boot/producer-core.json"
+KBS_ROOTS = "/trust/custom-kbs.pem"
+AUTHORITY_ROOTS = "/trust/authority.pem"
 
 
 def sha384(data):
@@ -55,9 +58,18 @@ class PackageRootfsTests(unittest.TestCase):
         self.config = self.root / "config.json"
         self.core = self.root / "producer-core.json"
         self.output = self.root / "guest.tar"
-        self.config_bytes = b'{ "version": 1 }\n'
+        self.boot_config = {
+            "version": 1, "purpose": "qlad.execution-proof.gcp-closed-boot-config.v1",
+            "bootstrap_path": "/init", "kbs_tls_roots_path": KBS_ROOTS,
+            "authority_tls_roots_path": AUTHORITY_ROOTS,
+            "roots": {"kbs_tls_roots_sha384": sha384(b"kbs"), "authority_tls_roots_sha384": sha384(b"authority")},
+        }
+        self.config_bytes = json.dumps(self.boot_config).encode()
         self.config.write_bytes(self.config_bytes)
         self.base = {
+            "/init": ("bootstrap_binary", b"init"),
+            KBS_ROOTS: ("tls_roots", b"kbs"),
+            AUTHORITY_ROOTS: ("tls_roots", b"authority"),
             LIBC: ("shared_library", b"measured libc fixture"),
             LOADER: ("loader", b"measured loader fixture"),
             "/onb17/bin/kata-agent-gcp-proof": ("kata_agent_binary", b"measured Kata fixture"),
@@ -124,6 +136,69 @@ class PackageRootfsTests(unittest.TestCase):
                     else:
                         self.assertEqual(data, expected[member.name])
             self.assertEqual(archive.getmember(resolver_name).mode, 0o555)
+
+    def test_boot_directory_depth_at_packaging_and_payload_ingress(self):
+        validate = runpy.run_path(str(PACKAGE.with_name("build-payload.py")))["validate_archive"]
+        path = "/" + "d/" * 16 + "leaf"
+        src = self.leaves / path[1:]
+        src.parent.mkdir(parents=True)
+        src.write_bytes(b"fixture")
+        self.base[path] = "data", b"fixture"
+        result, _ = self.run_package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        _, files, _ = validate(self.output)
+        self.assertIn("d/" * 16 + "leaf", files)
+
+        self.output.unlink()
+        deep = "d/" * 17 + "leaf"
+        leaf = self.leaves / deep
+        leaf.parent.mkdir()
+        leaf.write_bytes(b"x")
+        self.base["/" + deep] = "data", b"x"
+        result, _ = self.run_package()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("boot directory depth exceeded", result.stderr)
+        self.assertFalse(self.output.exists())
+        # Bypass the packager and submit each over-depth header directly.
+        for name, kind in [(deep, tarfile.REGTYPE), (deep.rsplit("/", 1)[0], tarfile.DIRTYPE)]:
+            with tarfile.open(self.output, "w", format=tarfile.USTAR_FORMAT) as archive:
+                entry = tarfile.TarInfo(name)
+                entry.type = kind
+                entry.mode = 0o555
+                archive.addfile(entry)
+            with self.assertRaisesRegex(ValueError, "boot directory depth exceeded"):
+                validate(self.output)
+
+    def test_kbs_roots_size_follows_configured_path_at_both_packaging_steps(self):
+        payload = runpy.run_path(str(PACKAGE.with_name("build-payload.py")))
+        for path, data, role in [(KBS_ROOTS, b"k" * 65536, "kbs"), (AUTHORITY_ROOTS, b"a" * 65537, "authority")]:
+            (self.leaves / path[1:]).write_bytes(data)
+            self.base[path] = "tls_roots", data
+            self.boot_config["roots"][role + "_tls_roots_sha384"] = sha384(data)
+        self.config_bytes = json.dumps(self.boot_config).encode()
+        self.config.write_bytes(self.config_bytes)
+        result, _ = self.run_package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        _, files, core_bytes = payload["validate_archive"](self.output)
+        self.output.unlink()
+
+        # Swap roles while preserving the exact leaf bytes, kinds and hashes.
+        self.boot_config.update(kbs_tls_roots_path=AUTHORITY_ROOTS, authority_tls_roots_path=KBS_ROOTS)
+        roots = self.boot_config["roots"]
+        roots["kbs_tls_roots_sha384"], roots["authority_tls_roots_sha384"] = (
+            roots["authority_tls_roots_sha384"], roots["kbs_tls_roots_sha384"]
+        )
+        self.config_bytes = json.dumps(self.boot_config).encode()
+        self.config.write_bytes(self.config_bytes)
+        result, _ = self.run_package()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("KBS TLS roots", result.stderr)
+        self.assertFalse(self.output.exists())
+
+        core = json.loads(core_bytes)
+        core["config_sha384"] = sha384(self.config_bytes)
+        with self.assertRaisesRegex(ValueError, "KBS TLS roots"):
+            payload["check_core"](self.config_bytes, json.dumps(core).encode(), files)
 
     def test_wrong_resolver_digest_does_not_create_archive(self):
         result, _ = self.run_package(pin=sha384(b"unselected resolver"))

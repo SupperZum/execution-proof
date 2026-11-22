@@ -14,12 +14,15 @@ import subprocess
 import tarfile
 import tempfile
 
+from boot_roots import validate_kbs_tls_roots
+
 CONFIG = "onb17/boot/config.json"
 CORE = "onb17/boot/producer-core.json"
 MOUNT_DIRS = {"", "dev", "proc", "run", "sys", "sys/kernel", "sys/kernel/config"}
 MAX_FILE = 256 << 20
 MAX_BLOB = 512 << 20
 MAX_TAR = MAX_BLOB + (2 << 20)
+MAX_BOOT_DIRECTORY_DEPTH = 16
 MAX_DOCUMENT = 64 << 10
 MAX_ENTRIES = 256
 INDEX_MAGIC = b"ONB17-TCB-IDX1\0\0"
@@ -105,6 +108,7 @@ def check_core(config_bytes, core_bytes, files):
         if kind == "bootstrap_binary":
             bootstrap.append(name)
         names.append(name)
+    validate_kbs_tls_roots(config, core["leaves"])
     if names != sorted(set(files) - {CONFIG, CORE}) or bootstrap != ["init"]:
         raise ValueError("archive does not match the sorted producer inventory")
 
@@ -136,6 +140,10 @@ def validate_archive(path):
                 or item.uname or item.gname
             ):
                 raise ValueError(f"unsafe or noncanonical archive entry: {item.name!r}")
+            # Archive names are relative. A directory counts toward its own depth.
+            depth = name.count("/") + int(bool(name) and item.isdir())
+            if depth > MAX_BOOT_DIRECTORY_DEPTH:
+                raise ValueError(f"boot directory depth exceeded: {name}")
             if header != item.tobuf(format=tarfile.USTAR_FORMAT):
                 raise ValueError("archive contains a noncanonical USTAR header")
             if item.type == tarfile.DIRTYPE and item.size == 0 and item.mode == 0o555:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise PID1's inert index/blob reader without mounts or host changes."""
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -28,15 +29,19 @@ def main():
         blob.write_bytes(content)
         digest = hashlib.sha384(content).digest()
 
-        def check(name, index_bytes, expected, selected=blob):
+        def check(name, index_bytes, expected, selected=blob, expected_errno=errno.EINVAL):
             index = root / 'index'
             index.write_bytes(index_bytes)
             result = subprocess.run([str(executable), '--inspect', str(index), str(selected)],
                                     capture_output=True, timeout=5, check=False)
             passed = result.returncode == expected
+            if passed and expected == 2:
+                prefix = b'ONB17_PROOF_STARTUP_V1 '
+                marker = json.loads(result.stdout.removeprefix(prefix))
+                passed = marker['status'] == 'STARTUP_REJECTED' and marker['errno'] == expected_errno
             results.append({'case': name, 'exit_code': result.returncode, 'passed': passed})
             if not passed:
-                raise RuntimeError(f'{name}: exit {result.returncode}, expected {expected}')
+                raise RuntimeError(f'{name}: unexpected exit or startup marker')
 
         index = MAGIC + len(content).to_bytes(8, 'big') + digest
         assert len(index) == 72
@@ -50,7 +55,8 @@ def main():
         check('digest-mismatch', index[:-1] + bytes([index[-1] ^ 1]), 2)
         link = root / 'link'
         link.symlink_to(blob)
-        check('symlink-blob', index, 2, link)
+        check('symlink-blob', index, 2, link, errno.ELOOP)
+        check('missing-blob', index, 2, root / 'missing', errno.ENOENT)
         fifo = root / 'fifo'
         os.mkfifo(fifo)
         check('nonregular-blob-without-blocking', index, 2, fifo)

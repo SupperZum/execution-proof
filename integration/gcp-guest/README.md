@@ -186,3 +186,27 @@ Use `build/podvm/disk/disk.tar.gz` as the disk archive.
 `disk/import-manifest.json` records its digest. Use `payload/producer-core.json`
 and `kernel/build-receipt.json` with the original boot configuration when
 preparing the signed boot artifacts for that disk.
+
+
+## Test the role loader under QEMU
+
+The [native loader test](native-loader/run.py) boots a local x86-64 Linux guest
+with a read-only EROFS image, software signing keys and the current handoff test
+binary as the Kata executable. It exercises valid capsule loading, changes to
+the signed scope and spec, root inventory, and executable identity.
+
+Build both libtest binaries and the policy helper from the repository root.
+
+```sh
+cargo test --locked -p execution-proof-verifier -p execution-proof-handoff \
+  --features execution-proof-handoff/gcp-startup --lib --no-run
+cargo build --locked -p execution-proof-handoff --features gcp-startup --example gcp-build-inputs
+python3 integration/gcp-guest/native-loader/run.py --help
+```
+
+Pass the two executables printed by Cargo, the helper, QEMU, its BIOS and data
+directory, `mkfs.erofs`, and a new output directory. The test kernel must accept
+an external uncompressed initramfs and support file-backed EROFS, procfs, ramfs,
+mount namespaces and serial console output. The host needs Python
+`cryptography` and a C compiler with static libc. The runner writes the guest
+console output to `console.log` in the output directory.

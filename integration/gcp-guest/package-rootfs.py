@@ -14,12 +14,15 @@ import subprocess
 import tarfile
 import tempfile
 
+from boot_roots import validate_kbs_tls_roots
+
 RESOLVER = "/lib/x86_64-linux-gnu/libseccomp.so.2"
 LIBC = "/lib/x86_64-linux-gnu/libc.so.6"
 LOADER = "/lib64/ld-linux-x86-64.so.2"
 CONFIG = "/onb17/boot/config.json"
 CORE = "/onb17/boot/producer-core.json"
 CORE_PURPOSE = "qlad.execution-proof.gcp-producer-core.v1"
+MAX_BOOT_DIRECTORY_DEPTH = 16
 MAX_DOCUMENT = 64 << 10
 MAX_LEAF = 256 << 20
 MAX_TOTAL = 512 << 20
@@ -94,8 +97,11 @@ def load_core(path, config):
             or not 0 < leaf["size_bytes"] <= MAX_LEAF
         ):
             raise ValueError(f"invalid producer leaf: {name!r}")
+        if name.count("/") - 1 > MAX_BOOT_DIRECTORY_DEPTH:
+            raise ValueError(f"boot directory depth exceeded: {name}")
         previous = name
 
+    validate_kbs_tls_roots(json.loads(config, object_pairs_hook=unique_object), core["leaves"])
     kinds = {leaf["path"]: leaf["kind"] for leaf in core["leaves"]}
     if kinds.get(LIBC) != "shared_library" or kinds.get(LOADER) != "loader":
         raise ValueError("producer core must measure the GNU libc and its loader")

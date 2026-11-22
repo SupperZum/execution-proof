@@ -32,6 +32,7 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef MFD_NOEXEC_SEAL
@@ -44,6 +45,7 @@
 #define CLOSE_RANGE_CLOEXEC (1U << 2)
 #endif
 #define MAX_BLOB (512U * 1024U * 1024U)
+#define ROLE_WATCHDOG_SECONDS 900
 #define MAX_ROLE (256U * 1024U * 1024U)
 #define SEALS (F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)
 #define RAMFS_MAGIC_VALUE 0x858458f6UL
@@ -51,7 +53,6 @@
 #define DATA_ATTRS (MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC)
 #define VIEW_ATTRS (MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)
 static const unsigned char IDX_MAGIC[16] = "ONB17-TCB-IDX1\0\0";
-static volatile sig_atomic_t expired;
 static int pid1;
 
 static void event(const char *status, const char *stage, int error) {
@@ -69,7 +70,10 @@ static _Noreturn void fail(const char *stage) {
     exit(2);
 }
 static void require(int condition, const char *stage) {
-    if (!condition) { if (!errno) errno = EINVAL; fail(stage); }
+    if (!condition) fail(stage);
+}
+static void validate(int condition, const char *stage) {
+    if (!condition) { errno = EINVAL; fail(stage); }
 }
 static int fd_result(long result, const char *stage) {
     if (result < 0) fail(stage);
@@ -80,13 +84,15 @@ static void read_exact(int fd, unsigned char *value, size_t size, const char *st
     while (offset < size) {
         ssize_t count = pread(fd, value + offset, size - offset, (off_t)offset);
         if (count < 0 && errno == EINTR) continue;
-        require(count > 0, stage); offset += (size_t)count;
+        require(count >= 0, stage);
+        validate(count > 0, stage); offset += (size_t)count;
     }
 }
 static int open_regular(const char *path, uint64_t expected, uint64_t maximum, const char *stage) {
     int fd = fd_result(open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK), stage);
     struct stat info;
-    require(!fstat(fd, &info) && S_ISREG(info.st_mode) && info.st_size > 0 &&
+    require(!fstat(fd, &info), stage);
+    validate(S_ISREG(info.st_mode) && info.st_size > 0 &&
             (uint64_t)info.st_size <= maximum && (!expected || (uint64_t)info.st_size == expected), stage);
     return fd;
 }
@@ -94,24 +100,25 @@ static uint64_t read_index(const char *path, unsigned char digest[48]) {
     unsigned char index[72];
     int fd = open_regular(path, sizeof(index), sizeof(index), "index-open");
     read_exact(fd, index, sizeof(index), "index-read"); close(fd);
-    require(!memcmp(index, IDX_MAGIC, sizeof(IDX_MAGIC)), "index-magic");
+    validate(!memcmp(index, IDX_MAGIC, sizeof(IDX_MAGIC)), "index-magic");
     uint64_t size = 0;
     for (size_t i = 16; i < 24; i++) size = (size << 8) | index[i];
-    require(size && size <= MAX_BLOB, "index-size");
+    validate(size && size <= MAX_BLOB, "index-size");
     memcpy(digest, index + 24, 48); return size;
 }
 static void hash_fd(int fd, uint64_t size, unsigned char digest[48]) {
     SHA512_CTX context;
     unsigned char buffer[8192];
-    require(SHA384_Init(&context) == 1, "hash-init");
+    validate(SHA384_Init(&context) == 1, "hash-init");
     for (uint64_t offset = 0; offset < size;) {
         size_t want = (size - offset) < sizeof(buffer) ? (size_t)(size - offset) : sizeof(buffer);
         ssize_t count = pread(fd, buffer, want, (off_t)offset);
         if (count < 0 && errno == EINTR) continue;
-        require(count > 0 && SHA384_Update(&context, buffer, (size_t)count) == 1, "hash-read");
+        require(count >= 0, "hash-read");
+        validate(count > 0 && SHA384_Update(&context, buffer, (size_t)count) == 1, "hash-read");
         offset += (size_t)count;
     }
-    require(SHA384_Final(digest, &context) == 1, "hash-final");
+    validate(SHA384_Final(digest, &context) == 1, "hash-final");
     memset(buffer, 0, sizeof(buffer)); memset(&context, 0, sizeof(context));
 }
 static void copy_fd(int input, int output, uint64_t size) {
@@ -120,12 +127,14 @@ static void copy_fd(int input, int output, uint64_t size) {
         size_t want = (size - offset) < sizeof(buffer) ? (size_t)(size - offset) : sizeof(buffer);
         ssize_t count = pread(input, buffer, want, (off_t)offset);
         if (count < 0 && errno == EINTR) continue;
-        require(count > 0, "copy-read");
+        require(count >= 0, "copy-read");
+        validate(count > 0, "copy-read");
         size_t written = 0;
         while (written < (size_t)count) {
             ssize_t n = pwrite(output, buffer + written, (size_t)count - written, (off_t)(offset + written));
             if (n < 0 && errno == EINTR) continue;
-            require(n > 0, "copy-write"); written += (size_t)n;
+            require(n >= 0, "copy-write");
+            validate(n > 0, "copy-write"); written += (size_t)n;
         }
         offset += (size_t)count;
     }
@@ -144,7 +153,7 @@ static void require_filesystems(void) {
         if (!count) break;
         used += (size_t)count;
     }
-    close(fd); require(used < sizeof(value), "filesystem-registry-bound"); value[used] = 0;
+    close(fd); validate(used < sizeof(value), "filesystem-registry-bound"); value[used] = 0;
     /* Exact final fields from the kernel seq-file; avoid module-autoload fallbacks. */
     int ramfs = 0, erofs = 0;
     for (char *line = value; line && *line;) {
@@ -154,7 +163,7 @@ static void require_filesystems(void) {
         if (!strcmp(last, "erofs")) erofs = 1;
         line = end ? end + 1 : NULL;
     }
-    require(ramfs && erofs, "required-built-in-filesystems");
+    validate(ramfs && erofs, "required-built-in-filesystems");
 }
 static int sealed_origin(int source, uint64_t size, const unsigned char expected[48]) {
     int origin = fd_result(syscall(SYS_memfd_create, "proof-tcb-origin",
@@ -163,14 +172,15 @@ static int sealed_origin(int source, uint64_t size, const unsigned char expected
     copy_fd(source, origin, size);
     require(!fcntl(origin, F_ADD_SEALS, SEALS), "origin-seal");
     int seals = fcntl(origin, F_GET_SEALS);
-    require(seals >= 0 && (seals & (SEALS | F_SEAL_EXEC)) == (SEALS | F_SEAL_EXEC), "origin-check-seals");
+    require(seals >= 0, "origin-check-seals");
+    validate((seals & (SEALS | F_SEAL_EXEC)) == (SEALS | F_SEAL_EXEC), "origin-check-seals");
     unsigned char actual[48]; hash_fd(origin, size, actual);
-    require(!memcmp(actual, expected, 48), "origin-hash"); return origin;
+    validate(!memcmp(actual, expected, 48), "origin-hash"); return origin;
 }
 static void readonly_flags(int fd, unsigned long magic, unsigned long flags) {
     struct statfs fs; struct statvfs vfs;
-    require(!fstatfs(fd, &fs) && !fstatvfs(fd, &vfs) &&
-            (unsigned long)fs.f_type == magic && (vfs.f_flag & flags) == flags, "mount-profile");
+    require(!fstatfs(fd, &fs) && !fstatvfs(fd, &vfs), "mount-profile");
+    validate((unsigned long)fs.f_type == magic && (vfs.f_flag & flags) == flags, "mount-profile");
 }
 static int readonly_backing(int origin, uint64_t size, const unsigned char expected[48], int *root_out) {
     int context = fd_result(syscall(SYS_fsopen, "ramfs", FSOPEN_CLOEXEC), "ramfs-open");
@@ -191,10 +201,11 @@ static int readonly_backing(int origin, uint64_t size, const unsigned char expec
     require(!syscall(SYS_mount_setattr, root, "", AT_EMPTY_PATH, &attrs, sizeof(attrs)), "ramfs-attrs");
     readonly_flags(reader, RAMFS_MAGIC_VALUE, ST_RDONLY | ST_NOSUID | ST_NODEV | ST_NOEXEC);
     struct stat info;
-    require(!fstat(reader, &info) && S_ISREG(info.st_mode) && info.st_nlink == 1 &&
+    require(!fstat(reader, &info), "ramfs-file-profile");
+    validate(S_ISREG(info.st_mode) && info.st_nlink == 1 &&
             (uint64_t)info.st_size == size && (info.st_mode & 07777) == 0600, "ramfs-file-profile");
     unsigned char actual[48]; hash_fd(reader, size, actual);
-    require(!memcmp(actual, expected, 48), "ramfs-readback-hash");
+    validate(!memcmp(actual, expected, 48), "ramfs-readback-hash");
     *root_out = root; return reader;
 }
 static int erofs_view(int backing) {
@@ -214,15 +225,17 @@ static int preparation_role(int root) {
         int next = fd_result(openat(fd, parts[i], O_RDONLY | O_NOFOLLOW | O_CLOEXEC |
                             (i < 2 ? O_DIRECTORY : 0)), "role-open");
         close(fd); fd = next;
-        struct stat info; require(!fstat(fd, &info) && info.st_uid == 0 &&
+        struct stat info; require(!fstat(fd, &info), "role-owner");
+        validate(info.st_uid == 0 &&
                     !(info.st_mode & 0022), "role-owner");
     }
     struct stat info; Elf64_Ehdr header;
-    require(!fstat(fd, &info) && S_ISREG(info.st_mode) && info.st_size >= (off_t)sizeof(header) &&
+    require(!fstat(fd, &info), "role-profile");
+    validate(S_ISREG(info.st_mode) && info.st_size >= (off_t)sizeof(header) &&
             (uint64_t)info.st_size <= MAX_ROLE && (info.st_mode & 0111) &&
             !(info.st_mode & 07022), "role-profile");
     read_exact(fd, (unsigned char *)&header, sizeof(header), "role-header");
-    require(!memcmp(header.e_ident, ELFMAG, SELFMAG) && header.e_ident[EI_CLASS] == ELFCLASS64 &&
+    validate(!memcmp(header.e_ident, ELFMAG, SELFMAG) && header.e_ident[EI_CLASS] == ELFCLASS64 &&
             header.e_ident[EI_DATA] == ELFDATA2LSB && header.e_machine == EM_X86_64 &&
             (header.e_type == ET_EXEC || header.e_type == ET_DYN) && header.e_ehsize == sizeof(header) &&
             header.e_phnum && header.e_phnum <= 128 && header.e_phentsize == sizeof(Elf64_Phdr) &&
@@ -230,8 +243,10 @@ static int preparation_role(int root) {
             header.e_phnum * sizeof(Elf64_Phdr) <= (uint64_t)info.st_size - header.e_phoff, "role-elf");
     for (unsigned i = 0; i < header.e_phnum; i++) {
         Elf64_Phdr ph;
-        require(pread(fd, &ph, sizeof(ph), (off_t)(header.e_phoff + i * sizeof(ph))) == (ssize_t)sizeof(ph), "role-phdr");
-        require(!(ph.p_type == PT_GNU_STACK && (ph.p_flags & PF_X)), "role-stack");
+        ssize_t count = pread(fd, &ph, sizeof(ph), (off_t)(header.e_phoff + i * sizeof(ph)));
+        require(count >= 0, "role-phdr");
+        validate(count == (ssize_t)sizeof(ph), "role-phdr");
+        validate(!(ph.p_type == PT_GNU_STACK && (ph.p_flags & PF_X)), "role-stack");
     }
     return fd;
 }
@@ -251,7 +266,7 @@ static void console_profile(void) {
     char actual[sizeof(expected)]; size_t used = 0;
     int fd = fd_result(open("/proc/cmdline", O_RDONLY | O_CLOEXEC | O_NOFOLLOW), "console-profile-open");
     for (;;) {
-        require(used < sizeof(actual), "console-profile-bound");
+        validate(used < sizeof(actual), "console-profile-bound");
         ssize_t count = read(fd, actual + used, sizeof(actual) - used);
         if (count < 0 && errno == EINTR) continue;
         require(count >= 0, "console-profile-read");
@@ -259,17 +274,59 @@ static void console_profile(void) {
         used += (size_t)count;
     }
     close(fd);
-    require(used == sizeof(expected) - 1 && !memcmp(actual, expected, used), "console-profile-command-line");
+    validate(used == sizeof(expected) - 1 && !memcmp(actual, expected, used), "console-profile-command-line");
     fd = open("/proc/sys/kernel/printk", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd >= 0) { close(fd); errno = EINVAL; fail("console-profile-mutable"); }
     require(errno == ENOENT, "console-profile-sysctl");
 }
-static void alarm_signal(int value) { (void)value; expired = 1; }
+/* Sample the child without ever entering a blocking wait. Absolute sleeps
+ * keep the same deadline across interruptions and scheduler delays. */
+static int wait_child(pid_t child, int *status, int timeout_seconds) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return errno;
+    const struct timespec deadline = { now.tv_sec + timeout_seconds, now.tv_nsec };
+    for (;;) {
+        pid_t result = waitpid(child, status, WNOHANG);
+        if (result == child) return 0;
+        if (result < 0 && errno != EINTR) return errno;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return errno;
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) return ETIMEDOUT;
+
+        struct timespec next = now;
+        next.tv_nsec += 100000000L; /* Poll at most every 100 ms. */
+        if (next.tv_nsec >= 1000000000L) {
+            next.tv_sec++;
+            next.tv_nsec -= 1000000000L;
+        }
+        if (next.tv_sec > deadline.tv_sec ||
+            (next.tv_sec == deadline.tv_sec && next.tv_nsec > deadline.tv_nsec)) next = deadline;
+        int error = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+        if (error && error != EINTR) return error;
+    }
+}
+static void supervise_child(pid_t child) {
+    int status;
+    int error = wait_child(child, &status, ROLE_WATCHDOG_SECONDS);
+    if (error) {
+        int kill_error = 0, reap_error = 0;
+        if (error != ECHILD) {
+            if (kill(child, SIGKILL) < 0) kill_error = errno;
+            reap_error = wait_child(child, &status, 5);
+        }
+        event("ROLE_TIMEOUT_OR_WAIT_ERROR", "wait", error);
+        if (kill_error || reap_error)
+            dprintf(2, "role cleanup: kill errno=%d, reap errno=%d\n", kill_error, reap_error);
+        poweroff();
+    }
+    event(WIFEXITED(status) && WEXITSTATUS(status) == 0 ? "ROLE_EXITED_ZERO" : "ROLE_FAILED", "after-child", 0);
+}
 static _Noreturn void boot(void) {
     clearenv(); umask(077);
     int console = fd_result(open("/dev/console", O_RDWR | O_NOFOLLOW | O_CLOEXEC), "console-open");
     struct stat console_info;
-    require(!fstat(console, &console_info) && S_ISCHR(console_info.st_mode) &&
+    require(!fstat(console, &console_info), "console-profile");
+    validate(S_ISCHR(console_info.st_mode) &&
             major(console_info.st_rdev) == 5 && minor(console_info.st_rdev) == 1, "console-profile");
     for (int fd = 0; fd < 3; fd++) require(dup2(console, fd) == fd && !fcntl(fd, F_SETFD, 0), "console-dup");
     if (console > 2) close(console);
@@ -279,7 +336,9 @@ static _Noreturn void boot(void) {
     require(!mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, "hidepid=2"), "private-proc");
     console_profile();
     require_filesystems();
-    require(prctl(PR_CAPBSET_READ, CAP_LAST_CAP + 1, 0, 0, 0) == -1 && errno == EINVAL, "known-capability-abi");
+    int capability = prctl(PR_CAPBSET_READ, CAP_LAST_CAP + 1, 0, 0, 0);
+    if (capability < 0 && errno != EINVAL) fail("known-capability-abi");
+    validate(capability == -1, "known-capability-abi");
     unsigned char expected[48]; uint64_t size = read_index("/boot/tcb-index.bin", expected);
     int source = open_regular("/boot/tcb.erofs", size, MAX_BLOB, "blob-open");
     int origin = sealed_origin(source, size, expected); close(source);
@@ -298,6 +357,12 @@ static _Noreturn void boot(void) {
     require(!mount("devtmpfs", "/view/dev", "devtmpfs", MS_NOSUID | MS_NOEXEC, "mode=0755"), "role-dev");
     require(!mount("configfs", "/view/sys/kernel/config", "configfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL), "role-tsm");
     event("IMMUTABLE_VIEW_ESTABLISHED", "before-role", 0);
+    /* Round down before fork so the role's cleanup cutoff precedes PID 1's wait. */
+    struct timespec start;
+    require(!clock_gettime(CLOCK_MONOTONIC, &start), "role-watchdog-clock");
+    char watchdog[80];
+    snprintf(watchdog, sizeof(watchdog), "ONB17_WATCHDOG_DEADLINE=%lld",
+             (long long)start.tv_sec + ROLE_WATCHDOG_SECONDS);
     pid_t child = fork(); require(child >= 0, "fork");
     if (!child) {
         pid1 = 0;
@@ -312,28 +377,17 @@ static _Noreturn void boot(void) {
             (1ULL << CAP_SYS_PTRACE) | (1ULL << CAP_SYS_ADMIN);
         capabilities(keep);
         require(!prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), "role-nnp");
-        require(!prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) && getppid() == 1, "role-parent");
+        require(!prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0), "role-parent");
+        validate(getppid() == 1, "role-parent");
         require(!syscall(SYS_close_range, 3U, UINT_MAX, CLOSE_RANGE_CLOEXEC), "role-fds");
         char *args[] = { "/onb17/bin/gcp-proof-preparation", NULL };
-        char *env[] = { "LC_ALL=C", "TMPDIR=/run/onb17/tmp", NULL };
+        char *env[] = { "LC_ALL=C", "TMPDIR=/run/onb17/tmp", watchdog, NULL };
         syscall(SYS_execveat, executable, "", args, env, AT_EMPTY_PATH); fail("child-execveat");
     }
     /* Parent retains private owners, but no remount/ptrace/device authority. */
     capabilities(1ULL << CAP_SYS_BOOT);
     require(!prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), "parent-nnp");
-    struct sigaction action = { .sa_handler = alarm_signal };
-    sigemptyset(&action.sa_mask); require(!sigaction(SIGALRM, &action, NULL), "watchdog"); alarm(900);
-    int status = 0;
-    for (;;) {
-        pid_t result = waitpid(child, &status, 0);
-        if (result == child) break;
-        if (result < 0 && errno == EINTR && !expired) continue;
-        kill(child, SIGKILL);
-        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-        event("ROLE_TIMEOUT_OR_WAIT_ERROR", "wait", errno); poweroff();
-    }
-    alarm(0);
-    event(WIFEXITED(status) && WEXITSTATUS(status) == 0 ? "ROLE_EXITED_ZERO" : "ROLE_FAILED", "after-child", 0);
+    supervise_child(child);
     close(executable); close(root); close(backing); close(ram_root); close(origin);
     poweroff();
 }
@@ -345,6 +399,6 @@ int main(int argc, char **argv) {
     unsigned char expected[48], actual[48]; uint64_t size = read_index(argv[2], expected);
     int source = open_regular(argv[3], size, MAX_BLOB, "inspect-blob");
     hash_fd(source, size, actual); close(source);
-    require(!memcmp(actual, expected, 48), "inspect-hash");
+    validate(!memcmp(actual, expected, 48), "inspect-hash");
     event("BLOB_BYTES_MATCH_INSPECTION_ONLY", "inspect-no-mount", 0); return 0;
 }
