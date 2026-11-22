@@ -346,3 +346,35 @@ fn hosted_preparation_checks_actual_self_identity_and_bounds_before_spawning() {
         Err(StartupError::InvalidExecutable)
     ));
 }
+
+#[test]
+fn explicit_cleanup_preserves_primary_and_reports_missing_child() {
+    let child = std::process::Command::new("/bin/true").spawn().unwrap();
+    let pid = child.id() as libc::pid_t;
+    let mut slot = ChildSlot::new(child);
+    // Simulate another waiter taking the child's terminal status.
+    assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) }, pid);
+    assert_eq!(
+        slot.stop_after_error(StartupError::Deadline),
+        StartupError::Cleanup {
+            primary: Box::new(StartupError::Deadline),
+            cleanup: ChildCleanupError {
+                kill_errno: None,
+                wait_errno: Some(libc::ECHILD)
+            },
+        }
+    );
+}
+
+#[test]
+fn parent_mismatch_reports_esrch_even_with_stale_errno() {
+    let parent = unsafe { libc::getppid() };
+    assert!(check_parent(parent).is_ok());
+    unsafe {
+        *libc::__errno_location() = libc::EINVAL;
+    }
+    assert_eq!(
+        check_parent(-1).unwrap_err().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}

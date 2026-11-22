@@ -65,6 +65,8 @@ impl ReceivedPacket {
 /// cancellation policy. A protocol or syscall failure closes this endpoint and
 /// discards its queued descriptors; subsequent operations fail. `WouldBlock`
 /// leaves a complete packet unsent, so the caller retains its borrowed source FD.
+/// An interrupted syscall returns the same pending outcome. The caller retries
+/// under its original deadline, including when signals arrive repeatedly.
 pub struct PrivateFdChannel {
     descriptor: Option<OwnedFd>,
 }
@@ -152,7 +154,10 @@ impl PrivateFdChannel {
             unsafe { libc::sendmsg(socket, &message, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
         if sent < 0 {
             let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::WouldBlock {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
                 return Ok(SendOutcome::WouldBlock);
             }
             return self.fail(io_error(error));
@@ -191,7 +196,10 @@ impl PrivateFdChannel {
         };
         if received < 0 {
             let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::WouldBlock {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
                 return Ok(None);
             }
             return self.fail(io_error(error));

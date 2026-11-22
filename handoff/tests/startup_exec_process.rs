@@ -219,6 +219,12 @@ fn concurrent_spawn_errors_are_preserved() {
 }
 fn main() {
     let arguments: Vec<_> = std::env::args().collect();
+    if arguments.get(1).map(String::as_str) == Some("--startup-no-hello") {
+        std::fs::write(&arguments[2], std::process::id().to_string()).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
     if let Some(mode) = arguments.get(1) {
         std::process::exit(if child(mode).is_ok() { 0 } else { 1 });
     }
@@ -282,6 +288,32 @@ fn main() {
         Duration::from_secs(4),
     )
     .is_err());
+    let directory = std::env::temp_dir().join(format!("startup-no-hello-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let marker = directory.join("started");
+    let pinned =
+        PinnedRoleExecutable::new(File::open("/proc/self/exe").unwrap(), hash, 128 << 20).unwrap();
+    let silent = RoleCommand::new(
+        pinned,
+        vec!["--startup-no-hello".into(), marker.clone().into()],
+    )
+    .unwrap();
+    assert!(matches!(
+        launch_kata_role(silent, hash, 128 << 20, BOOT, Duration::from_secs(2)),
+        Err(StartupError::Deadline)
+    ));
+    let pid = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    assert_eq!(
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    assert_eq!(descriptors(), before);
+    std::fs::remove_file(marker).unwrap();
+    std::fs::remove_dir(directory).unwrap();
     let wrong =
         PinnedRoleExecutable::new(File::open("/proc/self/exe").unwrap(), [0; 48], 128 << 20);
     assert!(matches!(wrong, Err(StartupError::ArtifactMismatch)));

@@ -60,8 +60,7 @@ fn readiness_child(action: &str) -> (ManagementRelayOwner, File, libc::pid_t) {
     drop(writer);
     (
         ManagementRelayOwner {
-            child,
-            stopped: false,
+            child: ChildSlot::new(child),
             _launch_thread: std::marker::PhantomData,
         },
         reader,
@@ -143,6 +142,12 @@ fn publication_control_domain_reserved_bits_and_descriptor_bounds_are_closed() {
             kind
         );
     }
+    for class in REPORT_CLEANUP_CLASSES {
+        let kind = PublicationKind::ReportCleanup(ReportCleanupCode::from_class(class).unwrap());
+        let wire = Publication::control(kind).unwrap().encode().unwrap();
+        assert_eq!(Publication::decode(&wire).unwrap().kind, kind);
+    }
+    assert!(ReportCleanupCode::from_class("unknown").is_err());
     let frame = Publication::control(PublicationKind::Ready)
         .unwrap()
         .encode()
@@ -175,4 +180,112 @@ fn file_hash_covers_multiple_chunks_and_requires_exact_size() {
 fn ordinary_host_root_cannot_supply_a_trusted_role_view() {
     assert!(load_embedded(Role::Kata).is_err());
     assert!(load_embedded(Role::Preparation).is_err());
+}
+
+#[test]
+#[ignore = "launched by launcher_transfers_capsule_ownership_across_exec"]
+fn valid_capsule_child() {
+    check_capsule_child(true);
+}
+
+#[test]
+#[ignore = "launched by launcher_transfers_capsule_ownership_across_exec"]
+fn invalid_capsule_child() {
+    check_capsule_child(false);
+}
+
+fn check_capsule_child(valid: bool) {
+    let raw: i32 = std::env::var("ONB17_GCP_CAPSULE_FD")
+        .unwrap()
+        .parse()
+        .unwrap();
+    // SAFETY: the parent fixture uses the production launcher's distinct
+    // inherited descriptors and this child takes the capsule exactly once.
+    let file = unsafe { take_inherited_capsule() }.unwrap();
+    assert_eq!(file.as_raw_fd(), raw);
+    assert_ne!(
+        unsafe { libc::fcntl(raw, libc::F_GETFD) } & libc::FD_CLOEXEC,
+        0
+    );
+    let original = file.metadata().unwrap();
+    if valid {
+        assert_eq!(decode_capsule(file).unwrap().effective_spec, b"{}");
+    } else {
+        assert!(load_capsule(Role::Kata, file).is_err());
+    }
+    assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EBADF)
+    );
+    assert!(!std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+        .any(|meta| meta.dev() == original.dev() && meta.ino() == original.ino()));
+}
+
+#[test]
+fn launcher_transfers_capsule_ownership_across_exec() {
+    use crate::startup::{launch_roles, PinnedRoleExecutable, RoleCommand};
+    let capsule = GcpRoleCapsuleV1 {
+        version: 1,
+        purpose: execution_proof_contract::gcp_startup::CAPSULE_PURPOSE.into(),
+        signed_manifest: vec![1],
+        signed_references: vec![2],
+        signed_grant: vec![3],
+        signed_aggregate: vec![4],
+        signed_plan: vec![5],
+        effective_spec: b"{}".to_vec(),
+    }
+    .encode()
+    .unwrap();
+    let executable = File::open("/proc/self/exe").unwrap();
+    let size = executable.metadata().unwrap().len();
+    let digest = raw48(&file_hash(&executable, size).unwrap()).unwrap();
+    let command = |bytes: &[u8], valid| {
+        let pin = PinnedRoleExecutable::new(executable.try_clone().unwrap(), digest, size).unwrap();
+        let name = if valid {
+            "valid_capsule_child"
+        } else {
+            "invalid_capsule_child"
+        };
+        let args = vec![
+            "--ignored".into(),
+            "--exact".into(),
+            format!("gcp_startup::tests::{name}").into(),
+        ];
+        RoleCommand::new(pin, args)
+            .unwrap()
+            .with_gcp_capsule(bytes)
+            .unwrap()
+    };
+    let mut roles = launch_roles(command(&capsule, true), command(b"{", false), [7; 48]).unwrap();
+    roles.wait(std::time::Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+#[ignore = "run inside the native EROFS loader fixture"]
+fn native_erofs_role_loads_only_the_bound_capsule() {
+    let root_case = std::env::var("CAPSULE_ROOT_CASE").unwrap();
+    if root_case != "valid" {
+        assert!(matches!(root_case.as_str(), "leaf" | "extra"));
+        assert!(load_embedded(Role::Kata).is_err());
+        return;
+    }
+    load_embedded(Role::Kata).unwrap();
+    // Same verified inventory, but this executable is the Kata leaf.
+    assert!(load_embedded(Role::Preparation).is_err());
+    for case in ["valid", "spec", "resource", "workflow"] {
+        let bytes = std::fs::read(format!("/run/{case}.json")).unwrap();
+        let fd = sealed_public_file(&bytes, MAX_CAPSULE_BYTES).unwrap();
+        let loaded = load_capsule(Role::Kata, fd);
+        if case == "valid" {
+            let role = loaded.unwrap();
+            assert_eq!(role.plan().container_id, "fixture");
+            assert_eq!(role.capsule().effective_spec, br#"{"fixture":"capsule"}"#);
+        } else {
+            assert!(loaded.is_err(), "{case}");
+        }
+    }
 }

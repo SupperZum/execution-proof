@@ -1,7 +1,7 @@
 //! Fixed-path, immutable-view readback for the GCP role entrypoints. This
 //! authenticates local bytes and authority statements. It does not prove that
 //! firmware booted this view; independent hardware qualification remains required.
-use crate::startup::{ExpectedStartup, Role};
+use crate::startup::{ChildCleanupError, ChildSlot, ExpectedStartup, Role};
 use execution_proof_contract::{
     gcp_artifact::{
         self, ArtifactVerificationExpectations, AuthenticatedArtifacts, BootArtifactManifestV1,
@@ -125,9 +125,24 @@ impl LoadedRole {
     }
 }
 
-/// The environment supplies only a descriptor location hint. It cannot select
-/// roots, paths, accepted role bytes, policy, B, or a successful gate result.
-pub fn load(role: Role) -> Result<LoadedRole> {
+/// Authenticate the role using the sealed public capsule handed off across exec.
+///
+/// # Safety
+/// Call once, at entry to the role started by the trusted launcher. The
+/// canonical location in ONB17_GCP_CAPSULE_FD must identify a live, exclusively
+/// transferred descriptor, distinct from the startup channel and ticket. No
+/// other code may own, close or reassign that descriptor before this call.
+pub unsafe fn load(role: Role) -> Result<LoadedRole> {
+    // SAFETY: the role entrypoint transfers the descriptor under the contract above.
+    load_capsule(role, unsafe { take_inherited_capsule() }?)
+}
+
+unsafe fn take_inherited_capsule() -> Result<File> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    if TAKEN.swap(true, Ordering::AcqRel) {
+        return Err(StartupRejected);
+    }
     let hint = std::env::var("ONB17_GCP_CAPSULE_FD").map_err(|_| StartupRejected)?;
     if hint.is_empty()
         || hint.len() > 10
@@ -137,33 +152,28 @@ pub fn load(role: Role) -> Result<LoadedRole> {
         return Err(StartupRejected);
     }
     let fd: i32 = hint.parse().map_err(|_| StartupRejected)?;
-    if fd < 128 {
+    if fd < crate::startup::MIN_INHERITED_FD {
         return Err(StartupRejected);
     }
-    let alias = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 128) };
-    if alias < 0 {
-        return Err(StartupRejected);
-    }
-    let file = unsafe { File::from_raw_fd(alias) };
-    let loaded = load_capsule(role, file)?;
-    // The launcher clears CLOEXEC so the capsule reaches this role.
-    // Restore it after validating the capsule to confine the inherited alias.
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-        return Err(StartupRejected);
-    }
-    Ok(loaded)
+    // SAFETY: the caller owns the inherited descriptor under the contract above.
+    let fd = reject(unsafe { crate::startup::take_inherited(fd) })?;
+    Ok(fd.into())
 }
+
+fn decode_capsule(file: File) -> Result<GcpRoleCapsuleV1> {
+    let bytes = read_sealed_public(&file, MAX_CAPSULE_BYTES)?;
+    drop(file);
+    reject(GcpRoleCapsuleV1::decode(&bytes))
+}
+
 pub fn load_capsule(role: Role, capsule_file: File) -> Result<LoadedRole> {
-    let capsule = reject(GcpRoleCapsuleV1::decode(&read_sealed_public(
-        &capsule_file,
-        MAX_CAPSULE_BYTES,
-    )?))?;
+    let capsule = decode_capsule(capsule_file)?;
     let EmbeddedRole {
         config,
         core: _,
         c,
         d,
-        mut files,
+        files,
         expected: expected_startup,
         sandbox_gateway,
     } = load_embedded(role)?;
@@ -174,7 +184,6 @@ pub fn load_capsule(role: Role, capsule_file: File) -> Result<LoadedRole> {
         &capsule.signed_manifest,
         &capsule.signed_references,
     )?;
-    files.push(capsule_file);
     let grant_expect = GrantExpectations {
         authority_public_key: config.roots.authority_public_key,
         audience: config.grant_audience.clone(),
@@ -409,7 +418,7 @@ fn readonly_erofs(file: &File) -> Result<()> {
 }
 fn verify_inventory(core: &ProducerCoreV1) -> Result<()> {
     fn visit(path: &str, depth: usize, count: &mut usize, core: &ProducerCoreV1) -> Result<()> {
-        if depth > 16 || *count > 256 {
+        if depth > gcp_artifact::MAX_BOOT_DIRECTORY_DEPTH || *count > 256 {
             return Err(StartupRejected);
         }
         for e in reject(std::fs::read_dir(path))? {
@@ -546,20 +555,21 @@ pub fn sealed_public_file(bytes: &[u8], max: usize) -> Result<File> {
     Ok(file)
 }
 pub fn read_sealed_public(file: &File, max: usize) -> Result<Vec<u8>> {
-    let meta = reject(file.metadata())?;
     let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
     let required = libc::F_SEAL_WRITE
         | libc::F_SEAL_GROW
         | libc::F_SEAL_SHRINK
         | libc::F_SEAL_SEAL
         | libc::F_SEAL_EXEC;
+    if seals < 0 || seals & required != required {
+        return Err(StartupRejected);
+    }
+    let meta = reject(file.metadata())?;
     let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
     if !meta.is_file()
         || meta.mode() & 0o111 != 0
         || meta.len() == 0
         || meta.len() > max as u64
-        || seals < 0
-        || seals & required != required
         || flags < 0
         || flags & libc::O_ACCMODE != libc::O_RDONLY
     {
@@ -573,25 +583,15 @@ pub fn read_sealed_public(file: &File, max: usize) -> Result<Vec<u8>> {
 /// Owns the unprivileged transport process on its launching thread. Its private
 /// TLS key serves management only; it is never a proof/attestation signing key.
 pub struct ManagementRelayOwner {
-    child: std::process::Child,
-    stopped: bool,
+    child: ChildSlot,
     _launch_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl ManagementRelayOwner {
-    pub fn stop_and_wait(&mut self) -> Result<()> {
-        if !self.stopped {
-            if reject(self.child.try_wait())?.is_none() {
-                // The child can exit between try_wait and kill. Always wait
-                // even if kill reports that race; cleanup must still reap it.
-                let _ = self.child.kill();
-                reject(self.child.wait())?;
-            }
-            self.stopped = true;
-        }
-        Ok(())
+    pub fn stop_and_wait(&mut self) -> std::result::Result<(), ChildCleanupError> {
+        self.child.stop()
     }
     pub fn is_running(&mut self) -> Result<bool> {
-        Ok(!self.stopped && reject(self.child.try_wait())?.is_none())
+        Ok(!reject(self.child.reap())?)
     }
 }
 impl Drop for ManagementRelayOwner {
@@ -795,11 +795,10 @@ pub fn launch_management_relay(
                 ) != 0
                 || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
                 || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
-                || libc::getppid() != parent
             {
                 return Err(fail());
             }
-            Ok(())
+            crate::startup::check_parent(parent)
         });
     }
     let child = reject(command.spawn())?;
@@ -807,11 +806,35 @@ pub fn launch_management_relay(
     // gives EOF. No inherited channel or TLS credential is used as readiness.
     drop(ready_writer);
     let owner = ManagementRelayOwner {
-        child,
-        stopped: false,
+        child: ChildSlot::new(child),
         _launch_thread: std::marker::PhantomData,
     };
     finish_management_startup(owner, ready_reader, std::time::Duration::from_secs(10))
+}
+
+// Tags 1 through 4 are the original control/export messages. Each additional
+// terminal reason is closed and carries neither an FD nor arbitrary text.
+const REPORT_CLEANUP_CLASSES: [&str; 5] = [
+    "report_cleanup_failed",
+    "attester_unavailable_report_cleanup_failed",
+    "binding_mismatch_report_cleanup_failed",
+    "invalid_evidence_report_cleanup_failed",
+    "too_large_report_cleanup_failed",
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReportCleanupCode(u8);
+impl ReportCleanupCode {
+    pub fn from_class(class: &str) -> Result<Self> {
+        REPORT_CLEANUP_CLASSES
+            .iter()
+            .position(|&known| known == class)
+            .map(|index| Self(index as u8))
+            .ok_or(StartupRejected)
+    }
+    pub fn class(self) -> &'static str {
+        REPORT_CLEANUP_CLASSES[self.0 as usize]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -820,6 +843,7 @@ pub enum PublicationKind {
     Export,
     Unproven,
     Stop,
+    ReportCleanup(ReportCleanupCode),
 }
 pub struct Publication {
     pub kind: PublicationKind,
@@ -858,6 +882,7 @@ impl Publication {
             PublicationKind::Export => 2,
             PublicationKind::Unproven => 3,
             PublicationKind::Stop => 4,
+            PublicationKind::ReportCleanup(code) => 5 + code.0,
         };
         b[16..24].copy_from_slice(&self.length.to_be_bytes());
         b[24..].copy_from_slice(&self.sha384);
@@ -872,6 +897,9 @@ impl Publication {
             2 => PublicationKind::Export,
             3 => PublicationKind::Unproven,
             4 => PublicationKind::Stop,
+            tag if tag >= 5 && usize::from(tag - 5) < REPORT_CLEANUP_CLASSES.len() => {
+                PublicationKind::ReportCleanup(ReportCleanupCode(tag - 5))
+            }
             _ => return Err(StartupRejected),
         };
         let p = Self {

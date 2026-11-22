@@ -34,7 +34,7 @@ use std::{
 };
 
 const INHERITED_FDS_ENV: &str = "ONB17_STARTUP_FDS";
-const MIN_INHERITED_FD: i32 = 128;
+pub(crate) const MIN_INHERITED_FD: i32 = 128;
 const WIRE_BYTES: usize = 192;
 const CONTENT_SEALS: i32 = libc::F_SEAL_WRITE
     | libc::F_SEAL_GROW
@@ -72,6 +72,12 @@ pub struct ExpectedStartup {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChildCleanupError {
+    pub kill_errno: Option<i32>,
+    pub wait_errno: Option<i32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StartupError {
     InvalidLimit,
     InvalidExecutable,
@@ -86,6 +92,10 @@ pub enum StartupError {
     EntropyUnavailable,
     Deadline,
     ChildFailure,
+    Cleanup {
+        primary: Box<StartupError>,
+        cleanup: ChildCleanupError,
+    },
     SignalPolicy,
     Kernel(i32),
     Transport(TransportError),
@@ -336,8 +346,9 @@ impl StartupBoundChannel {
         }
         let hint = std::env::var_os(INHERITED_FDS_ENV).ok_or(StartupError::MissingInherited)?;
         let (channel_raw, ticket_raw) = inherited_locations(hint.as_bytes())?;
-        let endpoint = take_inherited(channel_raw)?;
-        let ticket = take_inherited(ticket_raw)?;
+        // SAFETY: accept_inherited's caller transfers both distinct descriptors.
+        let endpoint = unsafe { take_inherited(channel_raw) }?;
+        let ticket = unsafe { take_inherited(ticket_raw) }?;
         Self::accept_descriptors(endpoint, ticket, expected, timeout)
     }
     fn accept_descriptors(
@@ -474,15 +485,13 @@ pub fn launch_roles(
     })?;
     let first = spawn_role(preparation, preparation_endpoint, preparation_ticket)?;
     let mut children = LaunchedRoles {
-        preparation: ChildSlot {
-            child: first,
-            status: None,
-        },
+        preparation: ChildSlot::new(first),
         kata: None,
         _launch_thread: PhantomData,
     };
     children.kata = Some(ChildSlot {
-        child: spawn_role(kata, kata_endpoint, kata_ticket)?,
+        child: spawn_role(kata, kata_endpoint, kata_ticket)
+            .map_err(|primary| children.preparation.stop_after_error(primary))?,
         status: None,
     });
     Ok(children)
@@ -532,33 +541,33 @@ pub fn launch_kata_role(
     let preparation_ticket = make_ticket(&preparation_bootstrap)?;
     let kata_ticket = make_ticket(&kata_bootstrap)?;
     let child = spawn_role(kata, kata_endpoint, kata_ticket)?;
-    let owner = LaunchedRole {
-        child: ChildSlot {
-            child,
-            status: None,
-        },
+    let mut owner = LaunchedRole {
+        child: ChildSlot::new(child),
         _launch_thread: PhantomData,
     };
-    let remaining = startup_deadline
-        .checked_duration_since(Instant::now())
-        .ok_or(StartupError::Deadline)?;
-    let channel = StartupBoundChannel::accept_descriptors(
-        preparation_endpoint
-            .into_startup_fd()
-            .map_err(StartupError::Transport)?,
-        preparation_ticket.into(),
-        ExpectedStartup {
-            role: Role::Preparation,
-            boot_config_sha384,
-            own_executable_sha384: expected_preparation_sha384,
-            peer_executable_sha384: kata_bootstrap.kata,
-        },
-        remaining,
-    )?;
+    let channel = (|| {
+        let remaining = startup_deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(StartupError::Deadline)?;
+        StartupBoundChannel::accept_descriptors(
+            preparation_endpoint
+                .into_startup_fd()
+                .map_err(StartupError::Transport)?,
+            preparation_ticket.into(),
+            ExpectedStartup {
+                role: Role::Preparation,
+                boot_config_sha384,
+                own_executable_sha384: expected_preparation_sha384,
+                peer_executable_sha384: kata_bootstrap.kata,
+            },
+            remaining,
+        )
+    })()
+    .map_err(|primary| owner.child.stop_after_error(primary))?;
     Ok((channel, owner))
 }
 
-struct ChildSlot {
+pub(crate) struct ChildSlot {
     child: Child,
     status: Option<ExitStatus>,
 }
@@ -576,7 +585,7 @@ impl LaunchedRole {
     pub fn wait(&mut self, timeout: Duration) -> Result<(), StartupError> {
         let deadline = deadline(timeout)?;
         loop {
-            if self.child.reap()? {
+            if self.child.reap().map_err(io_error)? {
                 return if self.child.status.is_some_and(|status| status.success()) {
                     Ok(())
                 } else {
@@ -587,26 +596,63 @@ impl LaunchedRole {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    pub fn terminate_and_wait(&mut self) {
-        self.child.stop();
+    pub fn terminate_and_wait(&mut self) -> Result<(), ChildCleanupError> {
+        self.child.stop()
     }
 }
 impl Drop for LaunchedRole {
     fn drop(&mut self) {
-        self.terminate_and_wait();
+        let _ = self.terminate_and_wait();
     }
 }
 impl ChildSlot {
-    fn reap(&mut self) -> Result<bool, StartupError> {
+    pub(crate) fn new(child: Child) -> Self {
+        Self {
+            child,
+            status: None,
+        }
+    }
+
+    pub(crate) fn reap(&mut self) -> io::Result<bool> {
         if self.status.is_none() {
-            self.status = self.child.try_wait().map_err(io_error)?;
+            self.status = self.child.try_wait()?;
         }
         Ok(self.status.is_some())
     }
-    fn stop(&mut self) {
-        if self.status.is_none() {
-            let _ = self.child.kill();
-            self.status = self.child.wait().ok();
+    pub(crate) fn stop(&mut self) -> Result<(), ChildCleanupError> {
+        let errno = |error: io::Error| error.raw_os_error().unwrap_or(libc::EIO);
+        // Recheck ownership before signalling, including on a Drop retry.
+        if self.reap().map_err(|error| ChildCleanupError {
+            kill_errno: None,
+            wait_errno: Some(errno(error)),
+        })? {
+            return Ok(());
+        }
+        let kill_errno = self.child.kill().err().map(errno);
+        let wait_errno = match self.child.wait() {
+            Ok(status) => {
+                self.status = Some(status);
+                None
+            }
+            Err(error) => Some(errno(error)),
+        };
+        if kill_errno.is_none() && wait_errno.is_none() {
+            Ok(())
+        } else {
+            Err(ChildCleanupError {
+                kill_errno,
+                wait_errno,
+            })
+        }
+    }
+
+    fn stop_after_error(&mut self, primary: StartupError) -> StartupError {
+        match self.stop() {
+            Ok(()) => primary,
+            Err(cleanup) => StartupError::Cleanup {
+                primary: Box::new(primary),
+                cleanup,
+            },
         }
     }
 }
@@ -629,12 +675,13 @@ impl LaunchedRoles {
     pub fn wait(&mut self, timeout: Duration) -> Result<(), StartupError> {
         let deadline = deadline(timeout)?;
         loop {
-            let first = self.preparation.reap()?;
+            let first = self.preparation.reap().map_err(io_error)?;
             let second = self
                 .kata
                 .as_mut()
                 .ok_or(StartupError::ChildFailure)?
-                .reap()?;
+                .reap()
+                .map_err(io_error)?;
             if first && second {
                 return if self.preparation.status.is_some_and(|s| s.success())
                     && self
@@ -652,17 +699,25 @@ impl LaunchedRoles {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    pub fn terminate_and_wait(&mut self) {
-        self.preparation.stop();
-        if let Some(kata) = &mut self.kata {
-            kata.stop();
-        }
+    pub fn terminate_and_wait(
+        &mut self,
+    ) -> (Result<(), ChildCleanupError>, Result<(), ChildCleanupError>) {
+        let preparation = self.preparation.stop();
+        let kata = self.kata.as_mut().map_or(Ok(()), ChildSlot::stop);
+        (preparation, kata)
     }
 }
 impl Drop for LaunchedRoles {
     fn drop(&mut self) {
-        self.terminate_and_wait();
+        let _ = self.terminate_and_wait();
     }
+}
+
+pub(crate) fn check_parent(expected: libc::pid_t) -> io::Result<()> {
+    if unsafe { libc::getppid() } != expected {
+        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    Ok(())
 }
 
 fn spawn_role(
@@ -713,9 +768,7 @@ fn spawn_role(
             }
             // If the launcher died before PR_SET_PDEATHSIG was installed, the
             // kernel has already reparented us. Never exec an orphan role.
-            if libc::getppid() != expected_parent {
-                return Err(io::Error::from_raw_os_error(libc::ESRCH));
-            }
+            check_parent(expected_parent)?;
             if libc::syscall(
                 libc::SYS_close_range,
                 3u32,
@@ -790,12 +843,13 @@ fn inherited_locations(hint: &[u8]) -> Result<(i32, i32), StartupError> {
     }
     Ok((channel, ticket))
 }
-fn take_inherited(raw: i32) -> Result<OwnedFd, StartupError> {
+/// # Safety
+/// The caller owns the inherited descriptor exclusively from exec.
+pub(crate) unsafe fn take_inherited(raw: i32) -> Result<OwnedFd, StartupError> {
     if unsafe { libc::fcntl(raw, libc::F_GETFD) } < 0 {
         return Err(StartupError::MissingInherited);
     }
-    // SAFETY: accept_inherited's caller guarantees exclusive ownership of the
-    // hinted descriptor. Validation above rejects absent descriptors.
+    // SAFETY: the entrypoint owns this live descriptor exclusively from exec.
     let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
     if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
         return Err(last_error());
