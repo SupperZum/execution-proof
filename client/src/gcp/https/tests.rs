@@ -99,7 +99,10 @@ struct Server {
     worker: Option<JoinHandle<Option<Vec<u8>>>>,
 }
 impl Server {
-    fn start(f: &Fixture, redirect: bool) -> Self {
+    fn start(f: &Fixture, status: u16) -> Self {
+        Self::serve(f, status, None)
+    }
+    fn serve(f: &Fixture, status: u16, chunked: Option<usize>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -143,11 +146,19 @@ impl Server {
                         break;
                     }
                 }
-                let response = if redirect {
-                    b"HTTP/1.1 302 Found\r\nLocation: https://foreign.test/credential\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
-                } else {
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted"
-                        .as_slice()
+                if let Some(size) = chunked {
+                    write!(stream, "HTTP/1.1 {status} OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{size:x}\r\n").ok()?;
+                    stream.write_all(&vec![0; size]).ok()?;
+                    let _ = stream.write_all(b"\r\n0\r\n\r\n");
+                    return Some(request);
+                }
+                let response = match status {
+                    302 =>
+                    b"HTTP/1.1 302 Found\r\nLocation: https://foreign.test/credential\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+                    503 => b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+                    200 => b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted"
+                        .as_slice(),
+                    _ => unreachable!(),
                 };
                 stream.write_all(response).ok()?;
                 return Some(request);
@@ -181,7 +192,7 @@ fn runtime() -> tokio::runtime::Runtime {
 #[test]
 fn selected_ca_and_fixed_dns_reach_only_the_selected_tls_origin() {
     let f = fixture();
-    let server = Server::start(&f, false);
+    let server = Server::start(&f, 200);
     let origin = format!("https://kbs.test:{}", server.address.port());
     let transport =
         GcpHttpsTransport::with_trusted_roots(&origin, &f.roots, &[server.address]).unwrap();
@@ -199,7 +210,7 @@ fn unselected_ca_and_wrong_san_cannot_deliver_http_request() {
     for wrong_ca in [false, true] {
         let f = fixture();
         let foreign = fixture();
-        let server = Server::start(&f, false);
+        let server = Server::start(&f, 200);
         let origin = format!(
             "https://{}:{}",
             if wrong_ca { "kbs.test" } else { "foreign.test" },
@@ -216,9 +227,32 @@ fn unselected_ca_and_wrong_san_cannot_deliver_http_request() {
     }
 }
 #[test]
+fn only_credential_delivery_exposes_a_retryable_service_unavailable() {
+    let f = fixture();
+    for delivery in [true, false] {
+        let server = Server::start(&f, 503);
+        let origin = format!("https://kbs.test:{}", server.address.port());
+        let transport =
+            GcpHttpsTransport::with_trusted_roots(&origin, &f.roots, &[server.address]).unwrap();
+        if delivery {
+            assert_eq!(
+                runtime().block_on(transport.post_credential_delivery(b"{}")),
+                Ok((503, Vec::new()))
+            );
+        } else {
+            assert_eq!(
+                runtime().block_on(transport.post_with_status(GcpLaunchRoute::Begin, b"{}")),
+                Err(ClientError::HttpStatus)
+            );
+        }
+        assert!(server.finish().is_some());
+    }
+}
+
+#[test]
 fn redirect_is_an_http_status_failure_without_new_origin_lookup() {
     let f = fixture();
-    let server = Server::start(&f, true);
+    let server = Server::start(&f, 302);
     let origin = format!("https://kbs.test:{}", server.address.port());
     let transport =
         GcpHttpsTransport::with_trusted_roots(&origin, &f.roots, &[server.address]).unwrap();
@@ -232,7 +266,7 @@ fn redirect_is_an_http_status_failure_without_new_origin_lookup() {
 #[test]
 fn failed_fixed_address_never_falls_back_to_localhost_resolution() {
     let f = fixture();
-    let server = Server::start(&f, false);
+    let server = Server::start(&f, 200);
     let origin = format!("https://localhost:{}", server.address.port());
     let refused = SocketAddr::new("127.0.0.2".parse().unwrap(), server.address.port());
     let transport = GcpHttpsTransport::with_trusted_roots(&origin, &f.roots, &[refused]).unwrap();
@@ -281,11 +315,15 @@ fn trusted_transport_requires_bounded_cert_only_roots_and_exact_fixed_addresses(
             Err(ClientError::InvalidField)
         ));
     }
+    let mut padded = f.roots.clone();
+    padded.resize(65536, b'\n');
+    assert!(GcpHttpsTransport::with_trusted_roots("https://kbs.test", &padded, &[good]).is_ok());
+    padded.push(b'\n');
     let mut private = f.roots.clone();
     private.extend_from_slice(&key().private_key_to_pem_pkcs8().unwrap());
     for roots in [
         vec![],
-        vec![b' '; (64 << 10) + 1],
+        padded,
         b"not-a-certificate".to_vec(),
         private,
         f.roots.repeat(17),
@@ -332,6 +370,31 @@ fn only_explicit_https_origins_and_static_routes_are_supported() {
             let url = transport.origin.join(route.path()).unwrap();
             assert_eq!(url.origin(), transport.origin.origin());
             assert!(url.path().starts_with("/kbs/launch/gcp/v2/"));
+        }
+    }
+}
+
+#[test]
+fn capture_limits_chunked_pending_and_completed_responses() {
+    let f = fixture();
+    for status in [202, 200] {
+        for extra in [0, 1] {
+            let server = Server::serve(&f, status, Some(MAX_TRANSPORT_BYTES + extra));
+            let transport = GcpHttpsTransport::with_trusted_roots(
+                &format!("https://kbs.test:{}", server.address.port()),
+                &f.roots,
+                &[server.address],
+            )
+            .unwrap();
+            let result =
+                runtime().block_on(transport.post_with_status(GcpLaunchRoute::Capture, b"{}"));
+            if extra == 0 {
+                let (actual_status, body) = result.unwrap();
+                assert_eq!(actual_status, status);
+                assert_eq!(body.len(), MAX_TRANSPORT_BYTES);
+            } else {
+                assert_eq!(result.unwrap_err(), ClientError::TooLarge);
+            }
         }
     }
 }

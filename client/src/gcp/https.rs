@@ -2,6 +2,7 @@
 //! No proxy, redirect, cookie jar, ambient authorization, or automatic retry.
 
 use crate::ClientError;
+use execution_proof_contract::gcp_artifact::MAX_KBS_TLS_ROOTS_BYTES;
 use std::{
     net::{IpAddr, SocketAddr},
     time::Duration,
@@ -116,7 +117,7 @@ impl GcpHttpsTransport {
                 return Err(ClientError::InvalidField);
             }
         }
-        if roots_pem.is_empty() || roots_pem.len() > 64 << 10 {
+        if roots_pem.is_empty() || roots_pem.len() > MAX_KBS_TLS_ROOTS_BYTES {
             return Err(ClientError::InvalidField);
         }
         let mut remainder =
@@ -216,6 +217,38 @@ impl GcpHttpsTransport {
     }
 
     pub async fn post(&self, route: GcpLaunchRoute, body: &[u8]) -> Result<Vec<u8>, ClientError> {
+        self.post_with_status(route, body)
+            .await
+            .map(|(_, body)| body)
+    }
+
+    pub async fn post_with_status(
+        &self,
+        route: GcpLaunchRoute,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), ClientError> {
+        let response = self.send(route, body).await?;
+        Self::read_success(response).await
+    }
+
+    /// A delivery may already exist when the archive returns 503. The caller
+    /// may replay only the original credential request within the same deadline.
+    pub async fn post_credential_delivery(
+        &self,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), ClientError> {
+        let response = self.send(GcpLaunchRoute::CredentialDelivery, body).await?;
+        if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Ok((503, Vec::new()));
+        }
+        Self::read_success(response).await
+    }
+
+    async fn send(
+        &self,
+        route: GcpLaunchRoute,
+        body: &[u8],
+    ) -> Result<reqwest::Response, ClientError> {
         if body.len() > MAX_TRANSPORT_BYTES {
             return Err(ClientError::TooLarge);
         }
@@ -223,14 +256,16 @@ impl GcpHttpsTransport {
             .origin
             .join(route.path())
             .map_err(|_| ClientError::InvalidOrigin)?;
-        let mut response = self
-            .client
+        self.client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.to_vec())
             .send()
             .await
-            .map_err(|_| ClientError::Transport)?;
+            .map_err(|_| ClientError::Transport)
+    }
+
+    async fn read_success(mut response: reqwest::Response) -> Result<(u16, Vec<u8>), ClientError> {
         if !response.status().is_success() {
             return Err(ClientError::HttpStatus);
         }
@@ -247,7 +282,7 @@ impl GcpHttpsTransport {
             }
             bytes.extend_from_slice(&chunk);
         }
-        Ok(bytes)
+        Ok((response.status().as_u16(), bytes))
     }
 }
 

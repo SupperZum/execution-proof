@@ -271,6 +271,13 @@ fn begin_rederives_as_nonce_and_full64_canonical_runtime() {
     let b = begin(&c);
     c.accept_begin_response(&b).unwrap();
     c.accept_begin_response(&b).unwrap();
+    let mut changed: GcpBeginResponseV2 = serde_json::from_slice(&b).unwrap();
+    changed.session_id = "ab".repeat(32);
+    assert_eq!(
+        c.accept_begin_response(&encode(&changed).unwrap()),
+        Err(ClientError::Conflict)
+    );
+    c.accept_begin_response(&b).unwrap();
     assert_eq!(
         c.report_data_full64().unwrap()[..48],
         c.report_data().unwrap()
@@ -317,6 +324,7 @@ fn capture_signs_distinct_v2_session_and_rejects_legacy_or_changed_evidence() {
     let mut c = client();
     c.accept_begin_response(&begin(&c)).unwrap();
     let bytes = c.capture_request(&evidence()).unwrap();
+    assert_eq!(c.capture_request(&evidence()).unwrap(), bytes);
     let r: GcpCaptureRequestV2 = serde_json::from_slice(&bytes).unwrap();
     gcp_session::verify_recorder_session_pop(
         &c.grant,
@@ -337,6 +345,41 @@ fn capture_signs_distinct_v2_session_and_rejects_legacy_or_changed_evidence() {
         c.capture_request(&other).unwrap_err(),
         ClientError::Conflict
     );
+}
+#[test]
+fn capture_responses_bind_http_status_domain_and_evidence() {
+    let c = ready();
+    let pending = serde_json::json!({"version":2, "purpose":CAPTURE_PURPOSE,
+        "boot_binding_sha384":c.boot_digest, "outcome":"pending", "commitments":null});
+    let check = |code, body: &Value| c.capture_outcome(code, &encode(body).unwrap(), None);
+    assert_eq!(check(202, &pending).unwrap(), CaptureState::Pending);
+    assert!(check(200, &pending).is_err());
+    let mut complete = pending;
+    complete["outcome"] = "captured".into();
+    assert!(check(200, &complete).is_err());
+    complete["commitments"] = serde_json::json!({
+        "grant_digest":c.grant.grant_digest(), "evidence_sha384":hash(c.evidence().unwrap()),
+        "policy_sha384":c.grant.binding().launch_policy_sha384, "input_sha384":"ae".repeat(48), "reference_data_sha384":null});
+    assert_eq!(check(200, &complete).unwrap(), CaptureState::Captured);
+    complete["outcome"] = "historical".into();
+    assert_eq!(check(200, &complete).unwrap(), CaptureState::Historical);
+    assert!(check(202, &complete).is_err());
+    for field in [
+        "grant_digest",
+        "evidence_sha384",
+        "policy_sha384",
+        "input_sha384",
+        "reference_data_sha384",
+    ] {
+        let mut wrong = complete.clone();
+        wrong["commitments"][field] = "invalid".into();
+        assert!(check(200, &wrong).is_err(), "{field}");
+    }
+    for field in ["version", "purpose", "boot_binding_sha384", "outcome"] {
+        let mut wrong = complete.clone();
+        wrong[field] = "invalid".into();
+        assert!(check(200, &wrong).is_err(), "{field}");
+    }
 }
 #[test]
 fn actual_signed_aggregate_and_credential_ciphertext_are_bound_and_redacted() {

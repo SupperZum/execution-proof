@@ -64,6 +64,26 @@ wire!(GcpCaptureRequestV2 {
     recorder_public_key_hex: String,
     signature_hex: String
 });
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureState {
+    Pending,
+    Captured,
+    Historical,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureCommitments {
+    pub grant_digest: String,
+    pub evidence_sha384: String,
+    pub policy_sha384: String,
+    pub input_sha384: String,
+    pub reference_data_sha384: Option<String>,
+}
+wire!(GcpCaptureResponseV2 {
+    outcome: CaptureState,
+    commitments: Option<CaptureCommitments>
+});
 wire!(GcpResourceChallengeRequestV2 {
     session_id: String,
     recorder_public_key_hex: String,
@@ -421,6 +441,37 @@ impl GcpClientProtocol {
             self.evidence = Some(evidence.to_vec());
         }
         Ok(bytes)
+    }
+    pub fn capture_outcome(
+        &self,
+        status: u16,
+        bytes: &[u8],
+        reference_data_sha384: Option<&str>,
+    ) -> Result<CaptureState, ClientError> {
+        let response: GcpCaptureResponseV2 = decode(bytes)?;
+        check_wire_domain(
+            response.version,
+            &response.purpose,
+            &response.boot_binding_sha384,
+            CAPTURE_PURPOSE,
+            &self.boot_digest,
+        )?;
+        let evidence = self.evidence()?;
+        match (status, response.outcome, response.commitments) {
+            (202, CaptureState::Pending, None) => Ok(CaptureState::Pending),
+            (200, state @ (CaptureState::Captured | CaptureState::Historical), Some(c)) => {
+                if c.grant_digest != self.grant.grant_digest()
+                    || c.evidence_sha384 != hash(evidence)
+                    || c.policy_sha384 != self.grant.binding().launch_policy_sha384
+                    || c.reference_data_sha384.as_deref() != reference_data_sha384
+                {
+                    return Err(ClientError::BindingMismatch);
+                }
+                lower_hex(&c.input_sha384, 48)?;
+                Ok(state)
+            }
+            _ => Err(ClientError::InvalidField),
+        }
     }
     pub fn resource_challenge_request(&self) -> Result<Vec<u8>, ClientError> {
         let b = self.begin()?;
