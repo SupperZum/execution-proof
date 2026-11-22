@@ -187,6 +187,24 @@ mod tests {
             object[long_field].as_array_mut().unwrap().push(0.into());
             assert!(GcpLaunchEvidenceV2::decode(&serde_json::to_vec(&object).unwrap()).is_err());
         }
+        let dense = GcpLaunchEvidenceV2::new(
+            vec![255; MAX_GCP_DECODED_EVIDENCE_BYTES - 2],
+            vec![255],
+            vec![255],
+        )
+        .unwrap();
+        assert_eq!(dense.encode().err(), Some(Error::TooLarge));
+        let mut padded = GcpLaunchEvidenceV2::new(vec![1], vec![2], vec![3])
+            .unwrap()
+            .encode()
+            .unwrap();
+        padded.resize(MAX_GCP_ENVELOPE_BYTES, b' ');
+        assert!(GcpLaunchEvidenceV2::decode(&padded).is_ok());
+        padded.push(b' ');
+        assert_eq!(
+            GcpLaunchEvidenceV2::decode(&padded).err(),
+            Some(Error::TooLarge)
+        );
         assert!(GcpLaunchEvidenceV2::new(vec![], vec![1], vec![1]).is_err());
         assert!(GcpLaunchEvidenceV2::decode(&vec![b' '; MAX_GCP_ENVELOPE_BYTES + 1]).is_err());
     }

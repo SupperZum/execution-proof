@@ -103,11 +103,23 @@ fn malformed_unknown_zero_and_weaker_claims_are_rejected() {
     let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     v["statement"]["qualified"] = true.into();
     assert!(verify_gcp_qualification_historical(&serde_json::to_vec(&v).unwrap(), &e).is_err());
+    let mut padded = bytes.clone();
+    padded.resize(crate::MAX_WIRE_BYTES, b' ');
+    assert!(verify_gcp_qualification_historical(&padded, &e).is_ok());
+    padded.push(b' ');
+    assert_eq!(
+        verify_gcp_qualification_historical(&padded, &e).err(),
+        Some(Error::TooLarge)
+    );
     let mut selected = e;
     selected.qualification_public_key = [0; 32];
-    assert!(verify_gcp_qualification_historical(&bytes, &selected).is_err());
-    assert!(
-        verify_gcp_qualification_historical(&vec![b' '; crate::MAX_WIRE_BYTES + 1], &selected)
-            .is_err()
+    assert_eq!(
+        verify_gcp_qualification_historical(&bytes, &selected).err(),
+        Some(Error::ConfusedKeys)
     );
+}
+
+#[test]
+fn qualification_transcript_matches_independent_framing_vector() {
+    assert_eq!(fixture().0.digest_sha384().unwrap(), "10650aba7f62c3b34f7a5c581ffacd54cd57e24326ee7bfa89385b45556f91314e384c0267ccdd31608200099c159a8b");
 }

@@ -18,10 +18,13 @@ pub const REFERENCE_POLICY_SET_PURPOSE: &str = "qlad.execution-proof.gcp-referen
 pub const GCP_PLATFORM_PROFILE: &str = "gcp-c3-intel-tdx-x86_64.v1";
 pub const GCP_MEASUREMENT_RECIPE: &str = "gcp-ccel-direct-pe.v1";
 pub const GCP_REQUIRED_EVENTS_PROFILE: &str = "gcp-nvme-gpt-single-pe-exit-boot-services.v1";
+pub const MAX_KBS_TLS_ROOTS_BYTES: usize = 64 << 10;
 pub const MAX_CONFIG_BYTES: usize = 64 << 10;
 pub const MAX_CORE_BYTES: usize = 64 << 10;
 pub const MAX_MANIFEST_BYTES: usize = 32 << 10;
 pub const MAX_REFERENCE_BYTES: usize = 16 << 10;
+/// Root is depth zero. A leaf may sit directly inside the deepest directory.
+pub const MAX_BOOT_DIRECTORY_DEPTH: usize = 16;
 pub const MAX_PRODUCER_LEAVES: usize = 64;
 pub const MAX_PRODUCER_LEAF_BYTES: u64 = 256 << 20;
 pub const MAX_PRODUCER_TOTAL_BYTES: u64 = 512 << 20;
@@ -455,11 +458,6 @@ impl ProducerCoreV1 {
                 &c.roots.authority_tls_roots_sha384,
             ),
             (
-                ProducerLeafKind::TlsRoots,
-                &c.kbs_tls_roots_path,
-                &c.roots.kbs_tls_roots_sha384,
-            ),
-            (
                 ProducerLeafKind::LaunchPolicy,
                 &c.launch_policy_path,
                 &c.launch_policy_sha384,
@@ -477,6 +475,14 @@ impl ProducerCoreV1 {
             {
                 return Err(Error::BindingMismatch);
             }
+        }
+        if !self.leaves.iter().any(|leaf| {
+            leaf.path == c.kbs_tls_roots_path
+                && leaf.kind == ProducerLeafKind::TlsRoots
+                && leaf.sha384 == c.roots.kbs_tls_roots_sha384
+                && leaf.size_bytes <= MAX_KBS_TLS_ROOTS_BYTES as u64
+        }) {
+            return Err(Error::BindingMismatch);
         }
         let mut relay_binaries = self
             .leaves
@@ -831,6 +837,7 @@ fn encode(value: &impl Serialize, limit: usize) -> Result<Vec<u8>, Error> {
 }
 fn immutable_path(value: &str) -> Result<(), Error> {
     if value.len() > 256
+        || value.bytes().filter(|&b| b == b'/').count() > MAX_BOOT_DIRECTORY_DEPTH + 1
         || !value.starts_with('/')
         || value.ends_with('/')
         || value.contains("//")

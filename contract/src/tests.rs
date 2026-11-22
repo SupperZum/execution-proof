@@ -260,6 +260,17 @@ fn policy_input_reference_predicate_and_kbs_session_bindings_are_required() {
         mutate(&mut f.a.evaluation);
         rejected(outcome(&f), Error::BindingMismatch);
     }
+    // Align the trusted expectation with the edited statement while retaining
+    // the original signature, so equality cannot mask the signature check.
+    let mut f = fixture();
+    let (grant, appraisal) = wire(&f);
+    let mut original: Signed<ProofAppraisal> = serde_json::from_slice(&appraisal).unwrap();
+    original.statement.evaluation.kbs.session_sha384 = "aa".repeat(48);
+    f.expected.evaluation = original.statement.evaluation.clone();
+    rejected(
+        verify_statements(&grant, &serde_json::to_vec(&original).unwrap(), &f.expected),
+        Error::InvalidSignature,
+    );
     let f = fixture();
     let (l, a) = wire(&f);
     let mut v: serde_json::Value = serde_json::from_slice(&a).unwrap();

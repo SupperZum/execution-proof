@@ -158,13 +158,26 @@ fn protocol_version_and_purpose_are_signed() {
     let grant = grant(&recorder, "grant-1");
     let bytes =
         recorder_session_signing_bytes(&grant, NONCE, &"08".repeat(48), &"09".repeat(48)).unwrap();
-    for pattern in [&VERSION.to_be_bytes()[..], SESSION_PURPOSE.as_bytes()] {
+    let domain = b"recorder-session";
+    let version_at = b"QLAD-EXEC-PROOF\0".len();
+    let session_length_at = version_at + 2 + 4 + domain.len();
+    assert_eq!(
+        &bytes[session_length_at..session_length_at + 4],
+        &2u32.to_be_bytes()
+    );
+    let session_at = session_length_at + 4;
+    assert_eq!(
+        &bytes[session_at..session_at + 2],
+        &SESSION_VERSION.to_be_bytes()
+    );
+    let purpose_at = session_at + 2 + 4;
+    assert_eq!(
+        &bytes[purpose_at..purpose_at + SESSION_PURPOSE.len()],
+        SESSION_PURPOSE.as_bytes()
+    );
+    for offset in [version_at + 1, session_at + 1, purpose_at] {
         let mut changed = bytes.clone();
-        let offset = changed
-            .windows(pattern.len())
-            .position(|p| p == pattern)
-            .unwrap();
-        changed[offset + pattern.len() - 1] ^= 1;
+        changed[offset] ^= 1;
         let signature = crate::hex(recorder.sign(&changed).as_ref());
         assert_eq!(
             verify(&grant, &recorder, &signature).err(),

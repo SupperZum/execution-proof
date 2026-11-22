@@ -74,9 +74,11 @@ fn challenge_json_spelling_does_not_change_transcript() {
 #[test]
 fn challenge_rejects_wrong_domains_and_noncanonical_hex() {
     let original = challenge(&record());
+    let mut wrong_purpose = original.clone();
+    wrong_purpose.purpose.push('x');
+    assert_eq!(wrong_purpose.validate().err(), Some(Error::WrongPurpose));
     for mutate in [
         (|c: &mut QuoteChallenge| c.version += 1) as fn(&mut QuoteChallenge),
-        |c| c.purpose.push('x'),
         |c| c.audience.clear(),
         |c| c.nonce = "00".repeat(32),
         |c| c.nonce = "AA".repeat(32),

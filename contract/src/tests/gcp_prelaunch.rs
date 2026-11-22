@@ -541,7 +541,41 @@ fn startup_capsule_has_distinct_domain_and_incremental_field_limits() {
     wire["unknown"] = true.into();
     assert!(GcpRoleCapsuleV1::decode(&serde_json::to_vec(&wire).unwrap()).is_err());
     wire.as_object_mut().unwrap().remove("unknown");
+    wire["signed_manifest"] = serde_json::json!(vec![1u8; 32 << 10]);
+    let mut padded = serde_json::to_vec(&wire).unwrap();
+    padded.resize(MAX_CAPSULE_BYTES, b' ');
+    assert!(GcpRoleCapsuleV1::decode(&padded).is_ok());
+    padded.push(b' ');
+    assert_eq!(
+        GcpRoleCapsuleV1::decode(&padded).err(),
+        Some(crate::Error::TooLarge)
+    );
     wire["signed_manifest"] = serde_json::json!(vec![1u8; (32 << 10) + 1]);
-    assert!(GcpRoleCapsuleV1::decode(&serde_json::to_vec(&wire).unwrap()).is_err());
-    assert!(GcpRoleCapsuleV1::decode(&vec![b' '; MAX_CAPSULE_BYTES + 1]).is_err());
+    assert_eq!(
+        GcpRoleCapsuleV1::decode(&serde_json::to_vec(&wire).unwrap()).err(),
+        Some(crate::Error::Malformed)
+    );
+}
+
+#[test]
+fn startup_plan_transcript_matches_independent_framing_vector() {
+    use crate::gcp_startup::{GcpAttemptPlanV1, PLAN_PURPOSE};
+    let plan = GcpAttemptPlanV1 {
+        version: 1,
+        purpose: PLAN_PURPOSE.into(),
+        authority: "authority".into(),
+        container_id: "task".into(),
+        execution_audience: "auditor".into(),
+        boot_binding: crate::gcp_boot_binding::GcpBootBindingV1::new(
+            [1; 48], [2; 48], [3; 48], [4; 48],
+        )
+        .unwrap(),
+        grant_sha384: "05".repeat(48),
+        aggregate_sha384: "06".repeat(48),
+        execution_nonce_hex: "07".repeat(32),
+        admission_policy_sha384: "08".repeat(48),
+        effective_spec_sha384: "09".repeat(48),
+        trust_snapshot_sha384: "0a".repeat(48),
+    };
+    assert_eq!(crate::sha384(&plan.signing_bytes().unwrap()), "917e78d7cd044b1295d20f3fa3e64fc9f54228e000f37e79fb8ab6c67ec39f84c5725c7ea701b658fbba5ee5b5334e68");
 }

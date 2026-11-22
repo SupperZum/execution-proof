@@ -345,6 +345,26 @@ fn recorder_operations_bind_kind_key_request_and_grant() {
             Ok(())
         );
     }
+    let s = &f.expected.expected;
+    let delivery = |digest: String| SessionOperation::CredentialDelivery {
+        session_id: s.session_id.clone(),
+        nonce: s.nonce.clone(),
+        runtime_sha384: s.runtime_sha384.clone(),
+        evidence_sha384: s.evidence_sha384.clone(),
+        request_sha384: s.request.digest_sha384().unwrap(),
+        aggregate_sha384: digest,
+    };
+    let op = delivery(s.digest_sha384().unwrap());
+    let sig = crate::hex(
+        f.recorder
+            .sign(&operation_signing_bytes(&f.grant, &op).unwrap())
+            .as_ref(),
+    );
+    assert_eq!(verify_operation_pop(&f.grant, &op, &public, &sig), Ok(()));
+    assert_eq!(
+        verify_operation_pop(&f.grant, &delivery("aa".repeat(48)), &public, &sig),
+        Err(Error::InvalidSignature)
+    );
     let challenge = operation(&f, false);
     let signature = crate::hex(
         f.recorder

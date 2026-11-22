@@ -280,11 +280,18 @@ fn foreign_build_reference_and_self_enrolled_roots_are_rejected() {
             2 => f.expected.build_public_key = pubkey(9),
             _ => f.expected.reference_public_key = pubkey(9),
         }
-        assert!(verify(&f).is_err());
+        assert_eq!(
+            verify(&f).err(),
+            Some(if which < 2 {
+                Error::InvalidSignature
+            } else {
+                Error::BindingMismatch
+            })
+        );
     }
     let mut f = fixture();
     f.expected.reference_public_key = f.expected.build_public_key;
-    assert!(verify(&f).is_err());
+    assert_eq!(verify(&f).err(), Some(Error::ConfusedKeys));
 }
 #[test]
 fn every_independent_reference_and_exact_relation_is_checked() {
@@ -299,7 +306,7 @@ fn every_independent_reference_and_exact_relation_is_checked() {
             5 => f.expected.build_issuer = "other".into(),
             _ => f.expected.reference_issuer = "other".into(),
         }
-        assert!(verify(&f).is_err());
+        assert_eq!(verify(&f).err(), Some(Error::BindingMismatch));
     }
     let mut f = fixture();
     let mut a: Signed<BootArtifactManifestV1> = serde_json::from_slice(&f.a).unwrap();
@@ -309,7 +316,7 @@ fn every_independent_reference_and_exact_relation_is_checked() {
     v.statement.artifact_manifest_sha384 = sha384(&f.a);
     f.v = signed(&v.statement, &v.statement.signing_bytes().unwrap(), 3);
     bind(&mut f);
-    assert!(verify(&f).is_err());
+    assert_eq!(verify(&f).err(), Some(Error::BindingMismatch));
 }
 #[test]
 fn backward_cycle_fields_unknown_peers_and_duplicate_json_fields_are_rejected() {
@@ -380,6 +387,51 @@ fn stable_config_rejects_mutable_paths_raw_quote_rpc_and_unimplemented_limits() 
     c.roots.build_public_key = c.roots.authority_public_key;
     assert!(c.validate().is_err());
 }
+#[test]
+fn producer_core_leaf_may_have_sixteen_parent_directories() {
+    let f = fixture();
+    for (parents, valid) in [(16, true), (17, false)] {
+        let mut core = ProducerCoreV1::decode(&f.d).unwrap();
+        core.leaves.push(ProducerLeafV1 {
+            path: format!("/{}leaf", "d/".repeat(parents)),
+            kind: ProducerLeafKind::Data,
+            sha384: "11".repeat(48),
+            size_bytes: 1,
+        });
+        core.leaves.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(core.validate().is_ok(), valid);
+    }
+}
+#[test]
+fn kbs_roots_size_is_checked_at_the_configured_path() {
+    let f = fixture();
+    let mut config = ClosedBootConfigV1::decode(&f.c).unwrap();
+    let mut core = ProducerCoreV1::decode(&f.d).unwrap();
+    let original = config.kbs_tls_roots_path.clone();
+    config.kbs_tls_roots_path = "/custom/anchors.pem".into();
+    let config_bytes = config.encode().unwrap();
+    core.config_sha384 = sha384(&config_bytes);
+    for leaf in &mut core.leaves {
+        if leaf.path == original {
+            leaf.path = config.kbs_tls_roots_path.clone();
+            leaf.size_bytes = 65536;
+        } else if leaf.path == config.authority_tls_roots_path {
+            leaf.size_bytes = 65537;
+        }
+    }
+    core.leaves.sort_by(|a, b| a.path.cmp(&b.path));
+    validate_config_core(&config_bytes, &core.encode().unwrap()).unwrap();
+    core.leaves
+        .iter_mut()
+        .find(|leaf| leaf.path == config.kbs_tls_roots_path)
+        .unwrap()
+        .size_bytes += 1;
+    assert_eq!(
+        validate_config_core(&config_bytes, &core.encode().unwrap()).err(),
+        Some(Error::BindingMismatch)
+    );
+}
+
 #[test]
 fn core_paths_kinds_and_size_budgets_are_closed() {
     let f = fixture();
@@ -704,4 +756,26 @@ fn management_role_requires_exact_declared_leaf_closure() {
         .unwrap()
         .size_bytes = (64 << 10) + 1;
     assert!(wrong.check_config(&c).is_err());
+}
+
+#[test]
+fn manifest_and_reference_each_bind_the_independent_pe_digest() {
+    for change_manifest in [true, false] {
+        let mut f = fixture();
+        let mut a: Signed<BootArtifactManifestV1> = serde_json::from_slice(&f.a).unwrap();
+        let mut v: Signed<ReferencePolicySetV1> = serde_json::from_slice(&f.v).unwrap();
+        if change_manifest {
+            a.statement.pe_authenticode_sha384 = "91".repeat(48);
+            f.a = signed(&a.statement, &a.statement.signing_bytes().unwrap(), 2);
+            v.statement.artifact_manifest_sha384 = sha384(&f.a);
+        } else {
+            v.statement.pe_authenticode_sha384 = "91".repeat(48);
+        }
+        f.v = signed(&v.statement, &v.statement.signing_bytes().unwrap(), 3);
+        bind(&mut f);
+        assert_eq!(verify(&f).err(), Some(Error::BindingMismatch));
+    }
+    let mut f = fixture();
+    f.a.resize(MAX_MANIFEST_BYTES + 1, b' ');
+    assert_eq!(verify(&f).err(), Some(Error::TooLarge));
 }
