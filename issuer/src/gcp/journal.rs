@@ -193,6 +193,15 @@ impl GcpIssuer {
             }
             return Err(PublicError::StateRejected);
         }
+        // The local pin may predate this first external publication.
+        // Readback also checks GCS finalization time if the upload crosses expiry.
+        self.store
+            .with_live_clock(self.clock.as_ref(), |now| {
+                self.qualification.validity().check_at(now)?;
+                grant.validity.check_at(now)?;
+                Ok(())
+            })
+            .map_err(GcpIssuerError::from)?;
         grant.attempt.publish_exact(
             journal,
             "pin",

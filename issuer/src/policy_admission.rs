@@ -165,13 +165,16 @@ impl SoftwareIssuer {
         if bytes.len() > MAX_WIRE_BYTES {
             return Err(Error::InvalidRequest);
         }
-        self.store.pin_policy(&store::PolicyPin {
-            grant_id: grant_id.to_owned(),
-            expected_json: bytes,
-            expected_digest: expected.digest_sha384()?,
-            guest_nonce: guest_nonce.to_owned(),
-            policy_digest: state.policy_sha384.clone(),
-        })?;
+        self.store.pin_policy(
+            &store::PolicyPin {
+                grant_id: grant_id.to_owned(),
+                expected_json: bytes,
+                expected_digest: expected.digest_sha384()?,
+                guest_nonce: guest_nonce.to_owned(),
+                policy_digest: state.policy_sha384.clone(),
+            },
+            self.clock.as_ref(),
+        )?;
         Ok(())
     }
 

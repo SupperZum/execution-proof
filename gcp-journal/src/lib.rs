@@ -66,15 +66,17 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// Use the operator-configured bucket and the runtime's attached identity.
-    pub fn connect(bucket: &str) -> Result<Self, Error> {
-        if !(3..=63).contains(&bucket.len())
-            || !bucket
+    pub fn valid_bucket(bucket: &str) -> bool {
+        (3..=63).contains(&bucket.len())
+            && bucket
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-            || bucket.starts_with('-')
-            || bucket.ends_with('-')
-        {
+            && !bucket.starts_with('-')
+            && !bucket.ends_with('-')
+    }
+    /// Use the operator-configured bucket and the runtime's attached identity.
+    pub fn connect(bucket: &str) -> Result<Self, Error> {
+        if !Self::valid_bucket(bucket) {
             return Err(Error::Unavailable);
         }
         let client = Client::builder()

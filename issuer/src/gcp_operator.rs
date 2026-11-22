@@ -150,6 +150,8 @@ pub enum PublicError {
     HardwareUnavailable,
     HardwareRejected,
     StateRejected,
+    StateBusy,
+    ClockUnavailable,
     JournalUnavailable,
     IoDeadline,
     Io,
@@ -166,6 +168,10 @@ impl From<GcpIssuerError> for PublicError {
             ))
             | GcpIssuerError::Issuer(crate::Error::Store(crate::StoreError::Expired)) => {
                 Self::RequestExpired
+            }
+            GcpIssuerError::Issuer(crate::Error::Store(crate::StoreError::Busy)) => Self::StateBusy,
+            GcpIssuerError::Issuer(crate::Error::Store(crate::StoreError::ClockUnavailable)) => {
+                Self::ClockUnavailable
             }
             GcpIssuerError::Issuer(crate::Error::Store(_)) => Self::StateRejected,
             _ => Self::RequestRejected,
@@ -193,6 +199,10 @@ pub(crate) fn dispatch(
     bytes: &[u8],
     journal: Option<&dyn PublicationJournal>,
 ) -> Result<Response, PublicError> {
+    dispatch_operation(issuer, parse_operation(bytes)?, journal)
+}
+
+fn parse_operation(bytes: &[u8]) -> Result<Operation, PublicError> {
     if bytes.is_empty() || bytes.len() > MAX_REQUEST_BYTES {
         return Err(PublicError::RequestLimit);
     }
@@ -201,7 +211,15 @@ pub(crate) fn dispatch(
     if request.version != 1 || request.purpose != REQUEST_PURPOSE {
         return Err(PublicError::RequestDomain);
     }
-    let result = match request.request {
+    Ok(request.request)
+}
+
+fn dispatch_operation(
+    issuer: &GcpIssuer,
+    operation: Operation,
+    journal: Option<&dyn PublicationJournal>,
+) -> Result<Response, PublicError> {
+    let result = match operation {
         Operation::Begin { signed_intent_json } => {
             let signed = issuer.begin(&signed_intent_json)?;
             if let Some(journal) = journal {
@@ -369,10 +387,14 @@ impl Arguments {
                 Some("--store") => &mut store,
                 Some("--collateral") => &mut collateral,
                 Some("--journal-bucket") => {
-                    if initialize || journal_bucket.is_some() {
+                    if journal_bucket.is_some() {
                         return Err(PublicError::Arguments);
                     }
-                    journal_bucket = Some(value.into_string().map_err(|_| PublicError::Arguments)?);
+                    let bucket = value.into_string().map_err(|_| PublicError::Arguments)?;
+                    if !Journal::valid_bucket(&bucket) {
+                        return Err(PublicError::Arguments);
+                    }
+                    journal_bucket = Some(bucket);
                     continue;
                 }
                 Some("--capacity") => {
@@ -438,7 +460,7 @@ fn read_operator_file(path: &Path, limit: usize, private: bool) -> Result<Vec<u8
     }
     Ok(bytes)
 }
-fn authority(args: &Arguments) -> Result<GcpIssuer, PublicError> {
+fn authority(args: &Arguments, mode: crate::gcp::OpenMode) -> Result<GcpIssuer, PublicError> {
     let mut config: GcpIssuerConfig =
         serde_json::from_slice(&read_operator_file(&args.config, MAX_CONFIG_BYTES, false)?)
             .map_err(|_| PublicError::OperatorConfiguration)?;
@@ -451,11 +473,16 @@ fn authority(args: &Arguments) -> Result<GcpIssuer, PublicError> {
     let qualification = read_operator_file(&args.qualification, MAX_CONTROL_BYTES, false)?;
     let pkcs8 = Zeroizing::new(read_operator_file(&args.signer, MAX_CONTROL_BYTES, true)?);
     let signer = Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| PublicError::OperatorKey)?;
-    let result = if args.initialize {
-        GcpIssuer::initialize_new(&args.store, config, &qualification, signer, args.capacity)
-    } else {
-        GcpIssuer::open_existing(&args.store, config, &qualification, signer, args.capacity)
-    };
+    let result = GcpIssuer::open(
+        &args.store,
+        config,
+        &qualification,
+        signer,
+        args.capacity,
+        std::sync::Arc::new(crate::SystemClock),
+        mode,
+        args.journal_bucket.as_deref(),
+    );
     result.map_err(PublicError::from)
 }
 
@@ -577,19 +604,24 @@ fn protect_process() -> Result<(), PublicError> {
 fn run_inner() -> Result<Response, PublicError> {
     protect_process()?;
     let args = Arguments::parse(std::env::args_os().skip(1))?;
-    let issuer = authority(&args)?;
     if args.initialize {
+        authority(&args, crate::gcp::OpenMode::Initialize)?;
         return Ok(Response::new(ResponseBody::Initialized));
     }
-    let request = read_request(libc::STDIN_FILENO, IO_TIMEOUT)?;
+    let request = parse_operation(&read_request(libc::STDIN_FILENO, IO_TIMEOUT)?)?;
+    let mode = match &request {
+        Operation::StatusPolicyAggregate { .. } => crate::gcp::OpenMode::HistoricalStatus,
+        _ => crate::gcp::OpenMode::Live,
+    };
+    let issuer = authority(&args, mode)?;
     let journal = args
         .journal_bucket
         .as_deref()
         .map(Journal::connect)
         .transpose()?;
-    dispatch(
+    dispatch_operation(
         &issuer,
-        &request,
+        request,
         journal.as_ref().map(|v| v as &dyn PublicationJournal),
     )
 }

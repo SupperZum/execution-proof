@@ -35,7 +35,7 @@ use execution_proof_verifier::{
     gcp_pregrant_protocol::{GcpPregrantRequest, GcpPregrantResponse},
     gcp_tdx_policy::GcpTdxModulePolicyV1,
     gcp_worker_protocol::GcpHardwareStatus,
-    worker::{run_gcp_pregrant_worker, TrustedWorker},
+    worker::{run_gcp_pregrant_worker, TrustedWorker, WorkerError},
 };
 use kbs_types::TeePubKey;
 use std::path::PathBuf;
@@ -96,6 +96,14 @@ impl fmt::Display for GcpIssuerError {
     }
 }
 impl std::error::Error for GcpIssuerError {}
+impl From<WorkerError> for GcpIssuerError {
+    fn from(error: WorkerError) -> Self {
+        match error {
+            WorkerError::InvalidResponse => Self::HardwareRejected,
+            _ => Self::HardwareUnavailable,
+        }
+    }
+}
 impl From<Error> for GcpIssuerError {
     fn from(value: Error) -> Self {
         Self::Issuer(value)
@@ -123,13 +131,20 @@ pub struct GcpBootstrapSubmission {
     pub keywrap_public_key: TeePubKey,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenMode {
+    Initialize,
+    Live,
+    HistoricalStatus,
+}
+
 pub struct GcpIssuer {
     config: GcpIssuerConfig,
     signer: Ed25519KeyPair,
     qualification: VerifiedGcpQualification,
     store: store::Store,
     clock: Arc<dyn IssuerClock>,
-    worker: TrustedWorker,
+    worker: Option<TrustedWorker>,
     admission_policy_sha384: String,
 }
 
@@ -165,7 +180,8 @@ impl GcpIssuer {
             signer,
             capacity,
             clock,
-            true,
+            OpenMode::Initialize,
+            None,
         )
     }
     pub fn open_existing(
@@ -199,34 +215,38 @@ impl GcpIssuer {
             signer,
             capacity,
             clock,
-            false,
+            OpenMode::Live,
+            None,
         )
     }
-    fn open(
+    pub(crate) fn open(
         path: &Path,
         config: GcpIssuerConfig,
         signed_qualification_json: &[u8],
         signer: Ed25519KeyPair,
         capacity: usize,
         clock: Arc<dyn IssuerClock>,
-        initialize: bool,
+        mode: OpenMode,
+        journal_bucket: Option<&str>,
     ) -> Result<Self, GcpIssuerError> {
         let qualification =
             verify_gcp_qualification_historical(signed_qualification_json, &config.qualification)?;
         let (identity, admission_policy_sha384) = identity(&config, &signer, &qualification)?;
         // Fresh initialization cannot install an expired/unreviewed profile.
         // Reopening permits historical status; every new permission checks again.
-        if initialize {
-            let now = clock
-                .now_unix_seconds()
-                .map_err(|_| Error::InvalidConfiguration)?;
+        if mode == OpenMode::Initialize {
+            let now = store::clock_now(clock.as_ref())?;
             qualification.validity().check_at(now)?;
         }
-        let worker =
-            TrustedWorker::open(&config.pregrant_worker_path, &config.pregrant_worker_sha384)
-                .map_err(|_| GcpIssuerError::HardwareUnavailable)?;
+        let worker = match mode {
+            OpenMode::HistoricalStatus => None,
+            OpenMode::Initialize | OpenMode::Live => Some(
+                TrustedWorker::open(&config.pregrant_worker_path, &config.pregrant_worker_sha384)
+                    .map_err(|_| GcpIssuerError::HardwareUnavailable)?,
+            ),
+        };
         let authority = public_key(&signer)?;
-        let store = if initialize {
+        let store = if mode == OpenMode::Initialize {
             store::Store::initialize_new_gcp_policy(
                 path,
                 &identity,
@@ -234,6 +254,7 @@ impl GcpIssuer {
                 clock.as_ref(),
                 authority,
                 *qualification.validity(),
+                journal_bucket,
             )?
         } else {
             store::Store::open_existing_gcp_policy(
@@ -242,6 +263,7 @@ impl GcpIssuer {
                 capacity,
                 authority,
                 *qualification.validity(),
+                journal_bucket,
             )?
         };
         Ok(Self {
@@ -306,8 +328,13 @@ impl GcpIssuer {
         submission: &GcpBootstrapSubmission,
     ) -> Result<IssuedGrant, GcpIssuerError> {
         self.issue_checked(challenge_id, submission, |request| {
-            run_gcp_pregrant_worker(request, &self.worker)
-                .map_err(|_| GcpIssuerError::HardwareUnavailable)
+            run_gcp_pregrant_worker(
+                request,
+                self.worker
+                    .as_ref()
+                    .ok_or(GcpIssuerError::HardwareUnavailable)?,
+            )
+            .map_err(GcpIssuerError::from)
         })
     }
 
@@ -358,8 +385,10 @@ impl GcpIssuer {
             module_policy: self.config.module_policy.clone(),
             collateral_json: self.config.collateral_json.clone(),
         };
+        let now = self.observed_time()?;
+        challenge.statement.validity.check_at(now)?;
         request
-            .verify_authority(self.now()?)
+            .verify_authority(now)
             .map_err(|_| GcpIssuerError::HardwareRejected)?;
         let response = check(&request)?;
         response
@@ -431,15 +460,18 @@ impl GcpIssuer {
         self.require_live_qualification()?;
         let (_, grant) = self.grant(grant_id)?;
         self.validate_expected(expected, &grant)?;
-        // Context validation enforces the same guest nonce syntax as admission.
+        // GCP requires a 32-byte guest nonce encoded as lowercase hex.
         decode_hex(guest_nonce, 32)?;
-        self.store.pin_policy(&store::PolicyPin {
-            grant_id: grant_id.into(),
-            expected_json: serde_json::to_vec(expected).map_err(|_| Error::InvalidRequest)?,
-            expected_digest: expected.digest_sha384()?,
-            guest_nonce: guest_nonce.into(),
-            policy_digest: self.admission_policy_sha384.clone(),
-        })?;
+        self.store.pin_policy(
+            &store::PolicyPin {
+                grant_id: grant_id.into(),
+                expected_json: serde_json::to_vec(expected).map_err(|_| Error::InvalidRequest)?,
+                expected_digest: expected.digest_sha384()?,
+                guest_nonce: guest_nonce.into(),
+                policy_digest: self.admission_policy_sha384.clone(),
+            },
+            self.clock.as_ref(),
+        )?;
         Ok(())
     }
 
@@ -487,14 +519,14 @@ impl GcpIssuer {
             execution_nonce_hex: random_id()?,
         };
         let bytes = plan.signing_bytes()?;
-        // Store/verification work may have queued. Plans retain the old L's
-        // window and cannot be newly signed after qualification or L expiry.
-        let now = self.now()?;
-        self.qualification.validity().check_at(now)?;
-        grant.validity().check_at(now)?;
+        let signature = self.store.with_live_clock(self.clock.as_ref(), |now| {
+            self.qualification.validity().check_at(now)?;
+            grant.validity().check_at(now)?;
+            Ok(self.signer.sign(&bytes))
+        })?;
         let result = serde_json::to_vec(&Signed {
             statement: plan,
-            signature: hex(self.signer.sign(&bytes).as_ref()),
+            signature: hex(signature.as_ref()),
         })
         .map_err(|_| Error::InvalidRequest)?;
         if result.len() > MAX_WIRE_BYTES {
@@ -539,13 +571,16 @@ impl GcpIssuer {
         )?;
         Ok(self.store.policy_status(&authorization)?)
     }
-    fn now(&self) -> Result<u64, GcpIssuerError> {
-        self.clock
-            .now_unix_seconds()
-            .map_err(|_| Error::InvalidRequest.into())
+    /// Persist the exact sample even if an early qualification or challenge check fails.
+    fn observed_time(&self) -> Result<u64, GcpIssuerError> {
+        self.store
+            .with_live_clock(self.clock.as_ref(), Ok)
+            .map_err(GcpIssuerError::from)
     }
     fn require_live_qualification(&self) -> Result<(), GcpIssuerError> {
-        self.qualification.validity().check_at(self.now()?)?;
+        self.qualification
+            .validity()
+            .check_at(self.observed_time()?)?;
         Ok(())
     }
     fn verify_intent(&self, bytes: &[u8]) -> Result<VerifiedTenantIntent, GcpIssuerError> {

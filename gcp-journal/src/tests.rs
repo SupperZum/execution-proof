@@ -7,7 +7,11 @@ use std::{
 
 #[test]
 fn conditional_publish_requires_matching_generation_and_timely_readback() {
-    for (upload_status, publication) in [("200 OK", true), ("412 Precondition Failed", false)] {
+    for (upload_status, publication) in [
+        ("200 OK", true),
+        ("412 Precondition Failed", false),
+        ("disconnect", false),
+    ] {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let worker = thread::spawn(move || {
@@ -60,6 +64,10 @@ fn conditional_publish_requires_matching_generation_and_timely_readback() {
                     let mut body = vec![0; length];
                     reader.read_exact(&mut body).unwrap();
                     assert_eq!(body, expected);
+                    if status == "disconnect" {
+                        // The object is committed, but the upload response never arrives.
+                        continue;
+                    }
                 }
                 write!(
                     stream,

@@ -19,7 +19,7 @@ use ring::{
     signature::{self, Ed25519KeyPair, KeyPair},
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
-use std::{fmt, fs::OpenOptions, path::Path, sync::Mutex, time::Duration};
+use std::{fmt, path::Path, sync::Mutex, time::Duration};
 
 const MAX_CAPACITY: usize = 1024;
 const MAX_WIRE: usize = 16 * 1024;
@@ -64,6 +64,11 @@ const SELECT_RECORD: &str = "SELECT challenge_id,authority,tenant,workload_id,at
  challenge_json,challenge_digest,grant_id,intent_json,intent_digest,intent_wire_digest,
  bootstrap_context,recorder_key,grant_json,grant_digest,grant_wire_digest,redeemed_context
  FROM challenges";
+#[cfg(feature = "gcp")]
+const GCP_JOURNAL_SCHEMA: &str = "CREATE TABLE gcp_journal (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ bucket TEXT CHECK(bucket IS NULL OR length(bucket) BETWEEN 3 AND 63)
+) STRICT";
 const POLICY_SCHEMA: &str = "CREATE TABLE policy_admissions (
  grant_id TEXT PRIMARY KEY REFERENCES challenges(grant_id),
  expected_json BLOB NOT NULL CHECK(length(expected_json) BETWEEN 1 AND 16384),
@@ -93,7 +98,7 @@ impl StoreProfile {
             Self::Legacy => SCHEMA_VERSION,
             Self::PolicyAdmission(_) => POLICY_SCHEMA_VERSION,
             #[cfg(feature = "gcp")]
-            Self::GcpPolicyAdmission { .. } => 4,
+            Self::GcpPolicyAdmission { .. } => 5,
         }
     }
     fn policy_authority(self) -> Option<[u8; 32]> {
@@ -256,6 +261,7 @@ impl Store {
             capacity,
             clock,
             StoreProfile::Legacy,
+            None,
         )
     }
 
@@ -272,6 +278,7 @@ impl Store {
             capacity,
             clock,
             StoreProfile::PolicyAdmission(authority),
+            None,
         )
     }
 
@@ -283,6 +290,7 @@ impl Store {
         clock: &dyn IssuerClock,
         authority: [u8; 32],
         qualification: ValidityWindow,
+        bucket: Option<&str>,
     ) -> Result<Self, StoreError> {
         Self::initialize_profile(
             path,
@@ -293,6 +301,7 @@ impl Store {
                 authority,
                 qualification,
             },
+            bucket,
         )
     }
     #[cfg(feature = "gcp")]
@@ -302,6 +311,7 @@ impl Store {
         capacity: usize,
         authority: [u8; 32],
         qualification: ValidityWindow,
+        bucket: Option<&str>,
     ) -> Result<Self, StoreError> {
         Self::open_profile(
             path,
@@ -311,6 +321,7 @@ impl Store {
                 authority,
                 qualification,
             },
+            bucket,
         )
     }
 
@@ -320,6 +331,7 @@ impl Store {
         capacity: usize,
         clock: &dyn IssuerClock,
         profile: StoreProfile,
+        journal_bucket: Option<&str>,
     ) -> Result<Self, StoreError> {
         validate_config(store_identity_sha384, capacity)?;
         // A retryable clock failure must not leave a partially initialized file.
@@ -328,22 +340,15 @@ impl Store {
         if let StoreProfile::GcpPolicyAdmission { qualification, .. } = profile {
             check_window(qualification, initial_time)?;
         }
-        let mut options = OpenOptions::new();
-        options.write(true).read(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                StoreError::AlreadyExists
-            } else {
-                StoreError::Io(error)
-            }
-        })?;
-        drop(file);
-        let mut connection = open_connection(path)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let staged = tempfile::Builder::new()
+            .prefix(".issuer-init-")
+            .tempfile_in(parent)
+            .map_err(StoreError::Io)?;
+        let mut connection = open_connection(staged.path())?;
         let mode: String = connection.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))?;
         if mode != "delete" {
             return Err(StoreError::Corrupt);
@@ -354,27 +359,45 @@ impl Store {
         if profile.policy_authority().is_some() {
             transaction.execute_batch(POLICY_SCHEMA)?;
         }
+        #[cfg(feature = "gcp")]
+        if matches!(profile, StoreProfile::GcpPolicyAdmission { .. }) {
+            transaction.execute_batch(GCP_JOURNAL_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO gcp_journal(singleton,bucket) VALUES(1,?1)",
+                [journal_bucket],
+            )?;
+        }
         transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
         transaction.pragma_update(None, "user_version", profile.version())?;
         transaction.execute(
             "INSERT INTO store_meta(singleton,identity_sha384,capacity,last_seen_unix_seconds) VALUES(1,?1,?2,?3)",
             params![store_identity_sha384, capacity as i64, initial_time as i64],
         )?;
+        #[cfg(test)]
+        tests::check_init_before_commit()?;
         transaction.commit()?;
-        // Persist the newly created directory entry before acknowledging init.
+        connection
+            .close()
+            .map_err(|(_, error)| StoreError::from(error))?;
+        staged.as_file().sync_all().map_err(StoreError::Io)?;
+        staged.persist_noclobber(path).map_err(|failure| {
+            if failure.error.kind() == std::io::ErrorKind::AlreadyExists {
+                StoreError::AlreadyExists
+            } else {
+                StoreError::Io(failure.error)
+            }
+        })?;
         #[cfg(unix)]
-        std::fs::File::open(
-            path.parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new(".")),
-        )
-        .and_then(|parent| parent.sync_all())
-        .map_err(StoreError::Io)?;
-        Ok(Self {
-            connection: Mutex::new(connection),
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(StoreError::Io)?;
+        Self::open_profile(
+            path,
+            store_identity_sha384,
             capacity,
             profile,
-        })
+            journal_bucket,
+        )
     }
 
     pub(crate) fn open_existing(
@@ -382,7 +405,13 @@ impl Store {
         expected_identity: &str,
         capacity: usize,
     ) -> Result<Self, StoreError> {
-        Self::open_profile(path, expected_identity, capacity, StoreProfile::Legacy)
+        Self::open_profile(
+            path,
+            expected_identity,
+            capacity,
+            StoreProfile::Legacy,
+            None,
+        )
     }
 
     pub(crate) fn open_existing_policy(
@@ -396,6 +425,7 @@ impl Store {
             identity,
             capacity,
             StoreProfile::PolicyAdmission(authority),
+            None,
         )
     }
 
@@ -404,11 +434,20 @@ impl Store {
         expected_identity: &str,
         capacity: usize,
         profile: StoreProfile,
+        journal_bucket: Option<&str>,
     ) -> Result<Self, StoreError> {
         validate_config(expected_identity, capacity)?;
         // READ_WRITE without CREATE: missing state cannot become a fresh store.
-        let connection = open_connection(path)?;
-        validate_database(&connection, expected_identity, capacity, profile)?;
+        let mut connection = open_connection(path)?;
+        let snapshot = connection.transaction()?;
+        validate_database(
+            &snapshot,
+            expected_identity,
+            capacity,
+            profile,
+            journal_bucket,
+        )?;
+        snapshot.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
             capacity,
@@ -596,6 +635,23 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
+    /// Hold the writer lock through a time-sensitive decision. A validity denial
+    /// must still commit the observed time before returning to the caller.
+    #[cfg(feature = "gcp")]
+    pub(super) fn with_live_clock<T>(
+        &self,
+        clock: &dyn IssuerClock,
+        decide: impl FnOnce(u64) -> Result<T, crate::Error>,
+    ) -> Result<T, crate::Error> {
+        let mut connection = self.connection.lock().map_err(|_| StoreError::Corrupt)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::from)?;
+        let decision = decide(observe_clock(&transaction, clock)?);
+        transaction.commit().map_err(StoreError::from)?;
+        decision
+    }
+
     /// Commits before replying. AlreadyRedeemed is status, not another permit.
     pub(crate) fn redeem(
         &self,
@@ -655,7 +711,11 @@ impl Store {
     }
 
     /// Operator-owned immutable expectations. This never consumes a grant.
-    pub(crate) fn pin_policy(&self, pin: &PolicyPin) -> Result<(), StoreError> {
+    pub(crate) fn pin_policy(
+        &self,
+        pin: &PolicyPin,
+        _clock: &dyn IssuerClock,
+    ) -> Result<(), StoreError> {
         let authority = self.policy_authority()?;
         validate_pin_profile(pin, self.profile)?;
         let mut connection = self.connection.lock().map_err(|_| StoreError::Corrupt)?;
@@ -680,6 +740,14 @@ impl Store {
         }
         if issued.redemption_context.is_some() {
             return Err(StoreError::Conflict);
+        }
+        #[cfg(feature = "gcp")]
+        if let StoreProfile::GcpPolicyAdmission { .. } = self.profile {
+            let now = observe_clock(&transaction, _clock)?;
+            if let Err(error) = check_record_window(&issued.reservation, now) {
+                transaction.commit()?;
+                return Err(error);
+            }
         }
         transaction.execute("INSERT INTO policy_admissions(grant_id,expected_json,expected_digest,guest_nonce,policy_digest) VALUES(?1,?2,?3,?4,?5)",
             params![pin.grant_id,pin.expected_json,pin.expected_digest,pin.guest_nonce,pin.policy_digest])?;
@@ -807,7 +875,7 @@ fn open_connection(path: &Path) -> Result<Connection, StoreError> {
     Ok(connection)
 }
 
-fn clock_now(clock: &dyn IssuerClock) -> Result<u64, StoreError> {
+pub(super) fn clock_now(clock: &dyn IssuerClock) -> Result<u64, StoreError> {
     let now = clock.now_unix_seconds().map_err(|error| match error {
         ClockError::Unavailable => StoreError::ClockUnavailable,
         ClockError::OutOfRange => StoreError::ClockOutOfRange,
@@ -869,6 +937,7 @@ fn validate_database(
     identity: &str,
     capacity: usize,
     profile: StoreProfile,
+    _journal_bucket: Option<&str>,
 ) -> Result<(), StoreError> {
     let app_id: i64 = connection.pragma_query_value(None, "application_id", |r| r.get(0))?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -885,12 +954,32 @@ fn validate_database(
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     let mut expected_schema = vec![("challenges".into(), RECORD_SCHEMA.into())];
+    #[cfg(feature = "gcp")]
+    let journal_bound = matches!(profile, StoreProfile::GcpPolicyAdmission { .. });
+    #[cfg(feature = "gcp")]
+    if journal_bound {
+        expected_schema.push(("gcp_journal".into(), GCP_JOURNAL_SCHEMA.into()));
+    }
     if profile.policy_authority().is_some() {
         expected_schema.push(("policy_admissions".into(), POLICY_SCHEMA.into()));
     }
     expected_schema.push(("store_meta".into(), META_SCHEMA.into()));
     if definitions != expected_schema {
         return Err(StoreError::Corrupt);
+    }
+    #[cfg(feature = "gcp")]
+    if journal_bound {
+        let stored = connection
+            .query_row(
+                "SELECT bucket FROM gcp_journal WHERE singleton=1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::Corrupt)?;
+        if stored.as_deref() != _journal_bucket {
+            return Err(StoreError::IdentityMismatch);
+        }
     }
     let (stored_identity, stored_capacity, last_seen): (String, i64, i64) = connection.query_row(
         "SELECT identity_sha384,capacity,last_seen_unix_seconds FROM store_meta WHERE singleton=1",
@@ -921,6 +1010,14 @@ fn validate_database(
             )
             .optional()?;
         if foreign_error.is_some() {
+            return Err(StoreError::Corrupt);
+        }
+        let missing_receipt: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM challenges c LEFT JOIN policy_admissions p
+             ON p.grant_id=c.grant_id WHERE c.redeemed_context IS NOT NULL AND p.receipt_json IS NULL)",
+            [], |row| row.get(0),
+        )?;
+        if missing_receipt {
             return Err(StoreError::Corrupt);
         }
         let mut query = connection.prepare("SELECT grant_id FROM policy_admissions")?;

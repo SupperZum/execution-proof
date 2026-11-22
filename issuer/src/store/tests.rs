@@ -233,7 +233,7 @@ fn policy_authorization_fixture(
         guest_nonce: "41".repeat(32),
         policy_digest: "42".repeat(48),
     };
-    store.pin_policy(&pin).unwrap();
+    store.pin_policy(&pin, &FixedClock).unwrap();
     // Internal database fixture, not a contract/producer verification test.
     // The public issuer path independently derives this complete template.
     AdmissionAuthorizationV1 {
@@ -930,4 +930,104 @@ fn consumed_history_works_with_failed_clock_and_old_schema_is_not_migrated() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(version, 1);
+}
+
+#[test]
+fn policy_reopen_checks_both_halves_and_concurrent_redeem_returns_exact_receipt() {
+    let dir = TestDir::new();
+    let path = dir.db();
+    let authority = key(2).public_key().as_ref().try_into().unwrap();
+    let first =
+        Store::initialize_new_policy(&path, &identity(), 2, &FixedClock, authority).unwrap();
+    let reservation = first.reserve_lab(&candidate("policy-reopen", 1)).unwrap();
+    let (issued, grant, _) = issued_fixture(&first, &reservation);
+    let auth = policy_authorization_fixture(&first, &issued, &grant);
+    let reopen = || Store::open_existing_policy(&path, &identity(), 2, authority);
+    {
+        // Install on the writer connection to fail only the receipt update.
+        let writer = first.connection.lock().unwrap();
+        writer.execute_batch("CREATE TEMP TRIGGER fail_receipt BEFORE UPDATE OF receipt_json ON policy_admissions BEGIN SELECT RAISE(ABORT, 'fixture'); END").unwrap();
+    }
+    assert!(first.redeem_policy(&auth, &key(2), &FixedClock).is_err());
+    assert!(first
+        .get_issued(&auth.grant_id)
+        .unwrap()
+        .redemption_context
+        .is_none());
+    assert!(first.policy_status(&auth).unwrap().is_none());
+    first
+        .connection
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_receipt")
+        .unwrap();
+    let second = reopen().unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let redeem = |store: Store| {
+        barrier.wait();
+        store.redeem_policy(&auth, &key(2), &FixedClock).unwrap()
+    };
+    let (a, b) = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| redeem(first));
+        (redeem(second), worker.join().unwrap())
+    });
+    assert_ne!(a.publication, b.publication);
+    assert_eq!(a.bytes, b.bytes);
+    assert_eq!(
+        reopen().unwrap().policy_status(&auth).unwrap(),
+        Some(a.bytes)
+    );
+    for sql in [
+        "DELETE FROM policy_admissions",
+        "UPDATE policy_admissions SET receipt_json=NULL, receipt_wire_digest=NULL",
+        "UPDATE challenges SET redeemed_context=NULL",
+        "UPDATE challenges SET redeemed_context=lower(hex(zeroblob(48)))",
+    ] {
+        let copy = path.with_extension("copy");
+        std::fs::copy(&path, &copy).unwrap();
+        Connection::open(&copy).unwrap().execute(sql, []).unwrap();
+        assert!(
+            matches!(
+                Store::open_existing_policy(&copy, &identity(), 2, authority),
+                Err(StoreError::Corrupt)
+            ),
+            "{sql}"
+        );
+    }
+}
+
+thread_local! { static FAIL_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+pub(super) fn check_init_before_commit() -> Result<(), StoreError> {
+    if FAIL_INIT.replace(false) {
+        return Err(StoreError::Io(std::io::Error::other("init fixture")));
+    }
+    Ok(())
+}
+
+#[test]
+fn interrupted_init_can_retry_and_cannot_replace_the_committed_database() {
+    let dir = TestDir::new();
+    let path = dir.db();
+    FAIL_INIT.set(true);
+    assert!(matches!(
+        initialize(&path, &identity(), 2),
+        Err(StoreError::Io(_))
+    ));
+    assert!(!path.exists());
+    let live = initialize(&path, &identity(), 2).unwrap();
+    let reserved = live.reserve_lab(&candidate("preserved", 1)).unwrap();
+    drop(live);
+    assert!(matches!(
+        initialize(&path, &identity(), 2),
+        Err(StoreError::AlreadyExists)
+    ));
+    assert_eq!(
+        Store::open_existing(&path, &identity(), 2)
+            .unwrap()
+            .challenge(&reserved.challenge.challenge_id)
+            .unwrap()
+            .grant_id,
+        reserved.grant_id
+    );
 }
