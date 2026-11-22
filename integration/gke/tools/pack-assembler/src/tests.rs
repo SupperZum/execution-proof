@@ -330,6 +330,54 @@ fn pinned_reader_rejects_wrong_hash_symlink_hardlink_and_outside_root() {
     assert!(canonical(Path::new("relative")).is_err());
 }
 #[test]
+fn failed_second_write_stays_unpublished_and_retry_publishes_once() {
+    let directory = Directory::new();
+    let path = directory.0.join("output");
+    let mut assembled = Assembled {
+        pack: b"first pack".to_vec(),
+        trust: b"trust".to_vec(),
+        challenge: b"challenge".to_vec(),
+    };
+    let error = publish_directory(&path, |dir| {
+        // Force create_new for the second file to fail after the first is synced.
+        fs::write(dir.join("trust.json"), b"collision")?;
+        let result = write_pack(dir, &assembled);
+        assert_eq!(fs::read(dir.join("pack.json"))?, assembled.pack);
+        assert!(!path.try_exists()?);
+        result
+    })
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+
+    publish(&path, &assembled).unwrap();
+    let receipt_bytes = serde_json::to_vec(&receipt(&assembled)).unwrap();
+    assembled.pack = b"replacement".to_vec();
+    assert!(publish(&path, &assembled).is_err());
+    assert_eq!(fs::read_dir(&path).unwrap().count(), 4);
+    assert_eq!(fs::read(path.join("pack.json")).unwrap(), b"first pack");
+    assert_eq!(fs::read(path.join("trust.json")).unwrap(), b"trust");
+    assert_eq!(fs::read(path.join("challenge.json")).unwrap(), b"challenge");
+    assert_eq!(fs::read(path.join("assembly.json")).unwrap(), receipt_bytes);
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+}
+#[test]
+fn directory_created_during_publication_is_preserved() {
+    let directory = Directory::new();
+    let path = directory.0.join("output");
+    let result = publish_directory(&path, |dir| {
+        fs::write(dir.join("pack.json"), b"staged")?;
+        fs::create_dir(&path)?;
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+}
+#[test]
 fn output_create_only_and_non_authorizing_receipt() {
     let directory = Directory::new();
     let path = directory.0.join("output");

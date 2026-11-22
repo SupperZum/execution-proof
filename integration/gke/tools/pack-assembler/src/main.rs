@@ -18,6 +18,7 @@ use execution_proof_verifier::{
     schema::{ObjectKind, SupportingObject, MAX_OBJECT_BYTES, MAX_PACK_BYTES, MAX_TRUST_BYTES},
 };
 use ring::digest;
+use rustix::fs::{renameat_with, RenameFlags, CWD};
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::{
     collections::BTreeSet,
@@ -131,8 +132,10 @@ fn hex(value: &str, bytes: usize) -> Result<()> {
 }
 fn canonical(path: &Path) -> Result<()> {
     let root = Path::new(ROOT);
-    require(root.is_absolute() && root != Path::new("/") && fs::canonicalize(root)? == root,
-        "canonical public input root required")?;
+    require(
+        root.is_absolute() && root != Path::new("/") && fs::canonicalize(root)? == root,
+        "canonical public input root required",
+    )?;
     require(
         path.is_absolute() && path.starts_with(root) && fs::canonicalize(path)? == path,
         "public canonical workspace path required",
@@ -520,6 +523,9 @@ fn receipt(assembled: &Assembled) -> OutputReceipt {
     }
 }
 fn publish(output: &Path, assembled: &Assembled) -> Result<()> {
+    publish_directory(output, |dir| write_pack(dir, assembled))
+}
+fn publish_directory(output: &Path, populate: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     let parent = output.parent().ok_or("output parent required")?;
     canonical(parent)?;
     let name = output
@@ -534,8 +540,25 @@ fn publish(output: &Path, assembled: &Assembled) -> Result<()> {
                 .all(|v| v.is_ascii_alphanumeric() || b"-_".contains(&v)),
         "simple output directory name required",
     )?;
-    fs::create_dir(output)?;
-    fs::set_permissions(output, fs::Permissions::from_mode(0o700))?;
+    let parent_dir = File::open(parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".pack-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)?;
+    populate(staging.path())?;
+    File::open(staging.path())?.sync_all()?;
+    renameat_with(
+        CWD,
+        staging.path(),
+        &parent_dir,
+        name,
+        RenameFlags::NOREPLACE,
+    )?;
+    let _ = staging.keep();
+    parent_dir.sync_all()?;
+    Ok(())
+}
+fn write_pack(output: &Path, assembled: &Assembled) -> Result<()> {
     let record = serde_json::to_vec(&receipt(assembled))?;
     for (name, raw) in [
         ("pack.json", assembled.pack.as_slice()),
@@ -552,8 +575,6 @@ fn publish(output: &Path, assembled: &Assembled) -> Result<()> {
         file.write_all(raw)?;
         file.sync_all()?;
     }
-    File::open(output)?.sync_all()?;
-    File::open(parent)?.sync_all()?;
     Ok(())
 }
 fn run() -> Result<()> {
