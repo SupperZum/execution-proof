@@ -112,8 +112,7 @@ def caa_manifests(profile, assets, image):
         "provider": "gcp",
         "limit": "1",
         "image": {"name": name, "tag": f"{tag}@{image['digest']}"},
-        "secrets": {"mode": "reference", "existingSecretName": "caa-adc",
-                    "existingTlsSecretName": "caa-relay-tls"},
+        "secrets": {"mode": "reference", "existingTlsSecretName": "caa-relay-tls"},
         "tlsProfile": {"minVersion": "VersionTLS13"},
         "providerConfigs": {"gcp": {
             "GCP_PROJECT_ID": profile["project"], "GCP_ZONE": profile["zone"],
@@ -141,6 +140,9 @@ def caa_manifests(profile, assets, image):
     require(len(containers) == 1 and containers[0]["image"] == f"{name}:{tag}@{image['digest']}",
             "unexpected CAA image or container layout")
     container = containers[0]
+    # The stock entrypoint requires inline GCP_CREDENTIALS and replaces the ADC path.
+    container["command"] = ["/usr/local/bin/cloud-api-adaptor"]
+    container["args"] = ["gcp"]
     container["imagePullPolicy"] = "Never"
     spec.setdefault("nodeSelector", {})[WORKER_LABEL] = "true"
     mounts = container.setdefault("volumeMounts", [])
@@ -174,7 +176,7 @@ def caa_manifests(profile, assets, image):
 
 def render(profile, output, assets):
     verify_charts(assets)
-    image = caa_image(assets / "caa-linux-amd64.oci.tar")
+    image = checked_caa_image(assets)
     kata = helm(assets / "charts/kata-deploy-4.0.0.tgz", "proof-kata",
                  ROOT / "templates/kata-values.yaml", profile["kubernetes_version"])
     require(sum(obj["kind"] == "RuntimeClass" and obj["metadata"]["name"] == "kata-remote"
@@ -197,6 +199,17 @@ def render(profile, output, assets):
         json.dump(image, receipt, indent=2)
         receipt.write("\n")
     print(f"Rendered Kubernetes manifests in {output}")
+
+
+def checked_caa_image(assets):
+    receipt = read_json(assets / "caa-build-receipt.json")
+    archive = assets / "caa-linux-amd64.oci.tar"
+    with archive.open("rb") as stream:
+        require(file_digest(stream, "sha256").hexdigest() == receipt["archive_sha256"],
+                "CAA archive differs from the build receipt")
+    image = caa_image(archive)
+    require(image["digest"] == receipt["manifest_digest"], "CAA manifest differs from the build receipt")
+    return image
 
 
 if __name__ == "__main__":

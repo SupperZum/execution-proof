@@ -26,10 +26,30 @@ class DeploymentAssetTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unexpected Helm chart digest"):
                     render.verify_charts(root)
 
+    def test_gcp_runs_the_provider_with_file_adc(self):
+        profile = json.loads((render.ROOT / "deployment.example.json").read_text())
+        image = {"reference": "test.invalid/caa:stock", "digest": "sha256:" + "a" * 64}
+        container = {"command": ["/usr/local/bin/entrypoint.sh"],
+                     "image": image["reference"] + "@" + image["digest"]}
+        spec = {"serviceAccountName": "cloud-api-adaptor", "containers": [container]}
+        chart = [{"kind": "DaemonSet", "spec": {"template": {"spec": spec}}}]
+        with patch.object(render, "helm", return_value=chart) as helm:
+            render.caa_manifests(profile, Path("."), image)
+        values = helm.call_args.args[2]
+        self.assertEqual(values["secrets"], {"mode": "reference", "existingTlsSecretName": "caa-relay-tls"})
+        self.assertEqual(container["command"] + container["args"], ["/usr/local/bin/cloud-api-adaptor", "gcp"])
+        mount = next(m for m in container["volumeMounts"] if m["name"] == "proof-caa-adc")
+        secret = next(v["secret"] for v in spec["volumes"] if v["name"] == mount["name"])
+        self.assertTrue(mount["readOnly"])
+        self.assertEqual(secret, {"secretName": "caa-adc", "defaultMode": 0o400,
+                                  "items": [{"key": "GCP_CREDENTIALS", "path": "GCP_CREDENTIALS"}]})
+        self.assertEqual(container["env"], [{"name": "GOOGLE_APPLICATION_CREDENTIALS",
+                          "value": mount["mountPath"] + "/" + secret["items"][0]["path"]}])
+
     def test_uses_manifest_digest_and_checks_platform(self):
         for architecture in ("amd64", "arm64"):
             with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as raw:
-                path = Path(raw) / "caa.tar"
+                path = Path(raw) / "caa-linux-amd64.oci.tar"
                 with tarfile.open(path, "w") as archive:
                     def write(name, value):
                         data = json.dumps(value).encode()
@@ -45,13 +65,20 @@ class DeploymentAssetTests(unittest.TestCase):
                         "mediaType": "application/vnd.oci.image.manifest.v1+json",
                         "digest": digest,
                     }]})
+                receipt = path.parent / "caa-build-receipt.json"
+                pins = {"manifest_digest": digest, "archive_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                receipt.write_text(json.dumps(pins))
                 if architecture == "amd64":
-                    self.assertEqual(render.caa_image(path), {
+                    self.assertEqual(render.checked_caa_image(path.parent), {
                         "reference": render.CAA_REFERENCE, "digest": digest,
                     })
+                    for field, error in [("manifest_digest", "CAA manifest"), ("archive_sha256", "CAA archive")]:
+                        receipt.write_text(json.dumps({**pins, field: "0" * 64}))
+                        with self.assertRaisesRegex(ValueError, error):
+                            render.checked_caa_image(path.parent)
                 else:
                     with self.assertRaisesRegex(ValueError, "Linux amd64"):
-                        render.caa_image(path)
+                        render.checked_caa_image(path.parent)
 
 
 if __name__ == "__main__":
