@@ -601,7 +601,7 @@ assert not stop.exists()
 ready.with_name("helper-finished").touch()
 """
             command = [sys.executable, "-c", script, str(ready), str(stopped), "fail" if failure else "serve"]
-            target = SimpleNamespace(expected=EXPECTED, instance="test-abcdef12")
+            target = SimpleNamespace(expected=EXPECTED, pod_name="proof-2", instance="test-abcdef12")
 
             def terminal():
                 until = time.monotonic() + 1
@@ -642,7 +642,7 @@ ready.with_name("helper-finished").touch()
     def test_serial_failure_preserves_concurrent_heartbeat_exit(self):
         script = ("import sys; print('ONB17_CAA_HEARTBEAT_BOUND', flush=True); "
                   "print('ONB17_CAA_HEARTBEAT_READY', flush=True); sys.exit(7)")
-        target = SimpleNamespace(expected=EXPECTED, instance="test-abcdef12")
+        target = SimpleNamespace(expected=EXPECTED, pod_name="proof-2", instance="test-abcdef12")
         with mock.patch.object(run, "worker_command", return_value=[sys.executable, "-c", script]):
             with self.assertRaisesRegex(controller.AttemptError, "^attempt_deadline$") as failure:
                 with run.heartbeat({}, target, self.deadline):

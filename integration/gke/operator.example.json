@@ -16,6 +16,14 @@
   "effective_spec": "/absolute/profile/effective-spec.json",
   "signed_intent": "/absolute/profile/signed-intent.json",
   "tenant_public_key": "/absolute/profile/tenant-public.raw",
+  "intent_cluster_id": "SET_STABLE_CLUSTER_ID",
+  "intent_store": "/absolute/private/intent-store",
+  "intent_ttl_seconds": 900,
+  "tenant_key": "/tmp/SET_PRIVATE_SIGNER_DIRECTORY/tenant.pk8",
+  "intent_signer": {
+    "path": "/absolute/bin/onb17-prototype-statement-signer",
+    "sha384": "SET_SHA384"
+  },
   "collateral": "/absolute/profile/collateral.json",
   "signed_q": "/absolute/qualification/signed-q.json",
   "selection": "/absolute/qualification/selection.json",

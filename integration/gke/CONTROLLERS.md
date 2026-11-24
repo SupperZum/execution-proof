@@ -42,9 +42,8 @@ Use one measured boot profile for both phases. Set `binding` to the boot
 expectations JSON containing the `boot_binding` member. Set `manifest`,
 `references`, `boot_config` and `producer_core` to the exact bytes shipped
 with the image. Use the included effective spec examples to prepare the
-qualification and Pod specs. Sign each tenant intent with the independently
-configured tenant key over its distinct workload, attempt, digest, spec hash
-and boot binding. Set `serial_host_public_keys` to Google's authenticated
+qualification spec and the Pod spec for a manually signed intent. Automatic
+Pod scheduling and launch derive the effective spec from the selected Pod. Set `serial_host_public_keys` to Google's authenticated
 public-key list for the deployment region and pin its SHA-384. Confirm the
 serial SSH public key is registered for this deployment's `serial_user`
 and instance before opening a connection. Use known host keys and an
@@ -119,6 +118,9 @@ python3 -B tools/controller/run.py preflight deployment.json qualification-opera
 
 ## Launch the gated Pod and archive the proof
 
+For automatic intent issuance, use the [event UID scheduling command](#schedule-with-an-automatically-issued-intent).
+The sequence below accepts a previously signed intent.
+
 1. Create `rendered/pod.yaml` with the scheduling gate intact. In the Pod
    operator JSON set `authority` to the normal Authority executable and its
    SHA-384, set the live Q and reviewed selection, and use a new signed
@@ -166,3 +168,95 @@ If scheduling is interrupted, rerun `schedule` with the same operator configurat
 and receipt. It checks the receipt against the current Pod UID and deployment inputs.
 If the gate is already gone it returns success. If the original gate is present it
 retries the guarded patch. A replacement Pod requires a fresh intent and private store.
+
+## Inspect Pod inputs before signing
+
+Run the following command while the Pod still has its scheduling gate.
+
+```bash
+python3 -B tools/controller/run.py select-intent-inputs deployment.json pod-operator.json --pod-name proof-1
+```
+
+The command reads the named Pod in the `execution-proof` namespace through the
+configured Kubernetes context. It checks the single-container profile in
+`templates/pod.yaml` and the exact workload image reference in the deployment.
+The JSON result includes the Pod UID and resource version, the selected manifest
+digest, and the effective OCI spec with the Pod hostname. The SHA-384 covers
+the UTF-8 bytes of the decoded `effective_spec` string. This read-only operation
+selects inputs for the first container start.
+
+## Issue an intent for a gated Pod
+
+Assign one stable `intent_cluster_id` to the authenticated cluster. Configure
+all issuers for that cluster to use the same existing `intent_store` directory
+on the trusted controller host. The directory must be owned by the controller
+user with mode 0700 on a local filesystem that supports SQLite locking.
+Keep its `attempts.sqlite` across restarts for the lifetime of the attempts.
+
+Configure `intent_signer` with the executable path and SHA-384 of the
+prototype signer and `tenant_key` with its provisioned `tenant.pk8` path.
+The signer expects that file in an owner-only directory directly under
+`/tmp` and checks the key against `tenant_public_key`. Set `intent_ttl_seconds`
+to 1–3600 seconds. The signed qualification sets the upper expiry bound.
+The issuer configuration supplies the tenant, audience, authority, boot
+binding and policy hashes. Use the same public key and policy settings when
+initializing the Authority for the selected PodVM.
+
+```bash
+python3 -B tools/controller/run.py issue-intent deployment.json pod-operator.json --pod-name proof-1
+```
+
+The command reads the gated Pod, verifies its selected profile and signed
+qualification, and writes the signed tenant intent to stdout after committing
+its receipt. The receipt key contains the cluster identity, namespace, Pod
+UID, container name and start number. Repeating the command for the same
+inputs while the intent is valid returns the original bytes. A change to the
+bound inputs or an expired intent stops issuance for that key. A replacement
+Pod with a new UID receives fresh workload and attempt IDs. Both IDs start
+with the checked qualification selection’s `normal_namespace`, followed by
+independent random suffixes. Configure the pack assembler with the same
+`PROOF_WORKLOAD_PREFIX`. Recovery rejects a stored intent with an incompatible
+ID and preserves its signed bytes.
+
+## Schedule with an automatically issued intent
+
+Pass the name and UID from the Kubernetes event to the controller. Use a distinct
+`pod_receipt` path for each Pod UID and retain the shared `intent_store` across
+deliveries. Configure the signer and issuer as described above.
+
+```bash
+python3 -B tools/controller/run.py schedule deployment.json pod-operator.json \
+  --pod-name "$POD_NAME" --pod-uid "$POD_UID"
+```
+
+The controller reads that Pod from the configured API, issues or reuses its
+committed intent, and persists the intent digest and attempt ID in the
+scheduling receipt before patching the gate. The patch tests the Pod UID,
+resource version, image and gate. After a lost response, retry with the
+original event UID and receipt path. An open gate with matching receipts in
+both stores completes the request. A gate still present is patched against
+the newly validated resource version. A replacement UID ends the original
+request. A successful response reports scheduling for the authorized attempt.
+
+Once CAA creates the PeerPod, use the same event name and UID to identify the
+PodVM. Configure the instance pins and worker as described in the launch
+procedure, then run the launch command in its private service.
+
+```bash
+python3 -B tools/controller/run.py describe-pod deployment.json pod-operator.json \
+  --pod-name "$POD_NAME" --pod-uid "$POD_UID"
+python3 -B tools/controller/run.py launch deployment.json pod-operator.json \
+  --pod-name "$POD_NAME" --pod-uid "$POD_UID"
+```
+
+Launch reads the scheduled Pod from the Kubernetes API and derives its effective
+OCI spec. It retrieves the original signed intent from `intent_store`, verifies
+its signature and validity, and compares the full scheduling receipt before
+contacting the Authority. The Authority receives the committed intent bytes
+in its normal Begin request. The guest startup protocol uses the verified spec.
+This command requires neither a tenant signing key nor external `signed_intent`
+and `effective_spec` files.
+
+The default deployment grants CAA permission to update Pod finalizers for
+`proof-1`. For another Pod name, grant that permission for its exact name and
+install a heartbeat helper built from this version.
