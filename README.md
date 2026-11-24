@@ -19,6 +19,8 @@ points and their trust inputs.
 
 Follow the [prototype run guide](docs/run-prototype.md) to verify the sample
 evidence offline or run an encrypted workload on GKE with Intel TDX.
+The [local collector and delivery queue](integration/collector/README.md) archive
+completed GCP bundles and return signed receipts for later retrieval.
 
 ## Workspace
 
