@@ -53,7 +53,7 @@ func TestHeartbeatRedialAndShutdown(t *testing.T) {
 				}
 			}
 			const uid = "0027be54-893f-410b-9d7a-b130575f7320"
-			config := `{"annotations":{"io.kubernetes.cri.sandbox-uid":"` + uid + `","io.kubernetes.cri.sandbox-name":"proof-1","io.kubernetes.cri.sandbox-namespace":"execution-proof","io.kubernetes.cri.container-type":"sandbox"}}`
+			config := `{"annotations":{"io.kubernetes.cri.sandbox-uid":"` + uid + `","io.kubernetes.cri.sandbox-name":"proof-2","io.kubernetes.cri.sandbox-namespace":"execution-proof","io.kubernetes.cri.container-type":"sandbox"}}`
 			if err := os.WriteFile(filepath.Join(tasks, id, "config.json"), []byte(config), 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -82,7 +82,7 @@ func TestHeartbeatRedialAndShutdown(t *testing.T) {
 			}()
 			var markers bytes.Buffer
 			done := make(chan error, 1)
-			go func() { done <- heartbeat(ctx, pods, tasks, uid, "proof-1", id[:8], &markers) }()
+			go func() { done <- heartbeat(ctx, pods, tasks, uid, "proof-2", id[:8], &markers) }()
 			select {
 			case <-service.tick:
 			case <-ctx.Done():
@@ -108,5 +108,18 @@ func TestHeartbeatRedialAndShutdown(t *testing.T) {
 				t.Fatalf("markers: %q", got)
 			}
 		})
+	}
+}
+
+func TestHeartbeatPodName(t *testing.T) {
+	for _, name := range []string{"proof-1", "proof-2", strings.Repeat("x", 63)} {
+		if !heartbeatPod.MatchString(name) {
+			t.Errorf("rejected Pod name %q", name)
+		}
+	}
+	for _, name := range []string{"", "../proof-2", "-bad", "bad-", strings.Repeat("x", 64)} {
+		if heartbeatPod.MatchString(name) {
+			t.Errorf("accepted invalid Pod name %q", name)
+		}
 	}
 }

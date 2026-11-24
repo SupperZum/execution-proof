@@ -28,7 +28,7 @@ const (
 
 var (
 	heartbeatPodUID = regexp.MustCompile(`^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$`)
-	heartbeatPod    = regexp.MustCompile(`^proof-1$`)
+	heartbeatPod    = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 	heartbeatPrefix = regexp.MustCompile(`^[a-f0-9]{8}$`)
 	heartbeatID     = regexp.MustCompile(`^[a-f0-9]{64}$`)
 )
