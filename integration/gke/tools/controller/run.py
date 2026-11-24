@@ -26,6 +26,7 @@ import kubernetes_serial as kube
 import no_swap_guard
 import qualification_gcp as qualification
 import qualification_serial
+import archive_delivery
 import serial_gateway as serial
 import tenant_intent
 
@@ -544,6 +545,10 @@ def launch(client, config, binding, values, deadline, *, name=POD, uid=None, out
         require(cloud._vm_prefix(target.pod_name) + result.sandbox_id[:8] == target.instance,
                 "worker_podvm_binding")
         return result
+    confirm_archive = None
+    if "collector_socket" in config:
+        confirm_archive = archive_delivery.Relay(path(config, "collector_socket"),
+            json.loads(intent)["statement"]["attempt_id"])
     with heartbeat(config, target, deadline) as finish_heartbeat, serial_config(target, config, deadline) as serial_options, \
             management_key(config) as key:
         with cloud.GceSerial(target, serial_options, read_target) as gateway:
@@ -551,7 +556,7 @@ def launch(client, config, binding, values, deadline, *, name=POD, uid=None, out
                 manifest=values["manifest"], references=values["references"],
                 effective_spec=effective_spec, management_key=key,
                 archive_directory=path(config, "archive"), deadline=deadline, target_receipt=target.receipt(),
-                before_stop=finish_heartbeat, outcome=outcome)
+                before_stop=finish_heartbeat, outcome=outcome, confirm_archive=confirm_archive)
 
 
 def qualify(client, config, binding, values, deadline, *, outcome=None):
@@ -575,13 +580,15 @@ def qualify(client, config, binding, values, deadline, *, outcome=None):
     kata = qualification_serial.KataProcess(path(config["kata"], "path"), config["kata"]["sha384"],
         cid=cid, sandbox=config["qualification_sandbox"], image=client.profile["workload_image"],
         relay_config=path(config, "relay_config"))
+    confirmation = (archive_delivery.qualification_confirmation(path(config, "qualification_export_receipt"))
+                    if "qualification_export_receipt" in config else None)
     with kata, serial_config(target, config, deadline) as serial_options, management_key(config) as key:
         with qualification.QualificationGceSerial(target, serial_options, refresh, cid) as gateway:
             return qualification_serial.drive(gateway, authority, kata, expected_cid=cid,
                 manifest=values["manifest"], references=values["references"],
                 effective_spec=values["effective_spec"], management_key=key,
                 archive_directory=path(config, "archive"), deadline=deadline, target_receipt=target.receipt(),
-                outcome=outcome)
+                outcome=outcome, confirm_archive=confirmation)
 
 
 @contextmanager

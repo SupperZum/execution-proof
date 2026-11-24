@@ -127,7 +127,7 @@ class PublicArchive:
     def put(self, name, raw):
         require(name in {"manifest.json", "references.json", "challenge.json", "bootstrap.json",
                          "grant.json", "policy.json", "plan.json", "admission-request.json",
-                         "authorization.json", "controller.json", "export.json", "result.json","failure.json"},
+                         "authorization.json", "controller.json", "export.json", "result.json","failure.json","archive-ack.json"},
                 "archive_name")
         public_json(raw)
         require(all(not pattern or pattern not in raw for pattern in self.patterns), "private_retention")

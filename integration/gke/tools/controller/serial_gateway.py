@@ -227,6 +227,15 @@ def public_frame(raw, *, ready_diagnostics=False):
     _no_secret(value)
     if phase in ('control-ready', 'ready') or (phase == 'unproven' and p == {}):
         _keys(p, [])
+    elif phase == 'qualification-export-archived':
+        _keys(p, ['attempt_id', 'export_sha384'])
+        _identifier(p['attempt_id'])
+        _hex(p['export_sha384'], 48)
+    elif phase in ('archive-pending', 'archive-acknowledged'):
+        _keys(p, ['attempt_id'] if phase == 'archive-pending' else ['attempt_id', 'pack_sha384'])
+        _identifier(p['attempt_id'])
+        if phase == 'archive-acknowledged':
+            _hex(p['pack_sha384'], 48)
     elif phase == 'unproven' and isinstance(p, dict) and 'report_cleanup' in p:
         report_cleanup_result(p)
     elif phase == 'unproven':
@@ -802,7 +811,7 @@ class SerialGateway:
         return self._stage, p
 
     def send_stop(self):
-        _require(self._stage in ('export', 'unproven'), 'operation_order')
+        _require(self._stage in ('export', 'unproven', 'archive-acknowledged'), 'operation_order')
         self._control({'stop': True})
         self._stage = 'stop-sent'
         until = self._deadline()

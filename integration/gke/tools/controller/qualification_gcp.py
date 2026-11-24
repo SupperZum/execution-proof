@@ -107,7 +107,13 @@ class QualificationGceSerial(serial.SerialGateway):
     receive_sandbox_ready = cloud.controller.LocalSerial.receive_sandbox_ready
     receive_candidate = cloud.controller.LocalSerial.receive_candidate
     send_plan = cloud.controller.LocalSerial.send_plan
-    send_stop = cloud.controller.LocalSerial.send_stop
+    def send_stop(self):
+        if self._stage == "qualification-export-archived":
+            self._control({"stop": True})
+            self._stage = "stop-sent"
+        else:
+            cloud.controller.LocalSerial.send_stop(self)
+
     _software_fixture = False
 
     def __init__(self, target, config, refresh, cid):

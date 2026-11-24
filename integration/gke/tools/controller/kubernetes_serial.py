@@ -244,7 +244,7 @@ class LocalSerial:
         self._stage = "plan-sent"
 
     def send_stop(self):
-        stages = ("quote-unavailable",) if self._software_fixture else ("export", "unproven")
+        stages = ("quote-unavailable",) if self._software_fixture else ("export", "unproven", "archive-acknowledged")
         serial._require(self._stage in stages, "operation_order")
         self._control({"stop": True})
         self._stage = "stop-sent"
@@ -434,7 +434,8 @@ def _archive_local_record(archive, raw):
 
 
 def drive(gateway, authority, read_worker, *, expected, manifest, references, effective_spec,
-          management_key, archive_directory, deadline, target_receipt=None, before_stop=None, outcome=None):
+          management_key, archive_directory, deadline, target_receipt=None, before_stop=None, outcome=None,
+          confirm_archive=None):
     """Run the GCP-format protocol over the supplied transport without a cloud client.
 
     The trusted authority supplies signed inputs. The worker callback selects a
@@ -543,12 +544,15 @@ def drive(gateway, authority, read_worker, *, expected, manifest, references, ef
             "producer_qualified": False,
             "execution_verified": False,
         }
-        # Early sandbox treats Stop as the archive acknowledgement. Retain
-        # both the original export and the terminal receipt before sending it.
+        # Persist the terminal publication before entering its shutdown protocol.
         if phase == "unproven":
             result.update(serial.report_cleanup_result(publication))
         archive.put("result.json", attempt.encode(result))
         live()
+        if phase == "export" and confirm_archive is not None:
+            ack = confirm_archive(gateway, deadline)
+            archive.put("archive-ack.json", attempt.encode(ack))
+            live()
         try:
             if before_stop is not None:
                 before_stop()

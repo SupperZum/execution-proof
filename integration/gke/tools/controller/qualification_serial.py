@@ -69,7 +69,7 @@ def _finished(value):
 
 
 def drive(gateway, authority, kata, *, expected_cid, manifest, references, effective_spec,
-          management_key, archive_directory, deadline, phase_hooks=None, target_receipt=None, outcome=None):
+          management_key, archive_directory, deadline, phase_hooks=None, target_receipt=None, outcome=None, confirm_archive=None):
     """Archive the protected export before ACK, then join the operator's Kata caller."""
     require(controller._deadline_is_bounded(deadline), "attempt_deadline")
     validate_cid(expected_cid)
@@ -147,7 +147,8 @@ def drive(gateway, authority, kata, *, expected_cid, manifest, references, effec
         _live(deadline)
         require(phase in ("export", "unproven"), "unexpected_execution_phase")
         if phase == "export":
-            archive.put("export.json", controller._protected_export(publication, expected_cid))
+            export = controller._protected_export(publication, expected_cid)
+            archive.put("export.json", export)
             outcome.protected_export_available = True
         result = {
             "mode": "qualification_experiment",
@@ -162,6 +163,10 @@ def drive(gateway, authority, kata, *, expected_cid, manifest, references, effec
             result.update(serial.report_cleanup_result(publication))
         archive.put("result.json", attempt.encode(result))
         _live(deadline)
+        if phase == "export" and confirm_archive is not None:
+            record = confirm_archive(gateway, grant, export, deadline)
+            archive.put("archive-ack.json", attempt.encode(record))
+            _live(deadline)
         gateway.send_stop()
         terminal = _finished(kata.finish(deadline))
         receipt = {"candidate": candidate, "task": terminal}

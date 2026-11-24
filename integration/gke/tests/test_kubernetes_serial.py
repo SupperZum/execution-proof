@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 import zlib
 
+import archive_delivery
 import kubernetes_serial as controller
 import run
 
@@ -149,6 +150,29 @@ class SerialTests(unittest.TestCase):
         self.gateway = controller.LocalSerial(
             self.host_read, self.host_write, self.deadline, phase_seconds=0.5
         )
+
+    def test_archive_relay_waits_for_matching_guest_ack_before_stop(self):
+        attempt_id = "test-attempt"
+        bound = {"attempt_id": attempt_id, "pack_sha384": "aa" * 48}
+        receipt = {"statement": bound, "signature": "test-signature"}
+        relay = archive_delivery.Relay(self.archive / "socket", attempt_id)
+        self.gateway._stage = "export"
+
+        def guest():
+            for _ in range(2):
+                self.assertEqual(request(self.peer), {"request_archive_status": True})
+                publish(self.peer, "archive-pending", {"attempt_id": attempt_id})
+            self.assertEqual(request(self.peer), {"archive_receipt": receipt})
+            publish(self.peer, "archive-acknowledged", bound)
+            self.assertEqual(request(self.peer), {"stop": True})
+
+        with ThreadPoolExecutor(1) as workers, mock.patch.object(relay, "receipt", side_effect=[None, receipt]), \
+                mock.patch("archive_delivery.time.sleep", return_value=None):
+            peer = workers.submit(guest)
+            result = relay(self.gateway, self.deadline)
+            self.assertEqual(result, {"guest": bound, "receipt": receipt})
+            self.gateway.send_stop()
+            peer.result(timeout=2)
 
     def test_partial_control_write_stops_on_simultaneous_input_and_writability(self):
         ssh = controller.serial.SerialGateway(self.gateway.config)
