@@ -4,6 +4,11 @@ set -eu
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/home/kubernetes/bin
 export LC_ALL=C
 cd /
+case "${1:-}" in
+    "") expected_socket=/run/peerpod/hypervisor.sock ;;
+    --single-guest) expected_socket=/run/execution-proof/single-guest.sock ;;
+    *) exit 2 ;;
+esac
 
 check() {
     if ! "$@"; then
@@ -85,6 +90,7 @@ for file in "$(dirname "$kata_config")"/config.d/*; do
 done
 remote_socket=$(toml_value hypervisor.remote remote_hypervisor_socket "$@")
 remote_timeout=$(toml_value hypervisor.remote remote_hypervisor_timeout "$@")
-check test "$remote_socket" = /run/peerpod/hypervisor.sock
+check test "$remote_socket" = "$expected_socket"
+check test -S "$remote_socket"
 check test "$remote_timeout" = 600
 printf 'remote_hypervisor_socket=%s\nremote_hypervisor_timeout=%s\n' "$remote_socket" "$remote_timeout"

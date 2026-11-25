@@ -34,7 +34,9 @@ class DeploymentAssetTests(unittest.TestCase):
         spec = {"serviceAccountName": "cloud-api-adaptor", "containers": [container]}
         chart = [{"kind": "DaemonSet", "spec": {"template": {"spec": spec}}}]
         with patch.object(render, "helm", return_value=chart) as helm:
-            render.caa_manifests(profile, Path("."), image)
+            objects = render.caa_manifests(profile, Path("."), image)
+        role = next(obj for obj in objects if obj["kind"] == "Role")
+        self.assertEqual(role["rules"][0]["resourceNames"], ["proof-1"])
         values = helm.call_args.args[2]
         self.assertEqual(values["secrets"], {"mode": "reference", "existingTlsSecretName": "caa-relay-tls"})
         self.assertEqual(container["command"] + container["args"], ["/usr/local/bin/cloud-api-adaptor", "gcp"])
@@ -45,6 +47,17 @@ class DeploymentAssetTests(unittest.TestCase):
                                   "items": [{"key": "GCP_CREDENTIALS", "path": "GCP_CREDENTIALS"}]})
         self.assertEqual(container["env"], [{"name": "GOOGLE_APPLICATION_CREDENTIALS",
                           "value": mount["mountPath"] + "/" + secret["items"][0]["path"]}])
+
+    def test_caa_namespace_finalizers_are_opt_in_and_scoped(self):
+        profile = json.loads((render.ROOT / "deployment.example.json").read_text())
+        image = {"reference": "test.invalid/caa:stock", "digest": "sha256:" + "a" * 64}
+        container = {"image": image["reference"] + "@" + image["digest"]}
+        spec = {"serviceAccountName": "cloud-api-adaptor", "containers": [container]}
+        with patch.object(render, "helm", return_value=[{"kind": "DaemonSet", "spec": {"template": {"spec": spec}}}]):
+            objects = render.caa_manifests(profile, Path("."), image, namespace_finalizers=True)
+        role = next(obj for obj in objects if obj["kind"] == "Role")
+        self.assertEqual(role["metadata"]["namespace"], "execution-proof")
+        self.assertEqual(role["rules"], [{"apiGroups": [""], "resources": ["pods/finalizers"], "verbs": ["update"]}])
 
     def test_uses_manifest_digest_and_checks_platform(self):
         for architecture in ("amd64", "arm64"):

@@ -105,7 +105,7 @@ def helm(chart, name, values, version):
     return [document for document in yaml.safe_load_all(result.stdout) if document]
 
 
-def caa_manifests(profile, assets, image):
+def caa_manifests(profile, assets, image, *, namespace_finalizers=False):
     name, tag = image["reference"].rsplit(":", 1)
     repository = f"projects/{profile['project']}"
     values = {
@@ -161,11 +161,13 @@ def caa_manifests(profile, assets, image):
         {"name": "proof-caa-adc", "secret": {"secretName": "caa-adc", "defaultMode": 0o400,
           "items": [{"key": "GCP_CREDENTIALS", "path": "GCP_CREDENTIALS"}]}},
     ])
+    finalizers = {"apiGroups": [""], "resources": ["pods/finalizers"], "verbs": ["update"]}
+    if not namespace_finalizers:
+        finalizers["resourceNames"] = ["proof-1"]
     role = {"name": "proof-pod-owner", "namespace": WORKLOAD_NS}
     objects.extend([
         {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "metadata": role,
-         "rules": [{"apiGroups": [""], "resources": ["pods/finalizers"],
-                    "resourceNames": ["proof-1"], "verbs": ["update"]}]},
+         "rules": [finalizers]},
         {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding", "metadata": role,
          "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": role["name"]},
          "subjects": [{"kind": "ServiceAccount", "name": spec["serviceAccountName"],
@@ -174,14 +176,14 @@ def caa_manifests(profile, assets, image):
     return objects
 
 
-def render(profile, output, assets):
+def render(profile, output, assets, *, namespace_finalizers=False):
     verify_charts(assets)
     image = checked_caa_image(assets)
     kata = helm(assets / "charts/kata-deploy-4.0.0.tgz", "proof-kata",
                  ROOT / "templates/kata-values.yaml", profile["kubernetes_version"])
     require(sum(obj["kind"] == "RuntimeClass" and obj["metadata"]["name"] == "kata-remote"
                 for obj in kata) == 1, "Kata rendered without the kata-remote RuntimeClass")
-    caa = caa_manifests(profile, assets, image)
+    caa = caa_manifests(profile, assets, image, namespace_finalizers=namespace_finalizers)
     pod = yaml.safe_load((ROOT / "templates/pod.yaml").read_text())
     pod["spec"]["containers"][0]["image"] = profile["workload_image"]
     pod["spec"]["nodeSelector"][WORKER_LABEL] = "true"
@@ -217,9 +219,11 @@ if __name__ == "__main__":
     parser.add_argument("profile", type=Path)
     parser.add_argument("output", type=Path, help="new output directory")
     parser.add_argument("--assets", type=Path, default=ROOT / "build")
+    parser.add_argument("--namespace-finalizers", action="store_true",
+                        help="allow CAA to update Pod finalizers throughout the dedicated workload namespace")
     args = parser.parse_args()
     try:
-        render(read_profile(args.profile), args.output, args.assets)
+        render(read_profile(args.profile), args.output, args.assets, namespace_finalizers=args.namespace_finalizers)
     except subprocess.CalledProcessError as error:
         parser.exit(1, error.stderr or str(error))
     except (ValueError, OSError, KeyError, TypeError, tarfile.TarError, yaml.YAMLError) as error:
