@@ -10,6 +10,7 @@ import serial_gateway as serial
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "collector"))
 from deliver import LocalConnection
+from tls_api import Endpoint
 
 
 class Relay:
@@ -19,7 +20,8 @@ class Relay:
         self.attempt = attempt
 
     def receipt(self, deadline):
-        with closing(LocalConnection(self.socket_path)) as conn:
+        with closing(self.socket_path.connection() if isinstance(self.socket_path, Endpoint)
+                     else LocalConnection(self.socket_path)) as conn:
             conn.timeout = min(4, max(0.01, deadline - time.monotonic()))
             conn.request("GET", "/v1/attempts/" + self.attempt + "/receipt")
             response = conn.getresponse()

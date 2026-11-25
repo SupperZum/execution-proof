@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import yaml
 
+import pod_scheduler
 import run as operator
 import tenant_intent
 from render import ROOT
@@ -197,7 +198,7 @@ class IntentIssuanceTests(unittest.TestCase):
                       qualification_public_key=str(public), evidence_dir=str(self.root),
                       selection=write("selection.json", {"normal_namespace": self.prefix,
                                                         "expected": {"qualification_public_key": list(self.public)}}))
-        config.update(artifacts, pod_receipt=str(self.root / "receipt.json"), image_id="123")
+        config.update(artifacts, launch_queue=str(self.store), pod_receipt=str(self.root / "receipt.json"), image_id="123")
         args = [sys.executable, "-B", str(ROOT / "tools/controller/run.py"), "issue-intent",
                 write("deployment.json", deployment), write("operator.json", config)]
         env = dict(os.environ, PATH=str(self.root) + ":" + os.environ["PATH"])
@@ -225,7 +226,8 @@ class IntentIssuanceTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT wire FROM attempts").fetchall(), [(first,)])
 
     @unittest.skipUnless(os.environ.get("GKE_INTENT_SIGNER_BIN"), "requires built prototype signer")
-    def test_schedule_cli_recovers_both_patch_outcomes(self):
+    def test_schedule_cli_only_queues_and_worker_recovers_both_patch_outcomes(self):
+        self.addCleanup(os.umask, os.umask(0o077))
         args, env = self.prepare_cli()
         args[3] = "schedule"
         args.extend(["--pod-uid", self.inputs["pod_uid"]])
@@ -285,9 +287,17 @@ else:
         with closing(sqlite3.connect(self.store / "attempts.sqlite")) as db:
             [(wire,)] = db.execute("SELECT wire FROM attempts").fetchall()
         digest = operator.hash384(wire)
-        self.assertEqual(scheduled, {"scheduled": True, "pod_uid": self.inputs["pod_uid"],
+        self.assertEqual(scheduled, {"queued": True, "gate_open": False, "pod_uid": self.inputs["pod_uid"],
                                      "attempt_id": json.loads(wire)["statement"]["attempt_id"],
                                      "signed_intent_sha384": digest})
+        self.assertFalse((self.root / "patches").exists())
+        config = json.loads(Path(args[5]).read_bytes())
+        profile = json.loads(Path(args[4]).read_bytes())
+        with patch.dict(os.environ, env):
+            deadline = time.monotonic() + 15
+            client = operator.Clients(profile, config, deadline)
+            operator.reconcile_pod_intent(client, operator.POD, self.inputs["pod_uid"], deadline,
+                                          before_patch=lambda _: None)
         self.assertEqual((self.root / "patches").read_text().splitlines(), ["42 " + digest, "43 " + digest])
         with closing(sqlite3.connect(self.store / "attempts.sqlite")) as db:
             db.execute("DELETE FROM attempts")
@@ -297,6 +307,185 @@ else:
         self.assertIn(b"missing_committed_intent", missing.stderr)
         self.assertEqual(missing.stdout, b"")
         self.assertEqual((self.root / "patches").read_text().splitlines(), ["42 " + digest, "43 " + digest])
+
+    @unittest.skipUnless(os.environ.get("GKE_INTENT_SIGNER_BIN"), "requires built prototype signer")
+    def test_service_relists_and_reconciles_original_open_gate_and_replacement(self):
+        self.addCleanup(os.umask, os.umask(0o077))
+        args, _ = self.prepare_cli()
+        config = json.loads(Path(args[5]).read_bytes())
+        profile = json.loads(Path(args[4]).read_bytes())
+        client = Mock(config=config, profile=profile, image_id=123)
+        pod = json.loads((self.root / "pod.json").read_bytes())
+        client.pod.side_effect = lambda deadline, name: pod
+        receipts = self.root / "receipts"
+        receipts.mkdir(mode=0o700)
+        patches = []
+        watch_versions = []
+
+        def api(argv, deadline):
+            if argv[0] == "-n":
+                operations = json.loads(argv[-1])
+                self.assertEqual(operations[0]["value"], pod["metadata"]["uid"])
+                patches.append(pod["metadata"]["uid"])
+                del pod["spec"]["schedulingGates"]
+                raise operator.cloud.protocol.AttemptError("lost_patch_response")
+            url = argv[-1]
+            if "watch=true" in url:
+                watch_versions.append(url)
+                return (json.dumps({"type": "MODIFIED", "object": pod}) + "\n"
+                        + json.dumps({"type": "ERROR", "object": {"code": 410}})).encode()
+            return json.dumps({"kind": "PodList", "metadata": {"resourceVersion": "68"},
+                               "items": [pod]}).encode()
+
+        client.k.side_effect = api
+        with patch("builtins.print") as output:
+            pod_scheduler.list_and_watch(client, receipts)
+            first_uid = pod["metadata"]["uid"]
+            first = (receipts / (first_uid + ".json")).read_bytes()
+            pod_scheduler.list_and_watch(client, receipts)
+            self.assertEqual((receipts / (first_uid + ".json")).read_bytes(), first)
+            pod["metadata"]["uid"] = "42d640d5-cb09-4baa-b9f1-ec7885388028"
+            pod_scheduler.list_and_watch(client, receipts)
+            self.assertEqual(patches, [])
+            pod["spec"]["schedulingGates"] = [{"name": operator.GATE}]
+            pod_scheduler.list_and_watch(client, receipts)
+        self.assertTrue(all(json.loads(call.args[0])["queued"] for call in output.call_args_list))
+        self.assertEqual(patches, [])
+        self.assertEqual(len(watch_versions), 4)
+        self.assertTrue(all("resourceVersion=68" in url for url in watch_versions))
+        with closing(sqlite3.connect(self.store / "attempts.sqlite")) as db:
+            rows = db.execute("SELECT wire FROM attempts").fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[0], rows[1])
+
+    @unittest.skipUnless(os.environ.get("GKE_INTENT_SIGNER_BIN"), "requires built prototype signer")
+    def test_relist_without_item_kind_replays_committed_intent_and_opens_gate(self):
+        self.addCleanup(os.umask, os.umask(0o077))
+        args, _ = self.prepare_cli()
+        config = json.loads(Path(args[5]).read_bytes())
+        profile = json.loads(Path(args[4]).read_bytes())
+        pod = json.loads((self.root / "pod.json").read_bytes())
+        name, uid = pod["metadata"]["name"], pod["metadata"]["uid"]
+        receipts = self.root / "receipts"
+        receipts.mkdir(mode=0o700)
+        receipt_path = receipts / (uid + ".json")
+        config["pod_receipt"] = str(receipt_path)
+        client = Mock(config=config, profile=profile, image_id=123)
+        client.pod.return_value = pod
+        with patch.object(operator.LaunchQueue, "publish", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                operator.schedule_pod_intent(client, name, uid, time.monotonic() + 20)
+        receipt = receipt_path.read_bytes()
+        with closing(sqlite3.connect(self.store / "attempts.sqlite")) as db:
+            [(wire,)] = db.execute("SELECT wire FROM attempts").fetchall()
+        queue = operator.LaunchQueue(self.store)
+        self.assertIsNone(queue.next_ready(config["intent_cluster_id"]))
+        (self.root / "tenant.pk8").unlink()
+
+        item = {key: value for key, value in pod.items() if key not in ("kind", "apiVersion")}
+        page = {"kind": "PodList", "metadata": {"resourceVersion": "68"}, "items": [item]}
+        client.k.side_effect = [json.dumps(page).encode(), b""]
+        with patch("builtins.print"):
+            pod_scheduler.list_and_watch(client, receipts)
+        self.assertEqual([call.args[0][:2] for call in client.k.call_args_list],
+                         [["get", "--raw"], ["get", "--raw"]])
+        self.assertEqual(receipt_path.read_bytes(), receipt)
+        self.assertEqual(queue.next_ready(config["intent_cluster_id"]), json.loads(receipt))
+        self.assertEqual(pod["spec"]["schedulingGates"], [{"name": operator.GATE}])
+
+        client.k.reset_mock()
+
+        def patch_gate(argv, deadline):
+            self.assertEqual(argv[:5], ["-n", operator.NAMESPACE, "patch", "pod", name])
+            patch_ops = json.loads(argv[-1])
+            self.assertEqual(patch_ops[0], {"op": "test", "path": "/metadata/uid", "value": uid})
+            self.assertEqual(patch_ops[-1], {"op": "remove", "path": "/spec/schedulingGates/0"})
+            del pod["spec"]["schedulingGates"]
+
+        client.k.side_effect = patch_gate
+        with (patch.object(operator, "worker_ready"), patch.object(operator, "wait_for_peer"),
+              patch.object(operator, "controller_attempt", return_value={"protected_export_available": True})):
+            operator.queued_launch(client, config, *operator.boot_artifacts(config), time.monotonic() + 20,
+                                   name=name, uid=uid)
+        client.k.assert_called_once()
+        self.assertNotIn("schedulingGates", pod["spec"])
+        with closing(sqlite3.connect(self.store / "attempts.sqlite")) as db:
+            self.assertEqual(db.execute("SELECT wire FROM attempts").fetchall(), [(wire,)])
+        with closing(queue.connect()) as db:
+            self.assertEqual(db.execute("SELECT uid, phase FROM launches").fetchall(), [(uid, "exported")])
+
+    @unittest.skipUnless(os.environ.get("GKE_INTENT_SIGNER_BIN"), "requires built prototype signer")
+    def test_scheduler_crash_before_receipt_file_and_profile_change(self):
+        self.addCleanup(os.umask, os.umask(0o077))
+        args, _ = self.prepare_cli()
+        config = json.loads(Path(args[5]).read_bytes())
+        client = Mock(config=config, profile=json.loads(Path(args[4]).read_bytes()), image_id=123)
+        pod = json.loads((self.root / "pod.json").read_bytes())
+        client.pod.return_value = pod
+        name, uid = pod["metadata"]["name"], pod["metadata"]["uid"]
+
+        def schedule():
+            return operator.schedule_pod_intent(client, name, uid, time.monotonic() + 20)
+
+        with patch.object(operator, "bind_schedule_receipt", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                schedule()
+        client.k.assert_not_called()
+        self.assertFalse(Path(config["pod_receipt"]).exists())
+        with closing(sqlite3.connect(self.store / "attempts.sqlite")) as db:
+            [(wire, receipt)] = db.execute(
+                "SELECT wire, receipt FROM attempts JOIN schedule_receipts USING(identity)").fetchall()
+        (self.root / "tenant.pk8").unlink()
+        client.image_id = 124
+        with self.assertRaisesRegex(operator.cloud.protocol.AttemptError, "scheduled_pod_receipt"):
+            schedule()
+        client.k.assert_not_called()
+        client.image_id = 123
+        self.assertEqual(schedule()["signed_intent_sha384"], operator.hash384(wire))
+        self.assertEqual(json.loads(Path(config["pod_receipt"]).read_bytes()), json.loads(receipt))
+        client.k.assert_not_called()
+
+    @unittest.skipUnless(os.environ.get("GKE_INTENT_SIGNER_BIN"), "requires built prototype signer")
+    def test_idle_worker_dispatches_from_queue_before_opening_the_gate(self):
+        self.addCleanup(os.umask, os.umask(0o077))
+        args, _ = self.prepare_cli()
+        config = json.loads(Path(args[5]).read_bytes())
+        profile = json.loads(Path(args[4]).read_bytes())
+        pod = json.loads((self.root / "pod.json").read_bytes())
+        uid, name = pod["metadata"]["uid"], pod["metadata"]["name"]
+        receipts = self.root / "worker-receipts"
+        receipts.mkdir(mode=0o700)
+        config.update(schedule_receipts=str(receipts), pod_receipt=str(receipts / (uid + ".json")), unit="fixture")
+        Path(args[5]).write_text(json.dumps(config))
+        client = Mock(config=config, profile=profile, image_id=123)
+        client.pod.return_value = pod
+        operator.schedule_pod_intent(client, name, uid, time.monotonic() + 20)
+        client.k.assert_not_called()
+        order = []
+
+        def ready(_client, _config, receipt, _deadline):
+            self.assertEqual(receipt["pod_uid"], uid)
+            with closing(operator.LaunchQueue(self.store).connect()) as db:
+                self.assertEqual(db.execute("SELECT phase FROM launches").fetchone(), ("claimed",))
+            order.append("ready")
+
+        def patch_pod(*_):
+            self.assertEqual(order, ["ready"])
+            order.append("patch")
+            del pod["spec"]["schedulingGates"]
+
+        client.k.side_effect = patch_pod
+        with (patch.object(sys, "argv", ["run.py", "launch-worker", *args[4:6]]),
+              patch.object(operator.resource, "setrlimit"), patch.object(operator.serial, "_LIBC") as libc,
+              patch.object(operator.no_swap_guard, "verify"), patch.object(operator, "Clients", return_value=client),
+              patch.object(operator, "worker_ready", side_effect=ready), patch.object(operator, "wait_for_peer"),
+              patch.object(operator, "controller_attempt", return_value={"protected_export_available": True}) as drive,
+              patch("builtins.print")):
+            libc.prctl.return_value = 0
+            self.assertEqual(operator.main(), 0)
+        self.assertEqual(order, ["ready", "patch"])
+        self.assertEqual((drive.call_args.kwargs["name"], drive.call_args.kwargs["uid"]), (name, uid))
+        self.assertIsNone(operator.LaunchQueue(self.store).next_ready(config["intent_cluster_id"]))
 
     def schedule_launch_pod(self, files, name, uid):
         deployment_file, base_config = files
@@ -316,6 +505,8 @@ else:
         client.pod.return_value = pod
         deadline = time.monotonic() + 30
         operator.schedule_pod_intent(client, name, uid, deadline)
+        client.k.assert_not_called()
+        operator.reconcile_pod_intent(client, name, uid, deadline, before_patch=lambda _: None)
         client.k.assert_called_once()
         self.assertEqual(client.k.call_args.args[0][:5], ["-n", operator.NAMESPACE, "patch", "pod", name])
         del pod["spec"]["schedulingGates"]
@@ -367,23 +558,19 @@ else:
             authority.bootstrap(kwargs["deadline"])
 
         with (
-            patch.object(sys, "argv", ["run.py", "launch", *files, "--pod-name", name, "--pod-uid", uid]),
-            patch.object(operator.no_swap_guard, "verify"), patch.object(operator.serial, "_LIBC"),
-            patch.object(operator.resource, "setrlimit"), patch.object(operator, "Clients", return_value=client),
             patch.object(operator, "executor", return_value=execute) as executor, patch.object(operator, "worker_pin"),
             patch.object(operator, "heartbeat", return_value=nullcontext()), patch.object(operator, "serial_config",
                 return_value=nullcontext()), patch.object(operator, "management_key", return_value=nullcontext()),
             patch.object(operator.cloud, "GceSerial", return_value=nullcontext()),
             patch.object(operator.kube, "drive", side_effect=drive), patch("builtins.print"),
         ):
-            operator.serial._LIBC.prctl.return_value = 0
             if foreign_receipt:
                 with self.assertRaisesRegex(operator.cloud.protocol.AttemptError, "^scheduled_pod_receipt$"):
-                    operator.main()
+                    operator.launch(client, config, *operator.boot_artifacts(config), time.monotonic() + 15, name=name, uid=uid)
                 executor.assert_not_called()
                 return
             with self.assertRaises(BeginReceived):
-                operator.main()
+                operator.launch(client, config, *operator.boot_artifacts(config), time.monotonic() + 15, name=name, uid=uid)
         self.assertEqual(client.pod_target.call_args.args[2], name)
         snapshot = operator.document(config, "trust_snapshot")
         self.assertEqual((snapshot["pod_uid"], snapshot["signed_intent_sha384"]), (uid, operator.hash384(wire)))

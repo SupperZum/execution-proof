@@ -1,7 +1,11 @@
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import stat
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -9,7 +13,10 @@ from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 
 import yaml
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
+import prepare_management_key
 import run as operator
 from render import ROOT
 
@@ -34,6 +41,12 @@ class PodIntentInputsTests(unittest.TestCase):
 
     def select(self):
         return operator.select_pod_inputs(self.client, self.name, 30)
+
+    def test_restarted_container_cannot_reuse_first_start_intent(self):
+        self.pod["status"] = {"phase": "Running", "containerStatuses": [{"name": "workload", "restartCount": 1}]}
+        self.spec.pop("schedulingGates")
+        with self.assertRaisesRegex(operator.cloud.protocol.AttemptError, "pod_start_number"):
+            operator.pod_intent_inputs(self.client, self.name, self.pod, gate_open=True)
 
     def test_persisted_pod_selects_exact_inputs(self):
         result = self.select()
@@ -110,7 +123,7 @@ class PodIntentInputsTests(unittest.TestCase):
     def prepare_schedule(self):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         self.receipt = Path(directory) / "receipt.json"
-        self.client.config.update(pod_receipt=str(self.receipt), intent_cluster_id="cluster")
+        self.client.config.update(pod_receipt=str(self.receipt), intent_cluster_id="cluster", launch_queue=directory)
         self.client.image_id = 123
         self.enterContext(patch.object(operator, "boot_artifacts", return_value=({}, {"boot_config": b"boot"})))
         statement = {"attempt_id": "attempt", "workload_id": "workload",
@@ -119,7 +132,119 @@ class PodIntentInputsTests(unittest.TestCase):
             operator, "committed_pod_intent", return_value=(json.dumps({"statement": statement}).encode(), "q")))
 
     def schedule(self):
-        return operator.schedule_pod_intent(self.client, self.name, self.uid, time.monotonic() + 30)
+        deadline = time.monotonic() + 30
+        operator.schedule_pod_intent(self.client, self.name, self.uid, deadline)
+        return operator.reconcile_pod_intent(self.client, self.name, self.uid, deadline, before_patch=lambda _: None)
+
+    def test_missing_queue_and_failed_readiness_preserve_gate(self):
+        self.prepare_schedule()
+        deadline = time.monotonic() + 30
+        with patch.dict(self.client.config):
+            del self.client.config["launch_queue"]
+            with self.assertRaisesRegex(operator.cloud.protocol.AttemptError, "launch_queue_required"):
+                operator.schedule_pod_intent(self.client, self.name, self.uid, deadline)
+        self.assertFalse(self.receipt.exists())
+        operator.schedule_pod_intent(self.client, self.name, self.uid, deadline)
+        queue = operator.LaunchQueue(self.receipt.parent)
+        receipt = queue.next_ready("cluster")
+        self.assertEqual(receipt, json.loads(self.receipt.read_bytes()))
+        with patch.object(operator, "worker_ready", side_effect=operator.cloud.protocol.AttemptError("worker_unavailable")), patch.object(operator, "launch") as launch:
+            with self.assertRaisesRegex(operator.cloud.protocol.AttemptError, "worker_unavailable"):
+                operator.queued_launch(self.client, self.client.config, {}, {}, deadline,
+                                       name=self.name, uid=self.uid)
+            launch.assert_not_called()
+        self.client.k.assert_not_called()
+        self.assertEqual(self.spec["schedulingGates"], [{"name": operator.GATE}])
+        self.assertIsNone(queue.next_ready("cluster"))
+
+    def test_collector_transport_is_not_a_launch_readiness_dependency(self):
+        self.spec["nodeSelector"]["kubernetes.io/hostname"] = "worker"
+        worker = {"metadata": {"uid": "node-uid", "labels": {"kubernetes.io/hostname": "worker"}},
+                  "spec": {"providerID": "gce://fixture/us-central1-a/worker"}}
+        self.client.k.side_effect = [json.dumps(worker), '{"items":[]}']
+        self.client.scope.zone = "us-central1-a"
+        config = {"worker": {"uid": "node-uid", "provider_id": worker["spec"]["providerID"]},
+                  "collector_tls": "/private/collector.json", "binding": "/private/binding.json",
+                  "serial_host_public_keys": "/public/serial.keys", "serial_host_public_sha384": "pin",
+                  "profile_probe": "/private/profile-probe"}
+        receipt = {"pod_name": self.name, "pod_uid": self.uid, "attempt_id": "attempt", "q_sha384": "q"}
+        endpoint = Mock()
+        endpoint.connection.side_effect = OSError("collector offline")
+        with tempfile.TemporaryDirectory() as directory:
+            known = Path(directory) / "known_hosts"
+            known.write_bytes(b"serial-host-key\n")
+            with (
+                patch.object(operator.archive_delivery, "Endpoint", return_value=endpoint) as create_endpoint,
+                patch.object(operator.serial, "prepare_known_hosts", return_value=(known, None)),
+                patch.object(operator, "management_key"),
+                patch.object(operator, "document", return_value={"boot_binding": {}}),
+                patch.object(operator, "boot_digest", return_value="boot"),
+                patch.object(operator, "binary", return_value=json.dumps({
+                    "attempt_id": "attempt", "q_sha384": "q", "boot_binding_sha384": "boot",
+                    "authority_checked": True, "kbs_checked": True})),
+                patch.object(operator, "worker_command", return_value=["guard", "ready", self.uid]) as guard,
+                patch.object(operator, "run", return_value=known.read_bytes()),
+            ):
+                operator.worker_ready(self.client, config, receipt, time.monotonic() + 30)
+        create_endpoint.assert_called_once_with(Path(config["collector_tls"]))
+        endpoint.connection.assert_not_called()
+        guard.assert_called_once_with(config, "single_guest", "ready", self.uid)
+
+    @unittest.skipUnless((os.geteuid(), os.getegid()) == (0, 0), "requires the launch service UID and GID")
+    def test_prepared_management_key_matches_launcher_and_wrong_owner_keeps_gate_closed(self):
+        self.prepare_schedule()
+        self.spec["nodeSelector"]["kubernetes.io/hostname"] = "worker"
+        directory = self.receipt.parent
+        key = directory / "management-server-key.pem"
+        pem = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        key.write_bytes(pem)
+        key.chmod(0o640)
+        with self.assertRaisesRegex(ValueError, "owner-only"):
+            prepare_management_key.prepare(key)
+        key.chmod(0o600)
+        os.chown(key, 999, 999)
+        known = directory / "known_hosts"
+        known.write_bytes(b"serial-host-key\n")
+        binding = directory / "binding.json"
+        binding.write_text('{"boot_binding":{}}')
+        config = self.client.config
+        provider_id = "gce://fixture/us-central1-a/worker"
+        config.update(management_key=str(key), collector_tls="/private/collector.json",
+                      binding=str(binding), serial_host_public_keys="/public/serial.keys",
+                      serial_host_public_sha384="pin", profile_probe="/private/profile-probe",
+                      worker={"uid": "node-uid", "provider_id": provider_id})
+        self.client.scope.zone = "us-central1-a"
+        node = {"metadata": {"uid": "node-uid", "labels": {"kubernetes.io/hostname": "worker"}},
+                "spec": {"providerID": provider_id}}
+        self.client.k.side_effect = [json.dumps(node), '{"items":[]}', json.dumps(node), '{"items":[]}']
+        deadline = time.monotonic() + 30
+        operator.schedule_pod_intent(self.client, self.name, self.uid, deadline)
+        receipt = json.loads(self.receipt.read_bytes())
+        with (
+            patch.object(operator.archive_delivery, "Endpoint"),
+            patch.object(operator.serial, "prepare_known_hosts", return_value=(known, None)),
+            patch.object(operator, "boot_digest", return_value="boot"),
+            patch.object(operator, "binary", return_value=json.dumps({
+                "attempt_id": receipt["attempt_id"], "q_sha384": receipt["q_sha384"],
+                "boot_binding_sha384": "boot", "authority_checked": True, "kbs_checked": True})),
+            patch.object(operator, "worker_command", return_value=["guard", "ready", self.uid]) as guard,
+            patch.object(operator, "run", return_value=known.read_bytes()),
+            patch.object(operator, "launch") as launch,
+        ):
+            with self.assertRaisesRegex(operator.serial.GatewayError, "operator_file"):
+                operator.queued_launch(self.client, config, {}, {}, deadline, name=self.name, uid=self.uid)
+            self.assertEqual(self.spec["schedulingGates"], [{"name": operator.GATE}])
+            self.assertEqual([call.args[0][0] for call in self.client.k.call_args_list], ["get", "-n"])
+            guard.assert_not_called()
+            launch.assert_not_called()
+
+            subprocess.check_call([sys.executable, "-B", prepare_management_key.__file__, str(key)])
+            info = key.stat()
+            self.assertEqual((info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)), (0, 0, 0o600))
+            self.assertEqual(key.read_bytes(), pem)
+            operator.worker_ready(self.client, config, receipt, deadline)
+            guard.assert_called_once_with(config, "single_guest", "ready", self.uid)
 
     def test_replaced_pod_stops_pending_event_and_restart(self):
         self.prepare_schedule()
@@ -134,7 +259,7 @@ class PodIntentInputsTests(unittest.TestCase):
                 self.schedule()
         self.assertEqual(json.loads(self.receipt.read_bytes())["pod_uid"], self.uid)
         self.client.k.assert_called_once()
-        self.issuance.assert_called_once()
+        self.assertEqual(self.issuance.call_count, 2)
 
     def test_changed_workload_rejected_on_gate_readback(self):
         self.prepare_schedule()
@@ -148,7 +273,7 @@ class PodIntentInputsTests(unittest.TestCase):
         with self.assertRaisesRegex(operator.cloud.protocol.AttemptError, "container_profile"):
             self.schedule()
         self.client.k.assert_called_once()
-        self.issuance.assert_called_once()
+        self.assertEqual(self.issuance.call_count, 2)
 
     def test_open_gate_without_schedule_receipt_is_rejected(self):
         self.prepare_schedule()

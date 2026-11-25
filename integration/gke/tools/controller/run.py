@@ -21,14 +21,17 @@ import time
 
 import yaml
 
+import gce_reader
 import kubernetes_gcp_serial as cloud
 import kubernetes_serial as kube
 import no_swap_guard
+import pool_worker
 import qualification_gcp as qualification
 import qualification_serial
 import archive_delivery
 import serial_gateway as serial
 import tenant_intent
+from launch_queue import LaunchQueue
 
 
 TOOLS = Path(__file__).resolve().parents[1]
@@ -210,12 +213,17 @@ class Clients(KubernetesClient):
         self.cloud = profile["project"], profile["zone"]
         # Strict argv allowlist: only caller-owned deployment inputs select an
         # authenticated context. Server readbacks never supply flags.
-        number = self.gcloud(["projects", "describe", self.cloud[0],
-                              "--format=value(projectNumber)"], deadline).decode().strip()
+        self.reader = None
+        if "gce_read_identity" in config:
+            self.reader = gce_reader.GceReader(*self.cloud, config["gce_read_identity"], deadline)
+            number = self.reader.project_number(deadline)
+            image = self.reader.image(profile["podvm_image"], deadline)
+        else:
+            number = self.gcloud(["projects", "describe", self.cloud[0],
+                                  "--format=value(projectNumber)"], deadline).decode().strip()
+            image = json.loads(self.gcloud(["compute", "images", "describe", profile["podvm_image"],
+                                              "--format=json"], deadline))
         self.scope = cloud.Scope(*self.cloud, cloud._numeric_id(number))
-        image = self.gcloud(["compute", "images", "describe", profile["podvm_image"],
-                             "--format=json"], deadline)
-        image = json.loads(image)
         self.image_id = cloud._numeric_id(config["image_id"])
         require(image["status"] == "READY" and cloud._numeric_id(image["id"]) == self.image_id
                 and "TDX_CAPABLE" in {item["type"] for item in image["guestOsFeatures"]},
@@ -227,6 +235,8 @@ class Clients(KubernetesClient):
     def compute(self, resource, name, deadline):
         require(resource in ("instances", "disks") and cloud._matches(cloud._DNS_LABEL, name),
                 "compute_name")
+        if self.reader is not None:
+            return self.reader.zonal(resource, name, deadline)
         return json.loads(self.gcloud(["compute", resource, "describe", name,
                                        "--zone", self.scope.zone, "--format=json"], deadline))
 
@@ -358,7 +368,7 @@ def bind_schedule_receipt(config, expected, gated, *, deadline=None):
         os.close(directory)
 
 
-def patch_gate(client, name, uid, image, deadline, *, resource_version=None):
+def patch_gate(client, name, uid, image, deadline, *, resource_version=None, worker_node=None):
     patch = [
         {"op": "test", "path": "/metadata/uid", "value": uid},
         {"op": "test", "path": "/spec/schedulingGates", "value": [{"name": GATE}]},
@@ -367,6 +377,9 @@ def patch_gate(client, name, uid, image, deadline, *, resource_version=None):
     ]
     if resource_version is not None:
         patch.insert(1, {"op": "test", "path": "/metadata/resourceVersion", "value": resource_version})
+    if worker_node is not None:
+        require(resource_version is not None and cloud._matches(cloud._DNS_LABEL, worker_node), "worker_node_selector")
+        patch.insert(-1, {"op": "add", "path": "/spec/nodeSelector/kubernetes.io~1hostname", "value": worker_node})
     client.k(["-n", NAMESPACE, "patch", "pod", name, "--type=json", "-p", json.dumps(patch)], deadline)
 
 
@@ -439,7 +452,9 @@ def worker_command(config, tool, *args):
     program = str(path(worker, tool))
     require(all(re.fullmatch(r"[A-Za-z0-9_./:@+-]+", arg) for arg in (program, *args)),
             "worker_command_arguments")
-    return ["/usr/bin/ssh", "-F", "/dev/null", "-T", "-o", "StrictHostKeyChecking=yes",
+    port = worker.get("port", 22)
+    require(type(port) is int and 1 <= port <= 65535, "worker_ssh_target")
+    return ["/usr/bin/ssh", "-F", "/dev/null", "-T", "-p", str(port), "-o", "StrictHostKeyChecking=yes",
             "-o", f"UserKnownHostsFile={path(worker, 'known_hosts')}", "-o", "GlobalKnownHostsFile=/dev/null",
             "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10", "-i", str(path(worker, "key")),
@@ -485,6 +500,8 @@ def heartbeat(config, target, deadline):
 
 def worker_pin(client, config, target, deadline):
     worker = json.loads(client.k(["get", "node", target.node_name, "-o", "json"], deadline))
+    if "pool" in config["worker"]:
+        pool_worker.check(client, config["worker"], target.node_name, worker, deadline)
     require(worker["metadata"]["uid"] == config["worker"]["uid"]
             and worker["spec"]["providerID"] == config["worker"]["provider_id"], "worker_identity")
 
@@ -546,8 +563,11 @@ def launch(client, config, binding, values, deadline, *, name=POD, uid=None, out
                 "worker_podvm_binding")
         return result
     confirm_archive = None
-    if "collector_socket" in config:
-        confirm_archive = archive_delivery.Relay(path(config, "collector_socket"),
+    if "collector_tls" in config or "collector_socket" in config:
+        require(not ("collector_tls" in config and "collector_socket" in config), "collector_transport")
+        destination = (archive_delivery.Endpoint(path(config, "collector_tls")) if "collector_tls" in config
+                       else path(config, "collector_socket"))
+        confirm_archive = archive_delivery.Relay(destination,
             json.loads(intent)["statement"]["attempt_id"])
     with heartbeat(config, target, deadline) as finish_heartbeat, serial_config(target, config, deadline) as serial_options, \
             management_key(config) as key:
@@ -612,6 +632,86 @@ def controller_attempt(function, *args, **kwargs):
     return result | {"retirement": "external"}
 
 
+def worker_ready(client, config, receipt, deadline):
+    # Clients already read the project and the pinned Compute image with the
+    # credentials of this process. Exercise the remaining pre-guest endpoints.
+    pod = read_intent_pod(client, receipt["pod_name"], deadline)
+    expected_worker = config["worker"]
+    requested = pod["spec"]["nodeSelector"].get("kubernetes.io/hostname")
+    node = expected_worker.get("name", requested)
+    require(node and cloud._matches(cloud._DNS_LABEL, node), "worker_node_selector")
+    require(requested in (None, node), "worker_node_selector")
+    worker = json.loads(client.k(["get", "node", node, "-o", "json"], deadline))
+    if "pool" in expected_worker:
+        pool_worker.check(client, expected_worker, node, worker, deadline)
+    require(worker["metadata"]["uid"] == expected_worker["uid"]
+            and worker["spec"]["providerID"] == expected_worker["provider_id"]
+            and worker["metadata"]["labels"]["kubernetes.io/hostname"] == node, "worker_identity")
+    peers = json.loads(client.k(["-n", NAMESPACE, "get", "peerpods", "-o", "json"], deadline))
+    require(not any(owner.get("uid") == receipt["pod_uid"] for peer in peers["items"]
+                    for owner in peer["metadata"].get("ownerReferences", [])), "prior_peerpod")
+    # Validate the local mTLS settings. Receipt lookup and delivery can retry
+    # independently once the guest has exported the proof.
+    archive_delivery.Endpoint(path(config, "collector_tls"))
+    host = serial.serial_host(client.scope.zone)
+    with tempfile.TemporaryDirectory() as work:
+        known, _ = serial.prepare_known_hosts(path(config, "serial_host_public_keys"),
+                            config["serial_host_public_sha384"], Path(work), host)
+        scanned = run(["/usr/bin/ssh-keyscan", "-T", "4", "-p", "9600", host], deadline)
+        require(set(known.read_bytes().splitlines()).intersection(scanned.splitlines()), "serial_host_key")
+    with management_key(config):
+        pass
+    request = {"attempt_id": receipt["attempt_id"], "q_sha384": receipt["q_sha384"],
+               "boot_binding_sha384": boot_digest(document(config, "binding")["boot_binding"])}
+    response = binary(config["profile_probe"], [], deadline, json.dumps(request).encode())
+    require(json.loads(response) == dict(request, authority_checked=True, kbs_checked=True), "profile_not_ready")
+    run(worker_command(config, "single_guest", "ready", receipt["pod_uid"]), deadline)
+
+
+def wait_for_peer(client, name, uid, deadline):
+    while True:
+        pod = client.pod(deadline, name)
+        require(pod["metadata"]["uid"] == uid and not pod["metadata"].get("deletionTimestamp"), "pod_identity")
+        peers = json.loads(client.k(["-n", NAMESPACE, "get", "peerpods", "-o", "json"], deadline))
+        matches = [p for p in peers["items"] if any(o.get("uid") == uid
+                   for o in p["metadata"].get("ownerReferences", []))]
+        require(len(matches) <= 1, "multiple_peerpods")
+        if matches and matches[0].get("spec", {}).get("instanceID") and pod["spec"].get("nodeName"):
+            return
+        time.sleep(timeout(deadline, 0.25))
+
+
+def queued_launch(client, config, binding, values, deadline, *, name, uid):
+    receipt = document(config, "pod_receipt")
+    require(receipt.get("pod_uid") == uid and receipt.get("pod_name") == name
+            and receipt.get("cluster_id") == config["intent_cluster_id"], "scheduled_pod_receipt")
+    queue = LaunchQueue(path(config, "launch_queue"))
+    queue.claim(receipt)
+    attempt = receipt["attempt_id"]
+    config = dict(config)
+    try:
+        def preflight(current):
+            check_schedule_receipt(receipt, current)
+            if "worker_pool" in config:
+                pod = read_intent_pod(client, name, deadline)
+                scheduling_gate(pod, uid, client.profile["workload_image"])
+                config["worker"] = pool_worker.assign(client, config, current, pod, deadline)
+            worker_ready(client, config, current, deadline)
+            if "worker_pool" in config:
+                return config["worker"]["name"]
+        reconcile_pod_intent(client, name, uid, deadline, before_patch=preflight)
+        wait_for_peer(client, name, uid, deadline)
+        result = controller_attempt(launch, client, config, binding, values, deadline, name=name, uid=uid)
+    except Exception as error:
+        reason = str(error) if isinstance(error, (cloud.protocol.AttemptError, serial.GatewayError)) else type(error).__name__
+        phase = "expired" if reason in ("tenant_intent_window", "qualification_window") else "recovery_required"
+        queue.finish(attempt, phase, reason)
+        raise
+    phase = "exported" if result.get("protected_export_available") else "recovery_required"
+    queue.finish(attempt, phase)
+    return result
+
+
 def select_pod_inputs(client, name, deadline):
     """Read a persisted, gated Pod and select the inputs to its first tenant intent."""
     return pod_intent_inputs(client, name, read_intent_pod(client, name, deadline))
@@ -634,6 +734,12 @@ def pod_intent_inputs(client, name, pod, *, gate_open=False):
     status = pod.get("status", {})
     require(isinstance(status, dict) and (gate_open or status.get("phase", "Pending") == "Pending"),
             "pod_phase")
+
+    statuses = status.get("containerStatuses", [])
+    require(isinstance(statuses, list) and len(statuses) <= 1 and all(
+        isinstance(row, dict) and row.get("name") == "workload"
+        and type(row.get("restartCount")) is int and row["restartCount"] == 0 for row in statuses),
+        "pod_start_number")
 
     template = yaml.safe_load((ROOT / "templates/pod.yaml").read_text())
     require(meta.get("annotations", {}) == template["metadata"]["annotations"], "pod_annotations")
@@ -695,7 +801,7 @@ def issue_pod_intent(client, name, deadline):
     return wire
 
 
-def committed_pod_intent(config, inputs, binding, boot, deadline, *, existing_only=False):
+def committed_pod_intent(config, inputs, binding, boot, deadline, *, existing_only=False, receipt_for=None):
     settings = document(config, "issuer_config")
     require(settings["boot_binding"] == binding and hash384(boot) == binding["config_sha384"],
             "authority_boot_binding")
@@ -732,7 +838,8 @@ def committed_pod_intent(config, inputs, binding, boot, deadline, *, existing_on
         wire = tenant_intent.issue_once(path(config, "intent_store"), config["intent_cluster_id"],
                                        inputs, fields, public_key, q_hash, q_expires,
                                        config["intent_ttl_seconds"], deadline, sign,
-                                       normal_namespace=selection.get("normal_namespace"), existing_only=existing_only)
+                                       normal_namespace=selection.get("normal_namespace"),
+                                       existing_only=existing_only, receipt_for=receipt_for)
         return wire, q_hash
 
 
@@ -746,7 +853,14 @@ def schedule_receipt(client, inputs, wire, q_hash):
 
 
 def schedule_pod_intent(client, name, uid, deadline):
-    """Authorize and un-gate exactly the Pod identified by the delivery event."""
+    require("launch_queue" in client.config, "launch_queue_required")
+    queue = LaunchQueue(path(client.config, "launch_queue"))
+    return reconcile_pod_intent(client, name, uid, deadline, queue=queue)
+
+
+def reconcile_pod_intent(client, name, uid, deadline, *, queue=None, before_patch=None):
+    """Publish a checked receipt or open its gate from the claimed launch worker."""
+    require((queue is None) != (before_patch is None), "launch_handoff_mode")
     config = client.config
     image = client.profile["workload_image"]
     require(cloud._matches(cloud._UUID, uid), "pod_identity")
@@ -760,22 +874,37 @@ def schedule_pod_intent(client, name, uid, deadline):
         saved = os.path.lexists(path(config, "pod_receipt"))
         if prior is not None:
             require(saved and document(config, "pod_receipt") == prior, "scheduled_pod_receipt")
+        if before_patch is not None:
+            require(saved, "missing_schedule_receipt")
         if not saved:
             require(gated, "missing_schedule_receipt")
+        def receipt_for(wire, q_hash):
+            receipt = schedule_receipt(client, inputs, wire, q_hash)
+            if saved:
+                check_schedule_receipt(document(config, "pod_receipt"), receipt)
+            return receipt
+
         wire, q_hash = committed_pod_intent(config, inputs, binding, values["boot_config"], deadline,
-                                            existing_only=saved)
+                                            existing_only=saved, receipt_for=receipt_for)
         receipt = schedule_receipt(client, inputs, wire, q_hash)
         bind_schedule_receipt(config, receipt, gated, deadline=deadline)
         return gated, inputs["resource_version"], receipt
 
     gated, version, receipt = read_and_bind()
+    if queue is not None:
+        queue.publish(receipt)
+        return {"pod_uid": uid, "queued": True, "gate_open": not gated,
+                "attempt_id": receipt["attempt_id"], "signed_intent_sha384": receipt["signed_intent_sha384"]}
+    require(gated, "gate_open_before_worker")
     for attempt in range(2):
         window = receipt["validity"]
         require(window["not_before"] <= time.time() < window["expires"], "tenant_intent_window")
         if not gated:
             break
+        node = before_patch(receipt)
+        require(time.time() < window["expires"], "tenant_intent_window")
         try:
-            patch_gate(client, name, uid, image, deadline, resource_version=version)
+            patch_gate(client, name, uid, image, deadline, resource_version=version, worker_node=node)
             break
         except (cloud.protocol.AttemptError, subprocess.TimeoutExpired):
             gated, version, receipt = read_and_bind(receipt)
@@ -788,7 +917,7 @@ def schedule_pod_intent(client, name, uid, deadline):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("describe-pod", "describe-qualification", "preflight",
-                                          "select-intent-inputs", "issue-intent", "schedule", "launch", "qualify"))
+                                          "select-intent-inputs", "issue-intent", "schedule", "launch", "launch-worker", "qualify"))
     parser.add_argument("deployment", type=Path)
     parser.add_argument("operator", type=Path)
     parser.add_argument("--pod-name", help="Kubernetes event Pod name")
@@ -802,14 +931,14 @@ def main():
         parser.error("--pod-name requires intent selection, issuance or an event UID")
     os.umask(0o077)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    if args.action in ("launch", "qualify"):
+    if args.action in ("launch", "launch-worker", "qualify"):
         require(serial._LIBC.prctl(4, 0, 0, 0, 0) == 0, "dump_protection")
     profile = read_profile(args.deployment)
     config = json.loads(serial._regular(args.operator.resolve(strict=True), 64 << 10, private=True))
     seconds = config["deadline_seconds"]
     require(type(seconds) is int and 15 <= seconds <= 300, "deadline_seconds")
     deadline = time.monotonic() + seconds
-    if args.action in ("launch", "qualify"):
+    if args.action in ("launch", "launch-worker", "qualify"):
         no_swap_guard.verify(config["unit"])
     if args.action == "preflight":
         binding, values = artifacts(config)
@@ -827,12 +956,39 @@ def main():
         result = select_pod_inputs(client, name, deadline)
         print(json.dumps(result, sort_keys=True))
         return 0
+    if args.action == "launch-worker":
+        # Each invocation owns one output set. A restart cannot reclaim an uncertain launch.
+        queue = LaunchQueue(path(config, "launch_queue"))
+        receipts = path(config, "schedule_receipts")
+        serial._directory(receipts)
+        while True:
+            receipt = queue.next_ready(config["intent_cluster_id"])
+            if receipt is not None:
+                break
+            time.sleep(0.25)
+        uid, name = receipt["pod_uid"], receipt["pod_name"]
+        require(cloud._matches(cloud._UUID, uid) and cloud._matches(cloud._DNS_LABEL, name), "pod_identity")
+        config = dict(config, pod_receipt=str(receipts / (uid + ".json")))
+        check_schedule_receipt(document(config, "pod_receipt"), receipt)
+        deadline = time.monotonic() + seconds
+        client = Clients(profile, config, deadline)
+        binding, values = boot_artifacts(config)
+        result = queued_launch(client, config, binding, values, deadline, name=name, uid=uid)
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result.get("protected_export_available") else 2
     client = Clients(profile, config, deadline)
     if args.action == "schedule" and automatic:
         result = schedule_pod_intent(client, name, args.pod_uid, deadline)
+    elif args.action == "schedule" and "launch_queue" in config:
+        raise cloud.protocol.AttemptError("launch_event_uid_required")
     elif args.action == "launch":
         binding, values = boot_artifacts(config)
-        result = controller_attempt(launch, client, config, binding, values, deadline, name=name, uid=args.pod_uid)
+        if automatic or "launch_queue" in config:
+            require("launch_queue" in config, "launch_queue_required")
+            require(automatic, "launch_event_uid_required")
+            result = queued_launch(client, config, binding, values, deadline, name=name, uid=args.pod_uid)
+        else:
+            result = controller_attempt(launch, client, config, binding, values, deadline, name=name, uid=args.pod_uid)
     elif args.action == "describe-qualification":
         result = client.qualification_target(deadline).receipt()
     elif args.action == "describe-pod":

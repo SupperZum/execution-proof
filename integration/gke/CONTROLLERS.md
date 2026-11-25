@@ -49,6 +49,19 @@ serial SSH public key is registered for this deployment's `serial_user`
 and instance before opening a connection. Use known host keys and an
 independently selected SSH endpoint for the dedicated GKE worker.
 
+Provision `management_key` as one regular file, mode `0600`, owned by the
+launch service's effective UID and GID. If the deployment bootstrap creates
+this dedicated file under a separate identity, transfer ownership once
+before starting the service. Run the preparer with the same effective UID
+and GID as the launch service and enough privilege to change the file owner.
+It checks the existing mode and changes ownership on the open file descriptor.
+
+```sh
+python3 -B tools/controller/prepare_management_key.py "$MANAGEMENT_KEY"
+```
+
+The launch worker checks access to the key before patching the Pod gate.
+
 Both `launch` and `qualify` report `protected_export_available` once the
 original export has been synced. If Stop or local cleanup fails after that
 point, the command exits unsuccessfully and the archive retains the export.
@@ -229,23 +242,18 @@ python3 -B tools/controller/run.py schedule deployment.json pod-operator.json \
   --pod-name "$POD_NAME" --pod-uid "$POD_UID"
 ```
 
-The controller reads that Pod from the configured API, issues or reuses its
-committed intent, and persists the intent digest and attempt ID in the
-scheduling receipt before patching the gate. The patch tests the Pod UID,
-resource version, image and gate. After a lost response, retry with the
-original event UID and receipt path. An open gate with matching receipts in
-both stores completes the request. A gate still present is patched against
-the newly validated resource version. A replacement UID ends the original
-request. A successful response reports scheduling for the authorized attempt.
+Set `launch_queue` to the same persistent directory on the scheduler and
+launch worker. The scheduler re-reads the Pod, commits or recovers its signed
+intent, writes its scheduling receipt, and queues the attempt. Replaying the
+original event publishes the same receipt. A successful schedule response
+contains `queued: true`. The Pod stays gated until a worker claims it.
 
-Once CAA creates the PeerPod, use the same event name and UID to identify the
-PodVM. Configure the instance pins and worker as described in the launch
-procedure, then run the launch command in its private service.
+Start the worker with the same event name, UID and receipt path. It validates
+the Pod and qualification before opening the gate with a conditional patch.
+It then waits for CAA to create the corresponding PeerPod.
 
 ```bash
-python3 -B tools/controller/run.py describe-pod deployment.json pod-operator.json \
-  --pod-name "$POD_NAME" --pod-uid "$POD_UID"
-python3 -B tools/controller/run.py launch deployment.json pod-operator.json \
+python3 -B tools/controller/run.py launch deployment.json launch-operator.json \
   --pod-name "$POD_NAME" --pod-uid "$POD_UID"
 ```
 
@@ -260,3 +268,85 @@ and `effective_spec` files.
 The default deployment grants CAA permission to update Pod finalizers for
 `proof-1`. For another Pod name, grant that permission for its exact name and
 install a heartbeat helper built from this version.
+
+### Run the Pod scheduler as a service
+
+Run the scheduler under the tenant issuance identity. Give it a service
+kubeconfig for the selected cluster, a namespaced Role for get/list/watch
+on Pods, and read access to the configured GCP project and Compute image.
+Provision the intent store and an owner-only receipt directory on persistent
+local storage, one pair per cluster. Supply the approved profile and signing
+inputs using the same operator settings as the automatic schedule command.
+
+```sh
+python3 -B tools/controller/pod_scheduler.py deployment.json pod-operator.json \
+  --receipts /var/lib/execution-proof/scheduler/receipts
+```
+
+The scheduler lists Pods in the execution-proof namespace, watches from the
+list resource version and relists on disconnection. It revalidates each named
+Pod and event UID before issuing an intent. The receipt for each first start
+is stored under its Pod UID. An already-open gate is reconciled against the
+saved receipt. The process writes scheduling outcomes to stdout. The launch worker requires its own credentials.
+
+Render with `--namespace-finalizers` for a dedicated proof namespace that
+accepts arbitrary supported Pod names. This grants the CAA service account
+only update on pods/finalizers in that namespace. Without the flag the
+existing single-name grant applies.
+
+Set `launch_queue` in both scheduler and automatic launch settings to the
+same absolute owner-only directory on persistent storage. The scheduler
+persists the intent and receipt before queueing the Pod UID. The Pod stays
+gated until the launch worker claims the receipt, validates the Pod and Q,
+and passes its preflight. Give the worker patch access for the intended
+Pod and set `schedule_receipts` to the directory passed to the scheduler as
+`--receipts`. Set `worker.single_guest` to the installed worker guard and
+`profile_probe` to the pinned transport for the trusted profile helper.
+Start the worker in its private no-swap unit before submitting the Pod.
+
+```sh
+python3 -B tools/controller/run.py launch-worker deployment.json launch-operator.json
+```
+
+Each single-guest worker handles one queued attempt. Pin the Pod with
+`nodeSelector.kubernetes.io/hostname` on the dedicated node. The
+[GKE DaemonSet installer](worker/daemonset/README.md) installs the worker
+files and socket on every new proof node. To prepare a worker manually,
+build `worker/single-guest/main.go` in the CAA Go module, install it as
+`/run/execution-proof/single-guest` and install `worker/check-runtime.sh` in
+the same directory. Provision `/var/lib/onb17-single-guest` once as root,
+mode 0700, on persistent storage. Install the adjacent systemd service and
+socket, start the socket, and apply `templates/kata-single-guest-values.yaml`
+after the base Kata Helm values. The CAA endpoint stays at
+`/run/peerpod/hypervisor.sock`. The guard reads the CRI bundle for the
+original Pod UID and durably consumes the start allowance before forwarding
+StartVM. Stopping the sandbox and restarting the daemon preserve that record.
+
+Use a fixed authenticated command for the helper's
+`tools/controller/profile_probe.py SETTINGS`. Its settings refer to the
+local pinned Authority and KBS binaries, a prepared probe policy, the
+signed Q and KBS config. The helper validates its KBS proof/TLS keys and
+opens a disposable Authority store. The actual launch needs a distinct
+Authority store and both policies bound to the newly observed Compute ID.
+Set `gce_read_identity` to the controller service account's email for
+direct read-only Resource Manager and Compute API requests. The worker
+checks the attached service account, project and zone in GCE metadata.
+Use the worker's own Compute and Kubernetes credentials and its scoped
+SSH identity for the node guard. Gate preflight loads the collector mTLS
+client settings locally. The collector authorizes the launch worker's
+receipt lookup during delivery, which can retry independently of launch.
+
+The first worker commits its claim before attempting launch. The queue
+permits one claimed launch at a time. A crash leaves a durable claim;
+reconcile the original execution against Authority and guest evidence
+before admitting further work. Check the phase and fixed failure reason
+with a read-only query against launch.sqlite:
+
+```sh
+sqlite3 -readonly "$LAUNCH_QUEUE/launch.sqlite" \
+  'SELECT cluster, uid, attempt, phase, reason FROM launches ORDER BY rowid;'
+```
+
+A ready row awaits a worker. An exported row records the controller's
+protected-export outcome. Delivery, guest receipt verification and the
+independent execution verdict have their own records.

@@ -40,7 +40,7 @@ def verified_statement(wire, public_key):
 
 
 def issue_once(directory, cluster_id, inputs, fields, public_key, q_hash, q_expires, ttl, deadline, sign,
-               *, normal_namespace, existing_only=False):
+               *, normal_namespace, existing_only=False, receipt_for=None):
     serial._directory(directory)
     serial._identifier(cluster_id)
     # The assembler allows 128 ASCII characters. Each generated suffix uses 32.
@@ -94,6 +94,14 @@ def issue_once(directory, cluster_id, inputs, fields, public_key, q_hash, q_expi
             window = statement["validity"]
         require(window["not_before"] <= int(time.time()) < window["expires"] <= q_expires,
                 "tenant_intent_window")
+        if receipt_for is not None:
+            receipt = json.dumps(receipt_for(wire, q_hash), sort_keys=True)
+            db.execute("""CREATE TABLE IF NOT EXISTS schedule_receipts (
+                identity TEXT PRIMARY KEY, receipt TEXT NOT NULL)""")
+            db.execute("INSERT INTO schedule_receipts VALUES(?,?) ON CONFLICT(identity) DO NOTHING",
+                       (identity, receipt))
+            stored, = db.execute("SELECT receipt FROM schedule_receipts WHERE identity=?", (identity,)).fetchone()
+            require(stored == receipt, "scheduled_pod_receipt")
         require(time.monotonic() < deadline, "controller_deadline")
         db.commit()
     return wire
