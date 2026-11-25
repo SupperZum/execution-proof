@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: execution-proof-collector
+  labels:
+    app: execution-proof-collector
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  shareProcessNamespace: false
+  nodeSelector:
+    kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+    - name: prepare-collector
+      image: registry.example.invalid/collector:replace-with-digest
+      command: ["/bin/sh", "-ec"]
+      args:
+        - |
+          umask 077
+          mkdir -p /archive/state
+          chmod 0700 /archive/state
+          install -m 0600 /source/signer.pem /keys/signer.pem
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - {name: archive, mountPath: /archive}
+        - {name: signer-source, mountPath: /source, readOnly: true}
+        - {name: signer, mountPath: /keys}
+  containers:
+    - name: collector
+      image: registry.example.invalid/collector:replace-with-digest
+      args: ["--state", "/archive/state", "serve", "--pod-verifier", "--key", "/keys/signer.pem",
+             "--manifest", "/config/trusted-runtime-bins.sha384", "--tls-config", "/config/server.json"]
+      ports:
+        - {name: https, containerPort: 8443}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - {name: archive, mountPath: /archive}
+        - {name: signer, mountPath: /keys, readOnly: true}
+        - {name: config, mountPath: /config, readOnly: true}
+        - {name: tls, mountPath: /tls, readOnly: true}
+        - {name: inputs, mountPath: /run/verifier-inputs}
+    - name: verifier
+      image: registry.example.invalid/verifier:replace-with-digest
+      resources:
+        requests: {cpu: 250m, memory: 256Mi}
+        limits: {cpu: "1", memory: 512Mi}
+      securityContext:
+        runAsUser: 65531
+        runAsGroup: 65531
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - {name: inputs, mountPath: /run/verifier-inputs, readOnly: true}
+        - {name: scratch, mountPath: /tmp}
+  volumes:
+    - name: archive
+      persistentVolumeClaim: {claimName: execution-proof-collector}
+    - name: signer-source
+      secret: {secretName: execution-proof-collector-signer, defaultMode: 0440}
+    - name: signer
+      emptyDir: {medium: Memory, sizeLimit: 1Mi}
+    - name: config
+      configMap: {name: execution-proof-collector}
+    - name: tls
+      secret: {secretName: execution-proof-collector-tls, defaultMode: 0440}
+    - name: inputs
+      emptyDir: {medium: Memory, sizeLimit: 32Mi}
+    - name: scratch
+      emptyDir: {medium: Memory, sizeLimit: 48Mi}

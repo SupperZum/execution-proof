@@ -136,10 +136,15 @@ class Store:
             db.execute("INSERT INTO qualification_exports VALUES(?,?,?,?)", (attempt, grant_id, export, receipt))
         return receipt
 
-    def mark_missing(self, attempt):
+    def mark_missing(self, attempt, reason=None):
         with closing(self.connect()) as db, db:
             if db.execute("UPDATE attempts SET missing=1 WHERE id=? AND receipt IS NULL", (attempt,)).rowcount != 1:
                 raise Conflict("unknown or already archived attempt")
+            if reason is not None:
+                db.execute("CREATE TABLE IF NOT EXISTS losses (id TEXT PRIMARY KEY, reason TEXT NOT NULL)")
+                db.execute("INSERT INTO losses VALUES(?,?) ON CONFLICT(id) DO NOTHING", (attempt, reason))
+                if db.execute("SELECT reason FROM losses WHERE id=?", (attempt,)).fetchone() != (reason,):
+                    raise Conflict("conflicting loss record")
 
     def fetch(self, attempt, artifact):
         with closing(self.connect()) as db:
@@ -152,6 +157,11 @@ class Store:
             missing, verdict = row
             state = "archived" if verdict else ("unproven" if missing else "pending")
             result = {"attempt_id": attempt, "delivery": state}
+            if missing and not verdict and db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='losses'").fetchone():
+                row = db.execute("SELECT reason FROM losses WHERE id=?", (attempt,)).fetchone()
+                if row:
+                    result["reason"] = row[0]
             if verdict:
                 result.update(verdict=json.loads(verdict), bundle=PREFIX + attempt + "/pack",
                               receipt=PREFIX + attempt + "/receipt")
@@ -221,13 +231,21 @@ class Verifier:
                 command.extend(["--ro-bind", str(f), inside])
                 args.extend(["--" + name, inside])
             result = subprocess.run([*command, "--", *args], capture_output=True, timeout=60)
-        if result.returncode == 1:
-            verdict = json.loads(result.stdout)
-            if verdict.get("status") == "invalid":
-                raise Rejected("invalid evidence")
-        if result.returncode:
-            raise Unavailable("verification unavailable")
-        return json.loads(result.stdout)
+        return verifier_result(result)
+
+
+def verifier_result(result):
+    try:
+        verdict = json.loads(result.stdout)
+    except (ValueError, UnicodeError) as error:
+        raise Unavailable("verifier returned no readable verdict") from error
+    if not isinstance(verdict, dict):
+        raise Unavailable("verifier returned no verdict object")
+    if result.returncode == 1 and verdict.get("status") == "invalid":
+        raise Rejected("invalid evidence")
+    if result.returncode:
+        raise Unavailable("verification unavailable")
+    return verdict
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -278,11 +296,16 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(200, receipt)
 
 
-def serve(state, store, signer, verify):
+def serve(state, store, signer, verify, tls_config=None):
     socket_path = state / "collector.sock"
     with (state / "collector.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         store.bind_signer(signer)
+        if tls_config is not None:
+            from tls_api import service
+            with service(tls_config, store, signer, verify) as server:
+                server.serve_forever()
+            return
         if socket_path.exists():
             if not stat.S_ISSOCK(socket_path.lstat().st_mode):
                 raise ValueError("unexpected socket path")
@@ -308,7 +331,11 @@ def main():
         qualification.add_argument("--" + name, type=Path, required=True)
     commands.add_parser("mark-missing").add_argument("attempt")
     service = commands.add_parser("serve")
-    for opt in ("key", "runtime", "manifest"):
+    service.add_argument("--tls-config", type=Path)
+    backend = service.add_mutually_exclusive_group(required=True)
+    backend.add_argument("--runtime", type=Path)
+    backend.add_argument("--pod-verifier", action="store_true")
+    for opt in ("key", "manifest"):
         service.add_argument("--" + opt, type=Path, required=True)
     args = parser.parse_args()
     store = Store(args.state)
@@ -326,8 +353,15 @@ def main():
             receipt = store.archive_qualification(bounded(args.grant, TRUST_LIMIT), bounded(args.export, PACK_LIMIT), signer)
             print(receipt.decode())
         else:
-            serve(args.state, store, signer, Verifier(args.runtime, args.manifest))
+            if args.pod_verifier:
+                from pod_verifier import PodVerifier
+                verify = PodVerifier(args.manifest)
+            else:
+                verify = Verifier(args.runtime, args.manifest)
+            serve(args.state, store, signer, verify, args.tls_config)
 
 
 if __name__ == "__main__":
+    import sys
+    sys.modules["collector"] = sys.modules[__name__]
     main()

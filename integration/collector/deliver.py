@@ -25,6 +25,19 @@ class LocalConnection(http.client.HTTPConnection):
         self.sock.connect(self.path)
 
 
+class SubmissionError(ValueError):
+    def __init__(self, status):
+        self.reason = {403: "denied", 404: "context_pending", 409: "conflict",
+                       422: "verification_rejected"}.get(status, "unavailable")
+        super().__init__(f"collector returned HTTP {status}")
+
+
+def connection_for(destination):
+    if hasattr(destination, "connection"):
+        return destination.connection()
+    return LocalConnection(destination)
+
+
 def verify_receipt(receipt, key, expected):
     if set(receipt) != {"statement", "signature"}:
         raise ValueError("invalid receipt envelope")
@@ -53,17 +66,17 @@ def submit(pack, trust, challenge, socket_path, key):
     # this independently selected challenge. The receipt also binds the full pack.
     record_hash = json.loads(challenge)["record_sha384"]
     path = PREFIX + attempt
-    with closing(LocalConnection(socket_path)) as connection:
+    with closing(connection_for(socket_path)) as connection:
         connection.request("PUT", path + "/pack", pack, {"Content-Type": "application/json"})
         response = connection.getresponse()
         if response.status != 200:
-            raise ValueError(f"collector returned HTTP {response.status}")
+            raise SubmissionError(response.status)
         receipt = json.loads(response.read(8192))
-    with closing(LocalConnection(socket_path)) as connection:
+    with closing(connection_for(socket_path)) as connection:
         connection.request("GET", path + "/verdict")
         response = connection.getresponse()
         if response.status != 200:
-            raise ValueError("stored verdict unavailable")
+            raise SubmissionError(response.status)
         verdict = response.read(8192)
     result = json.loads(verdict)
     if (result.get("status"), result.get("claim"), result.get("identity_scope"),

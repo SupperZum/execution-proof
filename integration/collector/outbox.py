@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from collector import CHALLENGE_LIMIT, ID, PACK_LIMIT, TRUST_LIMIT, Conflict, bounded, digest, encode, private_dir
-from deliver import submit
+from deliver import SubmissionError, submit
 
 
 class Outbox:
@@ -27,6 +27,7 @@ class Outbox:
                 attempt TEXT PRIMARY KEY, pack BLOB, trust BLOB, challenge BLOB,
                 pack_hash TEXT NOT NULL, trust_hash TEXT NOT NULL, challenge_hash TEXT NOT NULL,
                 ack BLOB)""")
+            db.execute("CREATE TABLE IF NOT EXISTS failures (attempt TEXT PRIMARY KEY, reason TEXT NOT NULL)")
         fd = os.open(directory, os.O_DIRECTORY)
         try:
             os.fsync(fd)
@@ -66,7 +67,11 @@ class Outbox:
                 try:
                     ack = submit(*row, socket_path, public)
                 except (OSError, http.client.HTTPException, InvalidSignature, ValueError, KeyError, TypeError, AttributeError, RecursionError) as err:
-                    print(f"{attempt}: delivery pending ({type(err).__name__})", file=sys.stderr)
+                    reason = err.reason if isinstance(err, SubmissionError) else type(err).__name__
+                    with db:
+                        db.execute("INSERT INTO failures VALUES(?,?) ON CONFLICT(attempt) DO UPDATE "
+                                   "SET reason=excluded.reason", (attempt, reason))
+                    print(f"{attempt}: delivery pending ({reason})", file=sys.stderr)
                     continue
                 # Keep the bytes through response loss, timeouts and crashes.
                 # Release the queue copy in the transaction that records the checked ACK.
@@ -77,10 +82,12 @@ class Outbox:
 
     def status(self, attempt):
         with closing(self.connect()) as db:
-            row = db.execute("SELECT ack FROM deliveries WHERE attempt=?", (attempt,)).fetchone()
+            row = db.execute("""SELECT ack,reason FROM deliveries LEFT JOIN failures USING(attempt)
+                                WHERE attempt=?""", (attempt,)).fetchone()
         if row is None:
             raise ValueError("attempt not queued")
-        return {"attempt_id": attempt, "delivery": "archived" if row[0] else "pending",
+        return {**({"reason": row[1]} if row[1] and not row[0] else {}),
+                "attempt_id": attempt, "delivery": "archived" if row[0] else "pending",
                 "receipt": json.loads(row[0]) if row[0] else None}
 
 
@@ -92,7 +99,9 @@ def main():
     actions.add_parser("enqueue").add_argument("bundle", type=Path)
     actions.add_parser("status").add_argument("attempt")
     flush = actions.add_parser("flush")
-    flush.add_argument("--socket", type=Path, required=True)
+    transport = flush.add_mutually_exclusive_group(required=True)
+    transport.add_argument("--socket", type=Path)
+    transport.add_argument("--tls-config", type=Path)
     flush.add_argument("--public-key", type=Path, required=True)
     flush.add_argument("--watch", action="store_true")
     args = parser.parse_args()
@@ -105,8 +114,10 @@ def main():
         public = serialization.load_pem_public_key(bounded(args.public_key, 4096))
         if not isinstance(public, Ed25519PublicKey):
             parser.error("expected Ed25519 collector key")
+        from tls_api import Endpoint
+        destination = Endpoint(args.tls_config) if args.tls_config else args.socket
         while True:
-            pending = queue.flush(args.socket, public)
+            pending = queue.flush(destination, public)
             if not args.watch:
                 return int(bool(pending))
             time.sleep(5)

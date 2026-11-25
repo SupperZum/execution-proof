@@ -144,3 +144,128 @@ Run the unit tests from the repository root. For process recovery, supply at lea
 python3 -m unittest discover -s integration/collector
 python3 integration/collector/check_recovery.py --runtime "$ROOTFS" --manifest "$MANIFEST" "$BUNDLE1" "$BUNDLE2"
 ```
+
+### Verify the signed receipt and replay the archived proof
+
+Use the original public collector key, runtime and manifest provisioned for
+the profile. Supply trust and challenge from the relying party's independent
+selection. This command checks the archived context, runs both pinned TDX
+workers through the offline verifier, compares verdicts, and verifies the
+Ed25519 signature over the attempt, event and artifact hashes.
+
+```sh
+python3 -B verify_download.py --download "$download" --runtime "$ROOTFS" \
+  --manifest "$MANIFEST" --trust "$TRUST" --challenge "$CHALLENGE" --public-key "$PUB"
+```
+
+The collector Dockerfile installs Bubblewrap and runs the service as UID
+65532. Mount the separately provisioned verifier runtime, manifest, archive
+volume and collector key for that identity. Test the reader command in the
+target container runtime with a known original pack before accepting new
+submissions. It requires Bubblewrap to create its isolated network namespace.
+
+### Verify new submissions in a restricted Pod
+
+Use the [collector Pod](sidecar/pod.yaml) to verify new submissions and issue
+receipts through the private HTTPS endpoint. Build the collector from this
+directory, then build the verifier using the same vetted runtime and manifest
+as the reader. The verifier build context needs `rootfs/opt/onb17/trusted/`
+and `context/trusted-runtime-bins.sha384`.
+
+```sh
+docker build -t "$COLLECTOR_IMAGE" .
+docker build --build-arg COLLECTOR_IMAGE="$COLLECTOR_IMAGE" -f sidecar/Dockerfile \
+  -t "$VERIFIER_IMAGE" "$VERIFIER_CONTEXT"
+```
+
+Pin both images by digest in the Pod, including the collector init container.
+Provision the archive PVC, the original Ed25519 signing key as Secret entry
+`signer.pem`, and the server TLS keypair and client CA under `/tls`. The
+collector ConfigMap contains the independent manifest and `server.json`
+with the TLS paths, client grants and port 8443. Use one writer per archive.
+The init container copies the signing key into an owner-only file in memory.
+
+With `serve --pod-verifier --manifest …`, the collector writes only the pack
+and registered trust and challenge to a dedicated memory volume. The verifier
+mounts that volume read-only and uses a separate writable `/tmp` for TDX
+verification. Keep the Pod's private network namespace and separate PID
+namespaces. Reserve UID 65532 for the collector and 65531 for the verifier.
+The two processes authenticate these UIDs on a Linux abstract Unix socket.
+The verifier checks all three executable pins and applies the offline syscall
+filter before accepting requests. Each successful response binds the three
+input hashes. The collector checks that binding and the execution verdict,
+then commits a signed receipt. An invalid proof returns 422. An unavailable
+verifier or mismatched manifest returns 503 and the sender can retry.
+An identical retry of an archived attempt returns its stored receipt.
+
+### Run assembly and registration independently of delivery
+
+The authorized profile service supplies a public pack selection and the
+independently selected trust and challenge. Run the following as the
+assembly or registration identity. Use a persistent owner-only JOBS directory,
+a separate SPOOL directory for the sender, and a private WORK directory under
+the assembler's compiled public input root. Pin the assembler through the
+deployment's trusted configuration. Staging copies and hashes the selected
+public inputs in one SQLite transaction. A restart after staging resumes
+from those bytes. A repeated enqueue also checks the original bundle hashes.
+
+```sh
+python3 assembly.py --state "$JOBS" stage --selection "$SELECTION" \
+  --public-root "$PUBLIC_ROOT" --trust "$TRUST" --challenge "$CHALLENGE"
+python3 assembly.py --state "$JOBS" resume --assembler "$ASSEMBLER" \
+  --assembler-sha384 "$ASSEMBLER_SHA384" --work "$WORK" --spool "$SPOOL" --watch
+```
+
+Run the registrar and sender as separate services. Registration replays after
+a registrar restart. A submission made before registration stays pending.
+Both services retry after an outage. Read registration outcomes in the
+service journal and the registrations table in assembly.sqlite. Include this
+database in consistent backups along with the sender and archive stores.
+
+```sh
+python3 assembly.py --state "$JOBS" register --tls-config "$REGISTRAR_TLS" --watch
+python3 outbox.py --state "$SPOOL" flush --tls-config "$SENDER_TLS" --public-key "$PUB" --watch
+```
+
+### Private HTTPS endpoint
+
+Add `--tls-config server.json` to the collector serve command to listen for
+authenticated HTTPS requests. Configure the listen host, port, server cert
+and key, trusted client CA and grants. Index grants by the lowercase SHA-256
+fingerprint of the client's DER leaf certificate. Give readers explicit
+attempt IDs or a tenant-specific prefix reserved by the issuer. A prefix
+grants access to every attempt starting with that string. A client setting
+uses `url`, `ca`, `cert` and `key` for the HTTPS origin, trusted server CA,
+client certificate and private key respectively. The server certificate
+must cover the DNS name or IP used by clients.
+
+```json
+{
+  "host": "0.0.0.0", "port": 8443,
+  "cert": "/run/tls/server.crt", "key": "/run/tls/server.key",
+  "client_ca": "/run/tls/client-ca.crt",
+  "clients": {
+    "0000000000000000000000000000000000000000000000000000000000000000": {
+      "roles": ["reader"], "attempts": ["example-attempt"]
+    }
+  }
+}
+```
+
+The registrar may PUT `/v1/attempts/{id}/context` with base64 fields `trust`
+and `challenge`. Identical bytes return 200, a changed context returns 409.
+The sender can PUT pack and GET verdict. The relay can GET receipt; configure
+`collector_tls` in its GKE launch settings with the relay client settings
+file. A reader can GET status and the five archive objects. A recovery client
+can PUT loss with a reason code after confirming loss of an original input.
+
+Readers receive the durable attempt URL from the scheduling receipt's attempt
+ID. To download the evidence over HTTPS, use the reader identity and configured
+collector CA, then run verify_download.py with the independent context.
+
+```sh
+for artifact in pack trust challenge verdict receipt; do
+  curl --fail --silent --show-error --cacert "$CA" --cert "$READER_CERT" \
+    --key "$READER_KEY" "$ATTEMPT_URL/$artifact" --output "$download/$artifact.json"
+done
+```

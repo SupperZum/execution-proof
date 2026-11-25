@@ -2,6 +2,7 @@ from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -9,7 +10,7 @@ from unittest.mock import patch
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.exceptions import InvalidSignature
 
-from collector import Conflict, Rejected, Store, digest, encode
+from collector import Conflict, Rejected, Store, Unavailable, Verifier, digest, encode
 from deliver import verify_receipt
 from outbox import Outbox
 
@@ -30,6 +31,16 @@ class CollectorTests(unittest.TestCase):
 
     def submit(self, raw=b"pack"):
         return self.store.submit("a", raw, lambda *_: self.verdict, self.key)
+
+    def test_verifier_distinguishes_startup_failure_from_invalid_evidence(self):
+        verify = Verifier.__new__(Verifier)
+        verify.runtime, verify.args = self.state, ["verifier"]
+        for code, stdout, error in [(1, b"", Unavailable), (0, b"[]", Unavailable),
+                                    (1, b'{"status":"invalid"}', Rejected)]:
+            outcome = subprocess.CompletedProcess([], code, stdout, b"")
+            with self.subTest(code=code, stdout=stdout), patch("collector.subprocess.run", return_value=outcome):
+                with self.assertRaises(error):
+                    verify(b"pack", self.trust, self.challenge)
 
     def test_lost_response_survives_restart(self):
         first = self.submit()
