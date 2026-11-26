@@ -1,0 +1,33 @@
+{
+  "ociVersion": "1.2.1",
+  "root": {"path": "rootfs", "readonly": true},
+  "process": {
+    "terminal": false,
+    "user": {"uid": 1000, "gid": 1000, "additionalGids": []},
+    "args": ["/app"],
+    "env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "HOSTNAME=proof-1",
+      "HOME=/"
+    ],
+    "cwd": "/",
+    "noNewPrivileges": true,
+    "capabilities": {"bounding": [], "effective": [], "inheritable": [], "permitted": [], "ambient": []}
+  },
+  "mounts": [],
+  "linux": {
+    "namespaces": [
+      {"type": "mount"},
+      {"type": "pid"},
+      {"type": "ipc"},
+      {"type": "uts"},
+      {"type": "network"}
+    ],
+    "seccomp": {
+      "defaultAction": "SCMP_ACT_ERRNO",
+      "defaultErrnoRet": 1,
+      "architectures": ["SCMP_ARCH_X86_64"],
+      "syscalls": [{"names": ["execveat", "exit_group", "write"], "action": "SCMP_ACT_ALLOW"}]
+    }
+  }
+}

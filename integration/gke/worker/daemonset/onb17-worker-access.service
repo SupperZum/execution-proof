@@ -1,0 +1,13 @@
+[Unit]
+Description=Execution proof worker control over SSH
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+UMask=0077
+ExecStartPre=/usr/sbin/sshd -t -f /var/lib/onb17-worker-access/sshd_config
+ExecStart=/usr/sbin/sshd -D -e -f /var/lib/onb17-worker-access/sshd_config
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

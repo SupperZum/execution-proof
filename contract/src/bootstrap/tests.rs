@@ -228,12 +228,21 @@ fn profile_policy_reference_key_boot_and_receipt_swaps_rejected() {
         |a: &mut BootstrapAppraisal| a.policy_sha384 = "11".repeat(48),
         |a: &mut BootstrapAppraisal| a.input_sha384 = "11".repeat(48),
         |a: &mut BootstrapAppraisal| a.rvps_sha384 = "11".repeat(48),
+    ] {
+        let mut f = fixture();
+        mutate(&mut f.appraisal);
+        f.possession.appraisal_sha384 = f.appraisal.digest_sha384().unwrap();
+        assert_eq!(verify(&f).err(), Some(Error::BindingMismatch));
+    }
+    for mutate in [
         |a: &mut BootstrapAppraisal| a.binding.boot_id = "other".into(),
         |a: &mut BootstrapAppraisal| a.binding.boot_nonce_hex = "11".repeat(32),
     ] {
         let mut f = fixture();
         mutate(&mut f.appraisal);
         assert_eq!(verify(&f).err(), Some(Error::BindingMismatch));
+        f.possession.appraisal_sha384 = f.appraisal.digest_sha384().unwrap();
+        assert!(verify(&f).is_ok());
     }
     let mut f = fixture();
     f.possession.challenge_sha384 = "11".repeat(48);
@@ -541,5 +550,17 @@ fn malformed_overflowing_or_duplicate_challenge_time_fields_fail_closed() {
     assert_eq!(
         verify_bootstrap_challenge(duplicate.as_bytes(), &public(&authority), c, 100).err(),
         Some(Error::Malformed)
+    );
+}
+
+#[test]
+fn authentic_software_challenge_with_wrong_purpose_is_rejected_by_domain() {
+    let f = fixture();
+    let mut challenge = f.expected.challenge;
+    challenge.purpose = "different-purpose".into();
+    let raw = signed(&challenge, &challenge.signing_bytes().unwrap(), &f.verifier);
+    assert_eq!(
+        verify_bootstrap_challenge(&raw, &public(&f.verifier), &challenge, 150).err(),
+        Some(Error::WrongPurpose)
     );
 }

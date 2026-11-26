@@ -1,0 +1,139 @@
+name: GCP integration
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  tools:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.1
+      PROOF_WORKFLOW_ID: ci-proof
+      PROOF_QUALIFICATION_PREFIX: ci-qual-
+      PROOF_WORKLOAD_PREFIX: ci-work-
+      PROOF_PUBLIC_INPUT_ROOT: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Test standalone Rust tools
+        run: |
+          for tool in pack-assembler prototype-signer qualification-experiment qualification-signer; do
+            cargo test --locked --manifest-path "integration/gke/tools/$tool/Cargo.toml"
+          done
+      - name: Check a feature-off handoff consumer
+        run: |
+          dir=$(mktemp -d)
+          cargo new --quiet --vcs none "$dir/consumer"
+          cd "$dir/consumer"
+          cargo add --path "$GITHUB_WORKSPACE/handoff" --no-default-features
+          echo 'fn main() { assert!(execution_proof_handoff::MAX_CAPACITY > 0); }' > src/main.rs
+          cargo run --locked
+          cargo tree --locked --format '{p} {f}' > features.txt
+          ! grep -E '^.*execution-proof-handoff v[^ ]+ .*rootfs-custody' features.txt
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: integration/management-relay/go.mod
+          cache: false
+      - run: go test ./...
+        working-directory: integration/management-relay
+      - name: Test GKE normal and qualification controllers
+        env:
+          PYTHONPATH: integration/gke/tools:integration/gke/tools/controller
+        run: |
+          sudo apt-get install -y python3-yaml python3-cryptography
+          cargo build --locked --manifest-path integration/gke/tools/prototype-signer/Cargo.toml --target-dir target
+          GKE_INTENT_SIGNER_BIN="$PWD/target/debug/onb17-prototype-statement-signer" \
+            /usr/bin/python3 -m unittest discover -s integration/gke/tests
+          /usr/bin/python3 -m unittest discover -s integration/collector
+          cargo build --locked -p execution-proof-issuer --features gcp --bin gcp-authority
+          GCP_RECOVERY_TEST_PYTHON=/usr/bin/python3 GCP_AUTHORITY_TEST_BIN="$PWD/target/debug/gcp-authority" \
+            cargo test --locked -p execution-proof-issuer --features gcp --lib real_cli_and_serial -- --ignored
+
+  binaries:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [guest-preparation, kata-startup, trustee-software, trusted-services]
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.1
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: execution-proof-prototype
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        if: matrix.component == 'guest-preparation' || matrix.component == 'kata-startup'
+        with:
+          repository: qlad-secure/guest-components
+          ref: 29fdc7cc690338149b6a7c46cbcfca00666302f9
+          path: guest-components-prepared-dev
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        if: matrix.component == 'kata-startup'
+        with:
+          repository: SupperZum/kata-containers
+          ref: eeff3ecaec51bce8fcf693e3b3db3ea67bbe96fa
+          path: kata-launch-dev
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        if: matrix.component == 'trusted-services' || matrix.component == 'trustee-software'
+        with:
+          repository: SupperZum/trustee
+          ref: bb11be1975817e6826d4f3cab57c292536eaa975
+          path: trustee-launch-dev
+          persist-credentials: false
+      - name: Record source revisions
+        run: |
+          for checkout in */.git; do
+            dir=${checkout%/.git}
+            echo "$dir $(git -C "$dir" rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          sudo apt-get update
+          sudo apt-get install -y libseccomp-dev libclang-dev libssl-dev protobuf-compiler
+      - if: matrix.component == 'guest-preparation'
+        working-directory: guest-components-prepared-dev
+        env:
+          OPENSSL_STATIC: 1
+        run: cargo build --locked -p confidential-data-hub --no-default-features --features gcp-production --bin gcp-proof-preparation
+      - if: matrix.component == 'kata-startup'
+        working-directory: kata-launch-dev/src/agent
+        run: cargo build --locked --no-default-features --features gcp-proof-startup --bin kata-agent-gcp-proof
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        if: matrix.component == 'kata-startup'
+        with:
+          go-version-file: kata-launch-dev/src/runtime/go.mod
+          cache: false
+      - if: matrix.component == 'kata-startup'
+        name: Test the heartbeat against the selected Kata runtime
+        working-directory: kata-launch-dev/src/runtime
+        run: |
+          worker="$GITHUB_WORKSPACE/execution-proof-prototype/integration/gke/worker"
+          go test "$worker/caa-heartbeat.go" "$worker/caa-heartbeat_test.go"
+      - if: matrix.component == 'trustee-software'
+        working-directory: trustee-launch-dev
+        run: |
+          cargo test --locked -p verifier --no-default-features --features execution-quote-worker --lib gcp_execution_quote_worker::tests
+          cargo build --locked -p verifier --no-default-features --features execution-quote-worker --bin gcp-tdx-hardware-verifier
+      - if: matrix.component == 'trusted-services'
+        name: Install the selected Intel QVL development files
+        run: |
+          curl -fsSL https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key -o intel.key
+          echo '74b07f9b16370924ead15d88bedfd472eaffe7ae52a8104986bea8278f5178fe1a4794d0d931ec9c5fa034be4e44a82b  intel.key' | sha384sum -c -
+          sudo gpg --dearmor --output /usr/share/keyrings/intel-sgx.gpg intel.key
+          echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/intel-sgx.gpg] https://download.01.org/intel-sgx/sgx_repo/ubuntu noble main' | sudo tee /etc/apt/sources.list.d/intel-sgx.list
+          sudo apt-get update
+          sudo apt-get install -y libsgx-dcap-quote-verify-dev=1.26.100.1-noble1 libsgx-dcap-quote-verify=1.26.100.1-noble1
+          echo '90dc9d13d0e48d11521a384c24d98f5fd6f9dced97507ae6fce1d53e41b64892940de4df7b05e82c9bf014a76db283d2  /usr/lib/x86_64-linux-gnu/libsgx_dcap_quoteverify.so.1' | sha384sum -c -
+      - if: matrix.component == 'trusted-services'
+        env:
+          SGX_SDK: /usr
+        run: |
+          cargo build --locked --manifest-path trustee-launch-dev/Cargo.toml -p verifier --no-default-features --features execution-quote-worker-tdx --bin gcp-tdx-pregrant-verifier --bin gcp-tdx-hardware-verifier --bin gcp-tdx-bootstrap-history-verifier
+          cargo test --locked --manifest-path execution-proof-prototype/integration/gcp-trusted-services/Cargo.toml --features server

@@ -137,6 +137,42 @@ impl VerifiedCredentialDelivery {
     }
 }
 
+/// Authenticated public publication metadata without checking ciphertext bytes.
+/// This distinct type cannot be used as a checked credential-delivery result.
+///
+/// ```compile_fail
+/// use execution_proof_contract::credential::{VerifiedCredentialMetadata, VerifiedCredentialDelivery};
+/// fn delivery(metadata: VerifiedCredentialMetadata) -> VerifiedCredentialDelivery { metadata }
+/// ```
+pub struct VerifiedCredentialMetadata {
+    publication: VerifiedCredentialDelivery,
+}
+
+impl VerifiedCredentialMetadata {
+    pub fn statement(&self) -> &CredentialDeliveryV1 {
+        self.publication.statement()
+    }
+    pub fn receipt_sha384(&self) -> &str {
+        self.publication.digest_sha384()
+    }
+    pub fn kbs_proof_key_sha384(&self) -> &str {
+        self.publication.kbs_proof_key_sha384()
+    }
+}
+
+/// Verify the signed publication commitment for a public evidence pack.
+/// No ciphertext, recipient receipt, decryption or provisioning is asserted.
+pub fn verify_credential_metadata_historical(
+    receipt_json: &[u8],
+    grant: &VerifiedLaunchGrant,
+    aggregate: &VerifiedPolicyAggregate,
+    expected: &DeliveryExpectations,
+) -> Result<VerifiedCredentialMetadata, Error> {
+    Ok(VerifiedCredentialMetadata {
+        publication: verify_publication(receipt_json, grant, aggregate, expected, None)?,
+    })
+}
+
 /// Authenticates the statement and checks a trusted authority/lab clock.
 pub fn verify_credential_delivery(
     receipt_json: &[u8],
@@ -165,6 +201,16 @@ pub fn verify_credential_delivery_historical(
     if jwe_bytes.is_empty() || jwe_bytes.len() > MAX_CREDENTIAL_JWE_BYTES {
         return Err(Error::TooLarge);
     }
+    verify_publication(receipt_json, grant, aggregate, expected, Some(jwe_bytes))
+}
+
+fn verify_publication(
+    receipt_json: &[u8],
+    grant: &VerifiedLaunchGrant,
+    aggregate: &VerifiedPolicyAggregate,
+    expected: &DeliveryExpectations,
+    jwe_bytes: Option<&[u8]>,
+) -> Result<VerifiedCredentialDelivery, Error> {
     identifier(&expected.audience)?;
     identifier(&expected.issuer)?;
     hex_bytes(&expected.keywrap_sha384, 48)?;
@@ -203,7 +249,7 @@ pub fn verify_credential_delivery_historical(
         || statement.init_data_sha384 != policy.init_data_sha384
         || statement.recorder_key_sha384 != policy.recorder_key_sha384
         || statement.keywrap_sha384 != expected.keywrap_sha384
-        || statement.ciphertext_sha384 != sha384(jwe_bytes)
+        || jwe_bytes.is_some_and(|bytes| statement.ciphertext_sha384 != sha384(bytes))
         || statement.workflow_id != policy.request.workflow_id
         || statement.resource_path != policy.request.resource_path
         || statement.validity != *grant.validity()

@@ -1,0 +1,7 @@
+# Apply after kata-values.yaml for the dedicated single-guest worker.
+shims:
+  remote:
+    dropIn: |
+      [hypervisor.remote]
+      remote_hypervisor_socket = "/run/execution-proof/single-guest.sock"
+      remote_hypervisor_timeout = 600

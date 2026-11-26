@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "purpose": "qlad.execution-proof.gcp-trusted-kbs-config.v1",
+  "listen": "10.128.0.10:8443",
+  "server_name": "kbs.onb17.internal",
+  "grant": {
+    "authority_public_key": null,
+    "audience": "REPLACE_FROM_C",
+    "authority": "REPLACE_FROM_C",
+    "tenant": "REPLACE_FROM_C",
+    "image_policy_sha384": "REPLACE_FROM_C"
+  },
+  "boot_binding": null,
+  "boot_policy": null,
+  "module_policy": null,
+  "as_policy": {
+    "id": "REPLACE_FROM_PREPARATION_POLICY",
+    "policy": {"path": "/opt/onb17/trusted/config/as.rego", "sha384": "REPLACE_EXACT_RAW_SHA384"}
+  },
+  "as_data": null,
+  "kbs_policy": {
+    "id": "REPLACE_FROM_PREPARATION_POLICY",
+    "policy": {"path": "/opt/onb17/trusted/config/kbs.rego", "sha384": "REPLACE_EXACT_RAW_SHA384"}
+  },
+  "aggregate_audience": "REPLACE_FROM_C_AND_PREPARATION_POLICY",
+  "aggregate_issuer": "REPLACE_FROM_PREPARATION_POLICY",
+  "delivery_audience": "REPLACE_FROM_PREPARATION_POLICY",
+  "delivery_issuer": "REPLACE_FROM_PREPARATION_POLICY",
+  "resource_path": ["REPLACE_FROM_C", "REPLACE_FROM_C", "REPLACE_FROM_C"],
+  "workflow_id": "REPLACE_FROM_C",
+  "credential_project_id": "REPLACE_OWNED_PROJECT",
+  "credential_client_email": "REPLACE_OWNED_SA_EMAIL",
+  "kbs_proof_public_key": null,
+  "kbs_proof_key_path": "/run/onb17/trusted/kbs-proof.pk8",
+  "tls_certificate": {"path": "/opt/onb17/trusted/config/kbs-chain.pem", "sha384": "REPLACE_EXACT_RAW_SHA384"},
+  "tls_private_key_path": "/run/onb17/trusted/kbs-tls.pem",
+  "offline_collateral": {"path": "/opt/onb17/trusted/config/offline-platform-collateral.json", "sha384": "REPLACE_EXACT_RAW_SHA384"},
+  "archive_directory": "/run/onb17/trusted/archive",
+  "lifetime_seconds": 14400
+}

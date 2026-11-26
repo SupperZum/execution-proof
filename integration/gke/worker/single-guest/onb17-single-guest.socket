@@ -1,0 +1,10 @@
+[Unit]
+Description=Kata single-guest endpoint
+
+[Socket]
+ListenStream=/run/execution-proof/single-guest.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

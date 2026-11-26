@@ -1,0 +1,12 @@
+[Unit]
+Description=Kata single-guest start guard
+Requires=onb17-single-guest.socket
+After=onb17-single-guest.socket
+
+[Service]
+ExecStart=/run/execution-proof/single-guest
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/onb17-single-guest
+RestrictAddressFamilies=AF_UNIX
+UMask=0077

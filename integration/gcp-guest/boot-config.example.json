@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "purpose": "qlad.execution-proof.gcp-closed-boot-config.v1",
+  "roots": {
+    "authority_public_key": "SET_AUTHORITY_PUBLIC_KEY_32_BYTE_ARRAY",
+    "build_public_key": "SET_BUILD_PUBLIC_KEY_32_BYTE_ARRAY",
+    "reference_public_key": "SET_REFERENCE_PUBLIC_KEY_32_BYTE_ARRAY",
+    "kbs_proof_public_key": "SET_KBS_PROOF_PUBLIC_KEY_32_BYTE_ARRAY",
+    "qualification_public_key": "SET_QUALIFICATION_PUBLIC_KEY_32_BYTE_ARRAY",
+    "authority_tls_roots_sha384": "SET_SHA384_OF_AUTHORITY_CA_PEM",
+    "kbs_tls_roots_sha384": "SET_SHA384_OF_KBS_CA_PEM"
+  },
+  "authority": "SET_AUTHORITY_ID",
+  "tenant": "SET_TENANT_ID",
+  "grant_audience": "SET_GRANT_AUDIENCE",
+  "aggregate_audience": "SET_AGGREGATE_AUDIENCE",
+  "admission_receipt_audience": "SET_ADMISSION_RECEIPT_AUDIENCE",
+  "authority_https_origin": "https://authority.example.invalid",
+  "kbs_https_origin": "https://kbs.example.invalid",
+  "resource_path": [
+    "SET_REPOSITORY",
+    "SET_RESOURCE_TYPE",
+    "SET_TAG"
+  ],
+  "workflow_id": "SET_WORKFLOW_ID",
+  "launch_policy_sha384": "SET_SHA384_OF_LAUNCH_REGO",
+  "image_policy_sha384": "SET_SHA384_OF_IMAGE_JSON",
+  "rpc_policy_sha384": "SET_SHA384_OF_RPC_JSON",
+  "device_policy_sha384": "SET_SHA384_OF_DEVICE_JSON",
+  "writer_policy_sha384": "SET_SHA384_OF_WRITER_JSON",
+  "rpc_policy_path": "/onb17/policy/rpc.json",
+  "device_policy_path": "/onb17/policy/device.json",
+  "writer_policy_path": "/onb17/policy/writer.json",
+  "launch_policy_path": "/onb17/policy/launch.rego",
+  "image_policy_path": "/onb17/policy/image.json",
+  "authority_tls_roots_path": "/onb17/roots/authority.pem",
+  "kbs_tls_roots_path": "/onb17/roots/kbs.pem",
+  "bootstrap_path": "/init",
+  "cdh_path": "/onb17/bin/gcp-proof-preparation",
+  "kata_agent_path": "/onb17/bin/kata-agent-gcp-proof",
+  "allowed_roles": [
+    "bootstrap",
+    "cdh",
+    "kata_agent"
+  ],
+  "custody_transport": "private-unix-seqpacket",
+  "host_transport": "tcp_tls13_mtls",
+  "management_relay": {
+    "executable_path": "/onb17/bin/management-relay",
+    "configuration_path": "/onb17/management/relay.json",
+    "configuration_sha384": "SET_SHA384_OF_RELAY_JSON",
+    "client_ca_path": "/onb17/management/client-ca.pem",
+    "client_ca_sha384": "SET_SHA384_OF_RELAY_CLIENT_CA_PEM",
+    "server_certificate_path": "/onb17/management/server-cert.pem",
+    "server_certificate_sha384": "SET_SHA384_OF_RELAY_SERVER_CERT_PEM",
+    "client_leaf_der_sha384": "SET_SHA384_OF_RELAY_CLIENT_CERT_DER",
+    "uid": 1001,
+    "gid": 1001
+  },
+  "generic_attestation_rpc_enabled": false,
+  "limits": {
+    "pending_records": 4,
+    "pending_bytes": 33554432,
+    "quote_attempts": 3,
+    "quote_timeout_seconds": 30,
+    "pending_timeout_seconds": 300,
+    "evidence_bytes": 1048576,
+    "envelope_bytes": 4194304,
+    "pack_bytes": 16777216
+  }
+}

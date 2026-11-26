@@ -13,6 +13,18 @@ use std::fmt;
 pub mod admission;
 pub mod bootstrap;
 pub mod credential;
+pub mod execution;
+pub mod execution_quote;
+pub mod gcp_artifact;
+pub mod gcp_boot_binding;
+pub mod gcp_bootstrap;
+pub mod gcp_credential;
+pub mod gcp_execution_envelope;
+pub mod gcp_execution_quote;
+pub mod gcp_policy_receipt;
+pub mod gcp_profile;
+pub mod gcp_session;
+pub mod gcp_startup;
 pub mod policy_receipt;
 pub mod session;
 
