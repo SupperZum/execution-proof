@@ -148,6 +148,12 @@ pub struct GcpIssuer {
     admission_policy_sha384: String,
 }
 
+pub(crate) struct StoreOptions<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) capacity: usize,
+    pub(crate) journal_bucket: Option<&'a str>,
+}
+
 impl GcpIssuer {
     pub fn initialize_new(
         path: &Path,
@@ -174,14 +180,16 @@ impl GcpIssuer {
         clock: Arc<dyn IssuerClock>,
     ) -> Result<Self, GcpIssuerError> {
         Self::open(
-            path,
+            StoreOptions {
+                path,
+                capacity,
+                journal_bucket: None,
+            },
             config,
             signed_qualification_json,
             signer,
-            capacity,
             clock,
             OpenMode::Initialize,
-            None,
         )
     }
     pub fn open_existing(
@@ -209,25 +217,25 @@ impl GcpIssuer {
         clock: Arc<dyn IssuerClock>,
     ) -> Result<Self, GcpIssuerError> {
         Self::open(
-            path,
+            StoreOptions {
+                path,
+                capacity,
+                journal_bucket: None,
+            },
             config,
             signed_qualification_json,
             signer,
-            capacity,
             clock,
             OpenMode::Live,
-            None,
         )
     }
     pub(crate) fn open(
-        path: &Path,
+        store_options: StoreOptions<'_>,
         config: GcpIssuerConfig,
         signed_qualification_json: &[u8],
         signer: Ed25519KeyPair,
-        capacity: usize,
         clock: Arc<dyn IssuerClock>,
         mode: OpenMode,
-        journal_bucket: Option<&str>,
     ) -> Result<Self, GcpIssuerError> {
         let qualification =
             verify_gcp_qualification_historical(signed_qualification_json, &config.qualification)?;
@@ -248,22 +256,22 @@ impl GcpIssuer {
         let authority = public_key(&signer)?;
         let store = if mode == OpenMode::Initialize {
             store::Store::initialize_new_gcp_policy(
-                path,
+                store_options.path,
                 &identity,
-                capacity,
+                store_options.capacity,
                 clock.as_ref(),
                 authority,
                 *qualification.validity(),
-                journal_bucket,
+                store_options.journal_bucket,
             )?
         } else {
             store::Store::open_existing_gcp_policy(
-                path,
+                store_options.path,
                 &identity,
-                capacity,
+                store_options.capacity,
                 authority,
                 *qualification.validity(),
-                journal_bucket,
+                store_options.journal_bucket,
             )?
         };
         Ok(Self {

@@ -474,14 +474,16 @@ fn authority(args: &Arguments, mode: crate::gcp::OpenMode) -> Result<GcpIssuer, 
     let pkcs8 = Zeroizing::new(read_operator_file(&args.signer, MAX_CONTROL_BYTES, true)?);
     let signer = Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| PublicError::OperatorKey)?;
     let result = GcpIssuer::open(
-        &args.store,
+        crate::gcp::StoreOptions {
+            path: &args.store,
+            capacity: args.capacity,
+            journal_bucket: args.journal_bucket.as_deref(),
+        },
         config,
         &qualification,
         signer,
-        args.capacity,
         std::sync::Arc::new(crate::SystemClock),
         mode,
-        args.journal_bucket.as_deref(),
     );
     result.map_err(PublicError::from)
 }

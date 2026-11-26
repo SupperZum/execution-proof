@@ -708,14 +708,16 @@ fn gcp_policy_admission_consumes_once_and_historical_status_survives_failed_cloc
         Err(GcpIssuerError::HardwareUnavailable)
     ));
     let historical = GcpIssuer::open(
-        &d.db(),
+        StoreOptions {
+            path: &d.db(),
+            capacity: 16,
+            journal_bucket: None,
+        },
         c.clone(),
         &qualification(&c),
         key(1),
-        16,
         clock.clone(),
         OpenMode::HistoricalStatus,
-        None,
     )
     .unwrap();
     assert!(historical.status_policy_aggregate(&id, &a, &wire).is_err());
