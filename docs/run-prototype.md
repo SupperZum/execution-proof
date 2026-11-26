@@ -1,43 +1,12 @@
 # Run the execution proof prototype
 
-Use the offline demo to inspect evidence from three executions of one encrypted
-image. Use the GKE setup to launch a workload and generate fresh evidence with
-the standard Cloud API Adaptor (CAA) GCP provider.
+## Verify archived evidence offline
 
-## Verify the offline demo
-
-Use x86-64 Linux. Install Python 3.11+, `jq`, `tar`, `gzip`, and
-`sha256sum` using your distribution's package manager. The pinned verifier
-executables require glibc and `libgcc_s.so.1`. Obtain the demo archive from the
-prototype operator and set `DEMO_ARCHIVE` to its path. The archive includes
-the evidence packs, relying-party expectations and verifier executables.
-Set `DEMO_EXPECTATIONS_SHA384` to the expectations digest received from the
-relying party through a trusted channel.
-
-```bash
-mkdir demo
-tar -xzf "$DEMO_ARCHIVE" --strip-components=1 -C demo
-cd demo
-sha256sum -c SHA256SUMS
-
-python3 -B verify-pod-executions.py \
-  --expectations relying-party/expectations.json \
-  --expectations-sha384 "$DEMO_EXPECTATIONS_SHA384" \
-  --packs packs \
-  --verifier bin/gcp-execution-proof-verifier \
-  --tdx-worker bin/gcp-tdx-hardware-verifier \
-  --gcp-bootstrap-worker bin/gcp-tdx-bootstrap-history-verifier \
-  > report.json
-
-jq -e '.pods | length == 3 and all(.[]; .verdict.status == "verified_exec"
-  and .verdict.claim == "exec_committed")' report.json
-jq -r '.pods[] | [.name, .verdict.status, .verdict.claim, .verdict.identity_scope] | @tsv' report.json
-```
-
-Expect three `verified_exec / exec_committed` results. Each result identifies the
-authorized attempt and its protected execution record. The Pod UID mapping comes
-from the relying party's Kubernetes, CAA and CRI observations. The workers
-evaluate the archived TDX collateral against the current clock.
+Retrieve the evidence pack and recorded verdict for the attempt. Supply the
+trust context, challenge and verifier runtime from the relying party's trusted
+sources. Follow the [offline verification procedure](../integration/collector/README.md#independently-verify-the-download)
+to evaluate the pack and compare the resulting execution verdict and record
+identity with the archived verdict.
 
 ## Prepare a GKE deployment
 
@@ -46,16 +15,24 @@ Requests, PyYAML, OpenSSH, OpenSSL, `jq`, `gcloud`,
 `gke-gcloud-auth-plugin`, `kubectl` and `helm`. Install the compiler and
 build dependencies in the [PodVM build guide](../integration/gcp-guest/README.md).
 
-From a new workspace directory, clone the compatible prototype branches as
-siblings. Set each `*_URL` to the repository or fork carrying the prototype
-changes and its `*_BRANCH` to the branch selected for the deployment. Use the
-directory names shown because the component manifests use relative Cargo paths.
+From a new workspace directory, select the execution-proof revision for the
+deployment. Use the corresponding guest-components, Kata and Trustee commit
+SHAs and repository URLs from its [GCP integration workflow](../.github/workflows/gcp-integration.yml).
+The integrated build uses the sibling directory names below.
 
 ```bash
-git clone --branch "$EPP_BRANCH" "$EPP_URL" execution-proof-prototype
-git clone --branch "$GC_BRANCH" "$GC_URL" guest-components-prepared-dev
-git clone --branch "$KATA_BRANCH" "$KATA_URL" kata-launch-dev
-git clone --branch "$TRUSTEE_BRANCH" "$TRUSTEE_URL" trustee-launch-dev
+set -e
+checkout_revision() {
+  git init --quiet "$1"
+  git -C "$1" fetch --quiet --depth=1 "$2" "$3"
+  git -C "$1" checkout --quiet --detach FETCH_HEAD
+  test "$(git -C "$1" rev-parse HEAD)" = "$3"
+}
+
+checkout_revision execution-proof-prototype "$EPP_URL" "$EPP_SHA"
+checkout_revision guest-components-prepared-dev "$GC_URL" "$GC_SHA"
+checkout_revision kata-launch-dev "$KATA_URL" "$KATA_SHA"
+checkout_revision trustee-launch-dev "$TRUSTEE_URL" "$TRUSTEE_SHA"
 git clone --branch main https://github.com/qlad-secure/cloud-api-adaptor.git cloud-api-adaptor
 root=$PWD
 mkdir -p build/bin inputs/public

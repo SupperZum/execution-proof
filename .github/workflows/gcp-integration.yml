@@ -70,21 +70,21 @@ jobs:
         if: matrix.component == 'guest-preparation' || matrix.component == 'kata-startup'
         with:
           repository: qlad-secure/guest-components
-          ref: denys/prepared-content
+          ref: 29fdc7cc690338149b6a7c46cbcfca00666302f9
           path: guest-components-prepared-dev
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         if: matrix.component == 'kata-startup'
         with:
           repository: SupperZum/kata-containers
-          ref: denys/launch-binding
+          ref: eeff3ecaec51bce8fcf693e3b3db3ea67bbe96fa
           path: kata-launch-dev
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         if: matrix.component == 'trusted-services' || matrix.component == 'trustee-software'
         with:
           repository: SupperZum/trustee
-          ref: denys/launch-appraisal
+          ref: bb11be1975817e6826d4f3cab57c292536eaa975
           path: trustee-launch-dev
           persist-credentials: false
       - name: Record source revisions

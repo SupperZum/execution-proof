@@ -1,5 +1,4 @@
-//! Authenticates one explicitly reviewed qualification decision. It does not
-//! reproduce the review, establish D5/D7 evidence, or issue runtime permission.
+//! Signs the reviewed qualification decision. Runtime authorization requires a separate grant.
 use execution_proof_contract::{
     gcp_artifact::{verify_artifacts, ArtifactVerificationExpectations},
     gcp_boot_binding::GcpBootBindingV1,
