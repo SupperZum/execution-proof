@@ -1,4 +1,4 @@
-"""Validate the optional D5 observation against its protected record."""
+"""Validate the optional guest execution observation against its protected record."""
 import base64
 import hashlib
 import json
